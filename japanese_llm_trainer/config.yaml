@@ -34,8 +34,27 @@ fused_model_path: "./models/qwen3-8b-japanese"
 max_seq_length: 2048    # 長いほどVRAM増加（OOMなら 1024 に下げる）
 grad_checkpoint: true   # trueでVRAM約30%削減
 
+# LoRA変種オプション（精度向上）
+# DoRA: 方向と大きさを分離学習（精度+5〜10%、やや遅い）
+use_dora: false
+# rsLoRA: ランク安定化（高ランク=32以上で特に効果あり）
+use_rslora: false
+
 # シード
 seed: 42
 
 # システムプロンプト（推論時）
 system_prompt: "あなたは優秀な日本語AIアシスタントです。アプリケーション開発と文章執筆を得意とし、常に正確で自然な日本語で回答します。"
+
+# -----------------------------------------------
+# DPO設定（2b_dpo.py 用）
+# -----------------------------------------------
+dpo:
+  beta: 0.1             # DPO温度（小→保守的・安定、大→変化大きい）
+  iters: 500            # SFTの半分程度でよい
+  batch_size: 2         # DPOはSFTよりメモリ消費が多い
+  learning_rate: 5e-5   # SFTより低めに設定
+  max_seq_length: 1024  # DPO時はやや短めに
+  dpo_data_dir: "./data/dpo"
+  dpo_adapter_path: "./adapters/japanese-dpo"
+  final_model_path: "./models/qwen3-8b-japanese-dpo"
