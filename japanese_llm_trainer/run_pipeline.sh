@@ -4,21 +4,28 @@
 # MacBook Pro M4 Max 36GB 向け
 #
 # 使い方:
-#   ./run_pipeline.sh                        # 8B + SFT+DPO
-#   ./run_pipeline.sh --model 14b            # 14B + ORPO
-#   ./run_pipeline.sh --model 14b --spin     # 14B + ORPO + SPIN（推奨）
-#   ./run_pipeline.sh --test                 # テスト実行（約15分）
-#   ./run_pipeline.sh --from-spin            # SPINから再開
-#   ./run_pipeline.sh --use-llm-judge        # 評価にLLM-as-Judgeを使用
+#   ./run_pipeline.sh                              # 8B + SFT+DPO
+#   ./run_pipeline.sh --model 14b                  # 14B + ORPO
+#   ./run_pipeline.sh --model 14b --spin           # 14B + ORPO + SPIN（推奨）
+#   ./run_pipeline.sh --model 14b --spin --use-llm-judge  # フル（推奨・就寝中）
+#   ./run_pipeline.sh --all                        # 全工程一括（最高品質）
+#   ./run_pipeline.sh --test                       # テスト実行（約15分）
+#   ./run_pipeline.sh --from-neftune               # NEFTuneから再開
+#   ./run_pipeline.sh --from-merge                 # マージから再開
+#
+# --all フラグの内容:
+#   14B + ORPO + SPIN(5回) + NEFTune + モデルマージ + LLM-Judge評価
+#   ※ 就寝中実行推奨（約12〜15時間）
 #
 # メモリ使用量:
-#   14B ORPO学習: ~21GB / SPIN学習: ~21GB / 推論: ~9GB
+#   14B ORPO/NEFTune学習: ~21GB / SPIN学習: ~21GB / 推論: ~9GB
 #   ※ 他アプリは常に15GB以上利用可能
 #
-# 所要時間（14B + ORPO + SPIN 5回）:
+# 所要時間（14B + ORPO + SPIN 5回 + NEFTune + Merge）:
 #   データ準備: ~10分 / ORPO: ~2〜3時間
 #   SPIN 1回:  ~90分（生成40分 + 採点30分 + 学習20分）
-#   SPIN 5回:  ~7〜8時間（就寝中に実行推奨）
+#   SPIN 5回:  ~7〜8時間
+#   NEFTune:   ~2〜3時間 / マージ: ~5〜15分
 # =============================================================================
 
 set -euo pipefail
@@ -27,6 +34,8 @@ set -euo pipefail
 MODEL_SIZE="8b"
 USE_ORPO=false
 USE_SPIN=false
+USE_NEFTUNE=false
+USE_MERGE=false
 TEST_MODE=false
 USE_LLM_JUDGE=false
 START_STEP=1
@@ -37,19 +46,24 @@ for arg in "$@"; do
   case $arg in
     --model=14b|--14b)  MODEL_SIZE="14b" ;;
     --model=8b|--8b)    MODEL_SIZE="8b" ;;
-    --orpo)        USE_ORPO=true ;;
-    --spin)        USE_SPIN=true ;;
-    --spin=*)      USE_SPIN=true; SPIN_ITERATIONS="${arg#*=}" ;;
-    --test)        TEST_MODE=true ;;
+    --orpo)          USE_ORPO=true ;;
+    --spin)          USE_SPIN=true ;;
+    --spin=*)        USE_SPIN=true; SPIN_ITERATIONS="${arg#*=}" ;;
+    --neftune)       USE_NEFTUNE=true ;;
+    --merge)         USE_MERGE=true ;;
+    --all)           MODEL_SIZE="14b"; USE_SPIN=true; USE_NEFTUNE=true; USE_MERGE=true; USE_LLM_JUDGE=true ;;
+    --test)          TEST_MODE=true ;;
     --use-llm-judge) USE_LLM_JUDGE=true ;;
-    --from-data)   START_STEP=1 ;;
-    --from-sft)    START_STEP=2 ;;
-    --from-dpo)    START_STEP=3 ;;
-    --from-orpo)   START_STEP=3 ;;
-    --from-eval)   START_STEP=4 ;;
-    --from-spin)   START_STEP=5 ;;
+    --from-data)     START_STEP=1 ;;
+    --from-sft)      START_STEP=2 ;;
+    --from-dpo)      START_STEP=3 ;;
+    --from-orpo)     START_STEP=3 ;;
+    --from-eval)     START_STEP=4 ;;
+    --from-spin)     START_STEP=5 ;;
+    --from-neftune)  START_STEP=6 ;;
+    --from-merge)    START_STEP=7 ;;
     --help|-h)
-      grep "^#" "$0" | head -25 | sed 's/^# //'
+      grep "^#" "$0" | head -35 | sed 's/^# //'
       exit 0
       ;;
   esac
@@ -115,7 +129,7 @@ else
 fi
 echo "╚══════════════════════════════════════════════════════════╝"
 echo ""
-echo "  設定: モデル=${MODEL_SIZE}B | ORPO=$( $USE_ORPO && echo ON || echo OFF ) | SPIN=$( $USE_SPIN && echo "${SPIN_ITERATIONS}回" || echo OFF ) | LLM-Judge=$( $USE_LLM_JUDGE && echo ON || echo OFF )"
+echo "  設定: モデル=${MODEL_SIZE}B | ORPO=$( $USE_ORPO && echo ON || echo OFF ) | SPIN=$( $USE_SPIN && echo "${SPIN_ITERATIONS}回" || echo OFF ) | NEFTune=$( $USE_NEFTUNE && echo ON || echo OFF ) | Merge=$( $USE_MERGE && echo ON || echo OFF ) | LLM-Judge=$( $USE_LLM_JUDGE && echo ON || echo OFF )"
 echo ""
 echo "  Step 1: データ準備（品質フィルタ + カリキュラム学習ソート + DPOデータ）"
 if $USE_ORPO; then
@@ -131,6 +145,12 @@ else
 fi
 if $USE_SPIN; then
   echo "  Step 5: SPIN 反復自己改善（最大${SPIN_ITERATIONS}回 → 自動収束）"
+fi
+if $USE_NEFTUNE; then
+  echo "  Step 6: NEFTune 埋め込みノイズ訓練（指示追従性 +5〜10%）"
+fi
+if $USE_MERGE; then
+  echo "  Step 7: モデルマージ（TIES法 → MLX変換）"
 fi
 echo ""
 
@@ -292,6 +312,77 @@ print(s.get('current_model', ''))
 fi
 
 # =============================================================================
+# Step 6: NEFTune（埋め込みノイズで指示追従性向上）
+# =============================================================================
+if $USE_NEFTUNE && [ "$START_STEP" -le 6 ]; then
+  log_step 6 "NEFTune 埋め込みノイズ訓練"
+  log_info "指示追従性を +5〜10% 向上させます（埋め込みへのノイズ注入）"
+  log_info "推定時間: $( $TEST_MODE && echo '3分' || echo '2〜3時間（14B）' )"
+  log_mem "~21GB（ORPO学習と同等）"
+
+  # NEFTuneの入力モデルを決定（SPIN済み → ORPO済み → ベースの順で優先）
+  NEFTUNE_INPUT="$BASE_MODEL"
+  if $USE_SPIN; then
+    SPIN_STATE_FILE="./data/spin/spin_state.json"
+    if [ -f "$SPIN_STATE_FILE" ]; then
+      SPIN_FINAL=$(python3 -c "
+import json
+with open('$SPIN_STATE_FILE') as f:
+    s = json.load(f)
+print(s.get('current_model', ''))
+" 2>/dev/null || echo "")
+      [ -n "$SPIN_FINAL" ] && [ -d "$SPIN_FINAL" ] && NEFTUNE_INPUT="$SPIN_FINAL"
+    fi
+  elif [ -d "$FINAL_MODEL" ]; then
+    NEFTUNE_INPUT="$FINAL_MODEL"
+  fi
+
+  log_info "NEFTune入力モデル: ${NEFTUNE_INPUT}"
+
+  NEFTUNE_TEST_FLAG=""
+  $TEST_MODE && NEFTUNE_TEST_FLAG="--test-run"
+
+  python 2d_train_neftune.py \
+    --config "$CONFIG" \
+    --model-path "$NEFTUNE_INPUT" \
+    $NEFTUNE_TEST_FLAG
+
+  log_done "NEFTune完了: ./adapters/14b-japanese-neftune"
+fi
+
+# =============================================================================
+# Step 7: モデルマージ（TIES法でSPINチェックポイントを統合）
+# =============================================================================
+if $USE_MERGE && [ "$START_STEP" -le 7 ]; then
+  log_step 7 "モデルマージ（TIES法 + MLX変換）"
+  log_info "複数のファインチューニング済みチェックポイントを統合します"
+  log_info "推定時間: $( $TEST_MODE && echo '2分' || echo '5〜15分' )"
+  log_mem "CPU/RAM処理（GPU不使用）"
+
+  # mergekit がインストールされているか確認
+  if ! python3 -c "import mergekit" 2>/dev/null; then
+    log_info "mergekitが未インストールのため、pip install mergekitを実行します"
+    pip install mergekit -q
+  fi
+
+  MERGE_ARGS="--method ties --to-mlx"
+
+  # SPINチェックポイントが存在すれば --auto-spin で自動収集
+  if $USE_SPIN && [ -f "./data/spin/spin_state.json" ]; then
+    log_info "SPINチェックポイントを自動収集してマージします"
+    python 5_merge.py --auto-spin $MERGE_ARGS
+  else
+    log_info "ORPO最終モデルをマージします"
+    python 5_merge.py \
+      --base-model "$BASE_MODEL" \
+      --models "$FINAL_MODEL" \
+      $MERGE_ARGS
+  fi
+
+  log_done "マージ完了: ./models/merged-japanese/"
+fi
+
+# =============================================================================
 # 完了サマリー
 # =============================================================================
 END_TIME=$(date +%s)
@@ -303,8 +394,24 @@ echo "║                   パイプライン完了！                     ║"
 printf "║  モデル: %-49s║\n" "Qwen3-${MODEL_SIZE}B"
 printf "║  経過時間: %-47s║\n" "${ELAPSED}分"
 echo "╠══════════════════════════════════════════════════════════╣"
+echo "║  完了ステップ:                                           ║"
+echo "║    ✓ Step 1: データ準備（カリキュラム学習）              ║"
+if $USE_ORPO; then
+  echo "║    ✓ Step 2: ORPO（SFT+DPO統合）                        ║"
+else
+  echo "║    ✓ Step 2: SFT / Step 3: DPO                           ║"
+fi
+echo "║    ✓ Step 4: 評価                                        ║"
+$USE_SPIN    && echo "║    ✓ Step 5: SPIN 反復自己改善                           ║"
+$USE_NEFTUNE && echo "║    ✓ Step 6: NEFTune 埋め込みノイズ                      ║"
+$USE_MERGE   && echo "║    ✓ Step 7: モデルマージ（TIES + MLX変換）              ║"
+echo "╠══════════════════════════════════════════════════════════╣"
 echo "║  生成物:                                                 ║"
-if $USE_SPIN; then
+if $USE_MERGE; then
+  echo "║    最終モデル: models/merged-japanese/                   ║"
+elif $USE_NEFTUNE; then
+  echo "║    最終モデル: adapters/14b-japanese-neftune/            ║"
+elif $USE_SPIN; then
   echo "║    最終モデル: data/spin/spin_state.json 参照            ║"
   echo "║    SPIN評価:   eval_results/after_spin/comparison.json  ║"
 else
