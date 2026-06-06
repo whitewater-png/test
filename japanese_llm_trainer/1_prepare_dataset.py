@@ -537,10 +537,67 @@ def generate_dpo_data() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# カリキュラム学習: 難易度スコアリング
+# ---------------------------------------------------------------------------
+
+def difficulty_score(record: dict) -> float:
+    """
+    難易度を0.0（簡単）〜1.0（難しい）で返す。
+    カリキュラム学習では簡単→難しい順で学習させる。
+
+    スコア要素:
+      - instruction の長さ・複雑さ
+      - output の長さ・語彙多様性
+      - 複数条件の有無
+    """
+    instruction = record.get("instruction", "")
+    output = record.get("output", "")
+
+    # 指示の長さ（長いほど複雑）
+    instr_len_score = min(len(instruction) / 300, 1.0) * 0.3
+
+    # 出力の長さ（長いほど複雑）
+    out_len_score = min(len(output) / 500, 1.0) * 0.25
+
+    # 複数条件の有無（箇条書き・番号付きリスト → 複雑）
+    has_conditions = bool(re.search(r"(\d+[．.。]|[①②③④⑤]|・.+・)", instruction))
+    condition_score = 0.2 if has_conditions else 0.0
+
+    # コードブロックの有無（技術的複雑さ）
+    has_code = "```" in instruction or "```" in output
+    code_score = 0.15 if has_code else 0.0
+
+    # 語彙多様性（出力の文字バイグラムTTR）
+    bigrams = [output[i:i+2] for i in range(len(output) - 1) if "぀" <= output[i] <= "鿿"]
+    vocab_score = (len(set(bigrams)) / max(len(bigrams), 1)) * 0.1 if bigrams else 0.0
+
+    return instr_len_score + out_len_score + condition_score + code_score + vocab_score
+
+
+def curriculum_sort(records: list[dict]) -> list[dict]:
+    """
+    カリキュラム学習順にソート（簡単→難しい）。
+    学習初期に簡単なサンプルを見せることで収束が安定する。
+    """
+    scored = [(difficulty_score(r), r) for r in records]
+    scored.sort(key=lambda x: x[0])
+    print(f"  カリキュラム学習: 難易度スコア {scored[0][0]:.3f}（最小）〜{scored[-1][0]:.3f}（最大）")
+    return [r for _, r in scored]
+
+
+# ---------------------------------------------------------------------------
 # メイン処理
 # ---------------------------------------------------------------------------
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--curriculum", action="store_true", default=True,
+                        help="カリキュラム学習順（簡単→難しい）でソート（デフォルト: ON）")
+    parser.add_argument("--no-curriculum", dest="curriculum", action="store_false",
+                        help="カリキュラム学習を無効化しランダム順にする")
+    args = parser.parse_args()
+
     random.seed(SEED)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     DPO_DIR.mkdir(parents=True, exist_ok=True)
@@ -567,19 +624,26 @@ def main():
     all_records = deduplicate(all_records)
     print(f"重複除去: {before} → {len(all_records)}件")
 
-    # シャッフル＆上限適用
+    # 上限適用（ソート前にシャッフルして多様性を確保してから上限）
     random.shuffle(all_records)
     single_limit = MAX_SAMPLES - len(multiturn_records)
     all_records = all_records[:single_limit]
 
-    # train / valid 分割
+    # train / valid 分割（validはランダムのまま）
     split_idx = int(len(all_records) * (1 - VALID_RATIO))
     train_single = all_records[:split_idx]
     valid_single = all_records[split_idx:]
 
-    # マルチターンをtrainにのみ追加
+    # カリキュラム学習ソート（train のみ適用）
+    if args.curriculum:
+        print("\n=== カリキュラム学習ソート ===")
+        train_single = curriculum_sort(train_single)
+    else:
+        random.shuffle(train_single)
+
+    # マルチターンをtrainの後半（難しい側）に追加
+    # マルチターンは構造的に複雑なので後半に配置
     train_all = train_single + [{"multiturn": r["multiturn"]} for r in multiturn_records]
-    random.shuffle(train_all)
 
     print(f"学習用: {len(train_all)}件  検証用: {len(valid_single)}件")
 

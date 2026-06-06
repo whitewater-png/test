@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-日本語能力評価スクリプト（拡張版）
+日本語能力評価スクリプト（拡張版 + ローカルLLM-as-Judge）
 ファインチューニング前後のモデルを比較評価する
 
-追加評価軸:
-    6. 敬語適切性       - 場面に応じた敬語レベルの使い分け
-    7. 文体一貫性       - です・ます調 / だ・である調の混在検出
-    8. 語彙品質         - 語彙の豊富さと反復の少なさ
+評価モード:
+    1. ルールベース（デフォルト）: キーワード・スタイル・語彙を自動採点
+    2. LLM-as-Judge（--use-llm-judge）: ローカルモデル自身に採点させる
+                                        APIなし・高精度・遅い
+
+評価カテゴリ:
+    1. 文法正確性    4. 文章執筆    7. 文体一貫性
+    2. 語彙豊富性    5. 指示理解    8. LLM総合評価（judge時のみ）
+    3. コーディング  6. 敬語適切性
 
 使い方:
-    python 3_evaluate.py [--model-path ./models/qwen3-8b-japanese]
     python 3_evaluate.py --compare
-    python 3_evaluate.py --model-path ./models/qwen3-8b-japanese-dpo --compare
+    python 3_evaluate.py --compare --use-llm-judge
+    python 3_evaluate.py --model-path ./models/qwen3-14b-japanese-orpo --compare --use-llm-judge
 """
 
 import json
@@ -399,15 +404,47 @@ SYSTEM_PROMPT = (
     "常に正確で自然な日本語で回答します。"
 )
 
+JUDGE_SYSTEM_PROMPT = (
+    "あなたは日本語の専門家です。与えられた質問と回答を、以下の基準で採点してください。"
+    "必ずJSON形式のみで返答してください。"
+)
+
+JUDGE_PROMPT_TEMPLATE = """以下の日本語回答を評価してください。
+
+【質問】
+{question}
+
+【回答】
+{answer}
+
+以下のJSON形式で採点結果を返してください（説明文は不要、JSONのみ）:
+{{
+  "naturalness": <1-10の整数>,
+  "accuracy": <1-10の整数>,
+  "keigo_appropriateness": <1-10の整数>,
+  "vocabulary_richness": <1-10の整数>,
+  "overall": <1-10の整数>,
+  "reason": "<50字以内の一言評価>"
+}}
+
+採点基準:
+- naturalness: 日本語として自然か（不自然な表現・機械的な文章でないか）
+- accuracy: 質問に正確に答えているか（事実誤認・論理的矛盾がないか）
+- keigo_appropriateness: 場面に応じた敬語レベルか
+- vocabulary_richness: 語彙が豊富で反復が少ないか
+- overall: 総合的な品質"""
+
 
 def run_mlx_inference(
     model_path: str,
     prompt: str,
     adapter_path: str | None,
     max_tokens: int,
+    system: str = SYSTEM_PROMPT,
+    temp: float = 0.3,
 ) -> str:
     full_prompt = (
-        f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+        f"<|im_start|>system\n{system}<|im_end|>\n"
         f"<|im_start|>user\n{prompt}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
@@ -416,7 +453,7 @@ def run_mlx_inference(
         sys.executable, "-m", "mlx_lm.generate",
         "--model", model_path,
         "--max-tokens", str(max_tokens),
-        "--temp", "0.3",
+        "--temp", str(temp),
         "--prompt", full_prompt,
     ]
 
@@ -435,6 +472,94 @@ def run_mlx_inference(
         return "(タイムアウト)"
     except Exception as e:
         return f"(エラー: {e})"
+
+
+# ---------------------------------------------------------------------------
+# ローカルLLM-as-Judge
+# ---------------------------------------------------------------------------
+
+def llm_judge_score(
+    judge_model_path: str,
+    question: str,
+    answer: str,
+    adapter_path: str | None = None,
+) -> dict | None:
+    """
+    ローカルモデルを審査員として使い、回答を採点する。
+    APIなしで高精度な評価が可能。
+    返り値: {naturalness, accuracy, keigo_appropriateness, vocabulary_richness, overall, reason}
+    """
+    if answer.startswith("("):  # エラー出力はスキップ
+        return None
+
+    judge_prompt = JUDGE_PROMPT_TEMPLATE.format(question=question, answer=answer)
+
+    raw = run_mlx_inference(
+        model_path=judge_model_path,
+        prompt=judge_prompt,
+        adapter_path=adapter_path,
+        max_tokens=200,
+        system=JUDGE_SYSTEM_PROMPT,
+        temp=0.1,  # 採点は低温度で一貫性を確保
+    )
+
+    # JSON部分を抽出
+    json_match = re.search(r"\{[^{}]+\}", raw, re.DOTALL)
+    if not json_match:
+        return None
+
+    try:
+        scores = json.loads(json_match.group())
+        # バリデーション（全キーが1-10の整数か）
+        required = ["naturalness", "accuracy", "keigo_appropriateness", "vocabulary_richness", "overall"]
+        for key in required:
+            val = scores.get(key)
+            if not isinstance(val, (int, float)) or not (1 <= val <= 10):
+                return None
+        return scores
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def run_llm_judge_batch(
+    judge_model_path: str,
+    tasks: list[EvalTask],
+    responses: list[str],
+    judge_adapter: str | None = None,
+) -> list[dict | None]:
+    """タスク一覧に対してLLM-as-Judgeを実行"""
+    results = []
+    total = len(tasks)
+    for i, (task, response) in enumerate(zip(tasks, responses), 1):
+        print(f"  Judge [{i:02d}/{total}] {task.id}...", end="", flush=True)
+        score = llm_judge_score(
+            judge_model_path=judge_model_path,
+            question=task.prompt,
+            answer=response,
+            adapter_path=judge_adapter,
+        )
+        if score:
+            print(f" overall={score['overall']}/10")
+        else:
+            print(" (採点失敗)")
+        results.append(score)
+    return results
+
+
+def aggregate_judge_scores(judge_results: list[dict | None]) -> dict:
+    """LLM-as-Judge のスコアを集計"""
+    valid = [r for r in judge_results if r is not None]
+    if not valid:
+        return {}
+
+    keys = ["naturalness", "accuracy", "keigo_appropriateness", "vocabulary_richness", "overall"]
+    averages = {
+        k: round(sum(r[k] for r in valid) / len(valid), 2)
+        for k in keys
+    }
+    averages["valid_count"] = len(valid)
+    averages["total_count"] = len(judge_results)
+    return averages
 
 
 # ---------------------------------------------------------------------------
@@ -521,16 +646,22 @@ def evaluate_model(
     model_path: str,
     adapter_path: str | None = None,
     output_file: str = "eval_results/results.json",
+    judge_model_path: str | None = None,
+    judge_adapter_path: str | None = None,
 ) -> dict:
     print(f"\n評価対象: {model_path}")
     if adapter_path:
         print(f"アダプター: {adapter_path}")
+    if judge_model_path:
+        print(f"Judgeモデル: {judge_model_path}")
 
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
 
     results = []
+    responses_for_judge = []
     category_scores: dict[str, list[float]] = {}
 
+    # --- 推論フェーズ ---
     for i, task in enumerate(EVAL_TASKS, 1):
         print(f"\n[{i:02d}/{len(EVAL_TASKS)}] {task.category} - {task.id}")
         print(f"  プロンプト: {task.prompt[:60]}...")
@@ -541,7 +672,7 @@ def evaluate_model(
 
         scores = score_response(task, response)
         style_label = scores["style_info"]["style"]
-        print(f"  スコア: {scores['percentage']:.1f}%  文体: {style_label}  ({elapsed:.1f}秒)")
+        print(f"  ルールスコア: {scores['percentage']:.1f}%  文体: {style_label}  ({elapsed:.1f}秒)")
         print(f"  応答: {response[:80]}...")
 
         results.append({
@@ -553,6 +684,7 @@ def evaluate_model(
             "scores": scores,
             "elapsed_sec": round(elapsed, 2),
         })
+        responses_for_judge.append(response)
 
         cat = task.category
         if cat not in category_scores:
@@ -573,7 +705,7 @@ def evaluate_model(
         if consistency_values else 1.0
     )
 
-    summary = {
+    summary: dict = {
         "model_path": model_path,
         "adapter_path": adapter_path,
         "overall_average": round(overall_avg, 1),
@@ -586,6 +718,32 @@ def evaluate_model(
         "results": results,
     }
 
+    # --- LLM-as-Judge フェーズ（オプション） ---
+    if judge_model_path:
+        print(f"\n=== LLM-as-Judge 評価 ({judge_model_path}) ===")
+        judge_results = run_llm_judge_batch(
+            judge_model_path=judge_model_path,
+            tasks=EVAL_TASKS,
+            responses=responses_for_judge,
+            judge_adapter=judge_adapter_path,
+        )
+
+        # 個別結果に付与
+        for result, jresult in zip(results, judge_results):
+            result["judge_scores"] = jresult
+
+        agg = aggregate_judge_scores(judge_results)
+        summary["llm_judge"] = agg
+        summary["llm_judge_overall"] = agg.get("overall", None)
+
+        if agg:
+            print(f"\nLLM-as-Judge 総合: {agg.get('overall', 'N/A')}/10")
+            print(f"  自然さ:     {agg.get('naturalness', 'N/A')}/10")
+            print(f"  正確さ:     {agg.get('accuracy', 'N/A')}/10")
+            print(f"  敬語:       {agg.get('keigo_appropriateness', 'N/A')}/10")
+            print(f"  語彙:       {agg.get('vocabulary_richness', 'N/A')}/10")
+            print(f"  (有効採点: {agg.get('valid_count', 0)}/{agg.get('total_count', 0)}件)")
+
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
@@ -596,8 +754,12 @@ def print_report(summary: dict, label: str = "評価レポート"):
     print("\n" + "=" * 60)
     print(label)
     print("=" * 60)
-    print(f"総合スコア:       {summary['overall_average']:.1f}%")
-    print(f"文体一貫性スコア: {summary.get('avg_style_consistency', 'N/A')}%")
+    print(f"総合スコア（ルールベース）: {summary['overall_average']:.1f}%")
+    print(f"文体一貫性スコア:           {summary.get('avg_style_consistency', 'N/A')}%")
+    if "llm_judge" in summary and summary["llm_judge"]:
+        j = summary["llm_judge"]
+        print(f"LLM-as-Judge 総合:         {j.get('overall', 'N/A')}/10")
+        print(f"  自然さ {j.get('naturalness','?'):.1f} | 正確さ {j.get('accuracy','?'):.1f} | 敬語 {j.get('keigo_appropriateness','?'):.1f} | 語彙 {j.get('vocabulary_richness','?'):.1f}")
     print()
     print("カテゴリ別スコア:")
     for cat, avg in summary["category_averages"].items():
@@ -612,13 +774,21 @@ def print_comparison(base: dict, ft: dict):
 
     diff = ft["overall_average"] - base["overall_average"]
     sign = "+" if diff >= 0 else ""
-    print(f"総合スコア: {base['overall_average']:.1f}% → {ft['overall_average']:.1f}%  ({sign}{diff:.1f}%)")
+    print(f"総合スコア（ルール）: {base['overall_average']:.1f}% → {ft['overall_average']:.1f}%  ({sign}{diff:.1f}%)")
 
     base_con = base.get("avg_style_consistency", 0)
     ft_con = ft.get("avg_style_consistency", 0)
     con_diff = ft_con - base_con
     sign_c = "+" if con_diff >= 0 else ""
-    print(f"文体一貫性: {base_con:.1f}% → {ft_con:.1f}%  ({sign_c}{con_diff:.1f}%)")
+    print(f"文体一貫性:           {base_con:.1f}% → {ft_con:.1f}%  ({sign_c}{con_diff:.1f}%)")
+
+    # LLM-as-Judge 比較（両方にある場合のみ）
+    bj = base.get("llm_judge", {})
+    fj = ft.get("llm_judge", {})
+    if bj and fj:
+        jo_diff = fj.get("overall", 0) - bj.get("overall", 0)
+        sign_j = "+" if jo_diff >= 0 else ""
+        print(f"LLM-as-Judge 総合:    {bj.get('overall','?')}/10 → {fj.get('overall','?')}/10  ({sign_j}{jo_diff:.1f})")
 
     print()
     print("カテゴリ別変化:")
@@ -639,16 +809,29 @@ def print_comparison(base: dict, ft: dict):
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="日本語LLM評価スクリプト（拡張版）")
-    parser.add_argument("--model-path", default="./models/qwen3-8b-japanese")
-    parser.add_argument("--base-model-path", default="./models/qwen3-8b")
+    parser = argparse.ArgumentParser(description="日本語LLM評価スクリプト（拡張版 + LLM-as-Judge）")
+    parser.add_argument("--model-path", default="./models/qwen3-14b-japanese-orpo")
+    parser.add_argument("--base-model-path", default="./models/qwen3-14b")
     parser.add_argument("--use-adapter", action="store_true")
-    parser.add_argument("--adapter-path", default="./adapters/japanese-dpo")
+    parser.add_argument("--adapter-path", default="./adapters/14b-japanese-orpo")
     parser.add_argument("--compare", action="store_true", help="ベースモデルとの比較")
     parser.add_argument("--output-dir", default="./eval_results")
+    parser.add_argument("--use-llm-judge", action="store_true",
+                        help="ローカルLLMを審査員として使用（APIなし・高精度・遅い）")
+    parser.add_argument("--judge-model", default=None,
+                        help="審査員モデルのパス（省略時はベースモデルを使用）")
     args = parser.parse_args()
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+
+    # LLM-as-Judge の審査員モデルを決定
+    judge_model = None
+    if args.use_llm_judge:
+        judge_model = args.judge_model or args.base_model_path
+        print(f"\nLLM-as-Judge モード: {judge_model}")
+        print("注意: 推論+採点で通常の約2倍の時間がかかります\n")
 
     if args.compare:
         print("\n[1/2] ベースモデルを評価中...")
@@ -656,6 +839,7 @@ def main():
             model_path=args.base_model_path,
             adapter_path=None,
             output_file=f"{args.output_dir}/base_results.json",
+            judge_model_path=judge_model,
         )
 
         print("\n[2/2] ファインチューニング済みモデルを評価中...")
@@ -665,18 +849,28 @@ def main():
             model_path=ft_model,
             adapter_path=ft_adapter,
             output_file=f"{args.output_dir}/finetuned_results.json",
+            judge_model_path=judge_model,
         )
 
         print_comparison(base, ft)
+
+        # LLM-as-Judge の改善量も記録
+        judge_improvement = {}
+        bj = base.get("llm_judge", {})
+        fj = ft.get("llm_judge", {})
+        if bj and fj:
+            for key in ["naturalness", "accuracy", "keigo_appropriateness", "vocabulary_richness", "overall"]:
+                judge_improvement[key] = round(fj.get(key, 0) - bj.get(key, 0), 2)
 
         comparison = {
             "base": base,
             "finetuned": ft,
             "improvement": {
-                "overall": round(ft["overall_average"] - base["overall_average"], 1),
+                "overall_rule": round(ft["overall_average"] - base["overall_average"], 1),
                 "style_consistency": round(
                     ft.get("avg_style_consistency", 0) - base.get("avg_style_consistency", 0), 1
                 ),
+                "llm_judge": judge_improvement,
                 "by_category": {
                     cat: round(
                         ft["category_averages"].get(cat, 0) - base["category_averages"].get(cat, 0), 1
@@ -696,6 +890,7 @@ def main():
             model_path=args.model_path,
             adapter_path=adapter,
             output_file=f"{args.output_dir}/results.json",
+            judge_model_path=judge_model,
         )
         print_report(summary)
 

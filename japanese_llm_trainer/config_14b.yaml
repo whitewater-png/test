@@ -1,0 +1,78 @@
+# Qwen3-14B 日本語ファインチューニング設定
+# MacBook Pro M4 Max 36GB 向け（メモリ最適化済み）
+#
+# メモリ試算:
+#   14Bモデル（4bit量子化）: ~9GB
+#   LoRA勾配（8レイヤー）:   ~8GB
+#   アクティベーション:      ~4GB
+#   ─────────────────────────────
+#   学習合計:               ~21GB
+#   macOS + 他アプリ:       ~10GB
+#   合計:                   ~31GB → 5GB余裕
+
+# モデル設定
+model: "Qwen/Qwen3-14B"
+model_path: "./models/qwen3-14b"
+
+# データ設定
+data_dir: "./data"
+train_file: "train.jsonl"
+valid_file: "valid.jsonl"
+
+# LoRA設定（14B × M4 Max 36GB 最適化）
+lora_layers: 8          # 8Bの16から削減（メモリ節約）
+lora_rank: 16           # ランクは維持
+lora_scale: 20.0
+use_dora: false
+use_rslora: false
+
+# 学習設定
+batch_size: 2           # 8Bの4から削減（必須）
+iters: 1000
+learning_rate: 0.0001
+lr_schedule: "cosine_decay"
+warmup_steps: 100
+val_batches: 25
+steps_per_eval: 200
+save_every: 200
+
+# 出力設定
+adapter_path: "./adapters/14b-japanese-v1"
+fused_model_path: "./models/qwen3-14b-japanese"
+
+# メモリ最適化（14B では必須）
+max_seq_length: 1024    # 14B では 2048 → 1024 に削減
+grad_checkpoint: true   # 必須（VRAM約30%削減）
+
+# シード
+seed: 42
+
+# システムプロンプト
+system_prompt: "あなたは優秀な日本語AIアシスタントです。アプリケーション開発と文章執筆を得意とし、常に正確で自然な日本語で回答します。"
+
+# -----------------------------------------------
+# ORPO設定（2c_orpo.py 用）
+# SFT + DPO を1ステップで実行する
+# -----------------------------------------------
+orpo:
+  beta: 0.1
+  iters: 1000           # SFT + DPO を1回でこなすため同ステップ数
+  batch_size: 2
+  learning_rate: 1e-4   # ORPOはSFTと同程度の学習率
+  max_seq_length: 1024
+  dpo_data_dir: "./data/dpo"
+  adapter_path: "./adapters/14b-japanese-orpo"
+  final_model_path: "./models/qwen3-14b-japanese-orpo"
+
+# -----------------------------------------------
+# DPO設定（2b_dpo.py 用 / ORPO不使用時のフォールバック）
+# -----------------------------------------------
+dpo:
+  beta: 0.1
+  iters: 500
+  batch_size: 2
+  learning_rate: 5e-5
+  max_seq_length: 1024
+  dpo_data_dir: "./data/dpo"
+  dpo_adapter_path: "./adapters/14b-japanese-dpo"
+  final_model_path: "./models/qwen3-14b-japanese-dpo"
