@@ -9,6 +9,15 @@ tqdm>=4.66.0
 # 設定ファイル読み込み
 pyyaml>=6.0
 
+# Spectrum解析（SNRベースのレイヤー選択）
+numpy>=1.26.0
+safetensors>=0.4.0
+
+# モデルマージ（TIES/DARE/SLERP）
+# mergekit はマージ実行時のみ必要。重いので任意インストール:
+#   pip install mergekit
+# mergekit>=0.0.5
+
 # オプション（詳細な評価・可視化）
 # matplotlib>=3.9.0
 # pandas>=2.2.0

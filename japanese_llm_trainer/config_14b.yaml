@@ -78,6 +78,27 @@ dpo:
   final_model_path: "./models/qwen3-14b-japanese-dpo"
 
 # -----------------------------------------------
+# NEFTune設定（2d_train_neftune.py 用）
+# 埋め込みノイズで指示追従性を +5〜10% 向上
+# -----------------------------------------------
+neftune:
+  neftune_alpha: 5.0           # 推奨5.0（論文では5〜15、大きすぎると不安定）
+  loss: "orpo"                 # "orpo"(推奨) か "default"(SFT)
+  model_path: "./models/qwen3-14b"
+  dpo_data_dir: "./data/dpo"
+  data_dir: "./data"
+  adapter_path: "./adapters/14b-japanese-neftune"
+  final_model_path: "./models/qwen3-14b-japanese-neftune"
+  lora_layers: 8
+  lora_rank: 16
+  lora_scale: 20.0
+  batch_size: 2
+  iters: 1000
+  learning_rate: 1e-4
+  max_seq_length: 1024
+  grad_checkpoint: true
+
+# -----------------------------------------------
 # SPIN設定（4_spin.py 用）
 # ORPO完了後に実行して反復的に品質向上する
 # -----------------------------------------------

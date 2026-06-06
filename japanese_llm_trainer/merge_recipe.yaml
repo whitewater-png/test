@@ -1,0 +1,33 @@
+# モデルマージ レシピ例（mergekit形式）
+# 5_merge.py --recipe merge_recipe.yaml で使用
+#
+# このレシピは「自作の日本語ORPOモデル」と「ELYZA日本語特化モデル」を
+# TIES法で融合する例。両者の長所を1モデルに統合する。
+#
+# 手法を変える場合:
+#   merge_method: linear | slerp | ties | dare_ties
+
+merge_method: ties
+
+# TIES/DARE のベースモデル（差分計算の基準）
+base_model: ./models/qwen3-14b
+
+models:
+  # 自作の日本語ファインチューニング済みモデル（高い重み）
+  - model: ./models/qwen3-14b-japanese-orpo
+    parameters:
+      weight: 0.6
+      density: 0.6        # 保持するパラメータ割合（TIES/DARE）
+
+  # SPIN反復で洗練されたモデル
+  - model: ./models/qwen3-14b-spin-iter3
+    parameters:
+      weight: 0.4
+      density: 0.5
+
+dtype: bfloat16
+
+# 注意:
+#  - 全モデルは同一アーキテクチャ（Qwen3-14B）である必要があります
+#  - 異なる日本語特化モデル（ELYZA等）を混ぜる場合も同一ベース必須
+#  - マージ後は 5_merge.py の --to-mlx でMLX形式へ変換してから評価
