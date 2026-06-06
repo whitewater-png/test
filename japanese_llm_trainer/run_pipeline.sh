@@ -4,18 +4,21 @@
 # MacBook Pro M4 Max 36GB 向け
 #
 # 使い方:
-#   chmod +x run_pipeline.sh
-#   ./run_pipeline.sh                        # 8B + SFT+DPO（デフォルト）
-#   ./run_pipeline.sh --model 14b            # 14B + ORPO（高品質）
-#   ./run_pipeline.sh --model 14b --orpo     # 14B + ORPO 明示指定
-#   ./run_pipeline.sh --test                 # テスト実行（約10分）
-#   ./run_pipeline.sh --from-orpo            # ORPOから再開
+#   ./run_pipeline.sh                        # 8B + SFT+DPO
+#   ./run_pipeline.sh --model 14b            # 14B + ORPO
+#   ./run_pipeline.sh --model 14b --spin     # 14B + ORPO + SPIN（推奨）
+#   ./run_pipeline.sh --test                 # テスト実行（約15分）
+#   ./run_pipeline.sh --from-spin            # SPINから再開
 #   ./run_pipeline.sh --use-llm-judge        # 評価にLLM-as-Judgeを使用
 #
 # メモリ使用量:
-#   8B  SFT: ~12GB / DPO: ~14GB / 推論: ~5GB
-#   14B ORPO: ~20GB           / 推論: ~9GB
-#   ※ 他アプリは常に16GB以上利用可能
+#   14B ORPO学習: ~21GB / SPIN学習: ~21GB / 推論: ~9GB
+#   ※ 他アプリは常に15GB以上利用可能
+#
+# 所要時間（14B + ORPO + SPIN 5回）:
+#   データ準備: ~10分 / ORPO: ~2〜3時間
+#   SPIN 1回:  ~90分（生成40分 + 採点30分 + 学習20分）
+#   SPIN 5回:  ~7〜8時間（就寝中に実行推奨）
 # =============================================================================
 
 set -euo pipefail
@@ -23,18 +26,20 @@ set -euo pipefail
 # デフォルト設定
 MODEL_SIZE="8b"
 USE_ORPO=false
+USE_SPIN=false
 TEST_MODE=false
 USE_LLM_JUDGE=false
 START_STEP=1
+SPIN_ITERATIONS=5
 
 # 引数解析
 for arg in "$@"; do
   case $arg in
-    --model)       shift; MODEL_SIZE="$1" ;;
-    --model=*)     MODEL_SIZE="${arg#*=}" ;;
     --model=14b|--14b)  MODEL_SIZE="14b" ;;
     --model=8b|--8b)    MODEL_SIZE="8b" ;;
     --orpo)        USE_ORPO=true ;;
+    --spin)        USE_SPIN=true ;;
+    --spin=*)      USE_SPIN=true; SPIN_ITERATIONS="${arg#*=}" ;;
     --test)        TEST_MODE=true ;;
     --use-llm-judge) USE_LLM_JUDGE=true ;;
     --from-data)   START_STEP=1 ;;
@@ -42,8 +47,9 @@ for arg in "$@"; do
     --from-dpo)    START_STEP=3 ;;
     --from-orpo)   START_STEP=3 ;;
     --from-eval)   START_STEP=4 ;;
+    --from-spin)   START_STEP=5 ;;
     --help|-h)
-      grep "^#" "$0" | head -20 | sed 's/^# //'
+      grep "^#" "$0" | head -25 | sed 's/^# //'
       exit 0
       ;;
   esac
@@ -109,7 +115,7 @@ else
 fi
 echo "╚══════════════════════════════════════════════════════════╝"
 echo ""
-echo "  設定: モデル=${MODEL_SIZE}B | ORPO=$( $USE_ORPO && echo ON || echo OFF ) | LLM-Judge=$( $USE_LLM_JUDGE && echo ON || echo OFF )"
+echo "  設定: モデル=${MODEL_SIZE}B | ORPO=$( $USE_ORPO && echo ON || echo OFF ) | SPIN=$( $USE_SPIN && echo "${SPIN_ITERATIONS}回" || echo OFF ) | LLM-Judge=$( $USE_LLM_JUDGE && echo ON || echo OFF )"
 echo ""
 echo "  Step 1: データ準備（品質フィルタ + カリキュラム学習ソート + DPOデータ）"
 if $USE_ORPO; then
@@ -122,6 +128,9 @@ if $USE_LLM_JUDGE; then
   echo "  Step 4: 評価（ルールベース + LLM-as-Judge）"
 else
   echo "  Step 4: 評価（ルールベース）"
+fi
+if $USE_SPIN; then
+  echo "  Step 5: SPIN 反復自己改善（最大${SPIN_ITERATIONS}回 → 自動収束）"
 fi
 echo ""
 
@@ -237,6 +246,52 @@ if [ "$START_STEP" -le 4 ]; then
 fi
 
 # =============================================================================
+# Step 5: SPIN 反復自己改善
+# =============================================================================
+if $USE_SPIN && [ "$START_STEP" -le 5 ]; then
+  log_step 5 "SPIN 反復自己改善ループ（最大${SPIN_ITERATIONS}回）"
+  log_info "生成 → 採点 → Preferenceペア生成 → ORPO を繰り返します"
+  log_info "推定時間: $( $TEST_MODE && echo '5分' || echo "SPIN1回あたり約90分 × 最大${SPIN_ITERATIONS}回（自動収束）" )"
+  log_mem "生成・採点: ~9GB / ORPO学習: ~21GB（フェーズごとに変動）"
+
+  SPIN_TEST_FLAG=""
+  if $TEST_MODE; then
+    SPIN_TEST_FLAG="--test-run"
+  fi
+
+  python 4_spin.py \
+    --config "$CONFIG" \
+    --iterations "$SPIN_ITERATIONS" \
+    --judge-model "$BASE_MODEL" \
+    $SPIN_TEST_FLAG
+
+  # SPIN最終モデルを評価（収束後）
+  SPIN_STATE_FILE="./data/spin/spin_state.json"
+  if [ -f "$SPIN_STATE_FILE" ]; then
+    SPIN_FINAL_MODEL=$(python3 -c "
+import json
+with open('$SPIN_STATE_FILE') as f:
+    s = json.load(f)
+print(s.get('current_model', ''))
+")
+    if [ -n "$SPIN_FINAL_MODEL" ] && [ -d "$SPIN_FINAL_MODEL" ]; then
+      log_info "SPIN最終モデルを評価中: $SPIN_FINAL_MODEL"
+      JUDGE_FLAG=""
+      if $USE_LLM_JUDGE; then
+        JUDGE_FLAG="--use-llm-judge --judge-model ${BASE_MODEL}"
+      fi
+      python 3_evaluate.py --compare \
+        --model-path "$SPIN_FINAL_MODEL" \
+        --base-model-path "$BASE_MODEL" \
+        --output-dir "./eval_results/after_spin" \
+        $JUDGE_FLAG
+    fi
+  fi
+
+  log_done "SPIN完了"
+fi
+
+# =============================================================================
 # 完了サマリー
 # =============================================================================
 END_TIME=$(date +%s)
@@ -249,8 +304,13 @@ printf "║  モデル: %-49s║\n" "Qwen3-${MODEL_SIZE}B"
 printf "║  経過時間: %-47s║\n" "${ELAPSED}分"
 echo "╠══════════════════════════════════════════════════════════╣"
 echo "║  生成物:                                                 ║"
-printf "║    最終モデル: %-43s║\n" "$(basename $FINAL_MODEL)/"
-echo "║    評価結果:   eval_results/comparison.json              ║"
+if $USE_SPIN; then
+  echo "║    最終モデル: data/spin/spin_state.json 参照            ║"
+  echo "║    SPIN評価:   eval_results/after_spin/comparison.json  ║"
+else
+  printf "║    最終モデル: %-43s║\n" "$(basename $FINAL_MODEL)/"
+  echo "║    評価結果:   eval_results/comparison.json              ║"
+fi
 echo "╠══════════════════════════════════════════════════════════╣"
 echo "║  Ollamaで使う場合:                                       ║"
 echo "║    ollama create qwen3-ja -f Modelfile                   ║"

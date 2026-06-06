@@ -76,3 +76,23 @@ dpo:
   dpo_data_dir: "./data/dpo"
   dpo_adapter_path: "./adapters/14b-japanese-dpo"
   final_model_path: "./models/qwen3-14b-japanese-dpo"
+
+# -----------------------------------------------
+# SPIN設定（4_spin.py 用）
+# ORPO完了後に実行して反復的に品質向上する
+# -----------------------------------------------
+spin:
+  model_path: "./models/qwen3-14b-japanese-orpo"  # ORPO済みから開始
+  base_model_path: "./models/qwen3-14b"
+  spin_data_dir: "./data/spin"
+  spin_adapter_base: "./adapters/spin"
+  spin_model_base: "./models/qwen3-14b-spin"
+  max_iterations: 5             # 最大5回（通常3〜4回で収束）
+  convergence_threshold: 2.0    # Judge改善が2点未満で収束
+  candidates_per_prompt: 4      # 各プロンプトで4候補生成
+  generation_temp: 0.8          # 多様性のため高め
+  judge_temp: 0.1               # 採点は安定性優先で低め
+  orpo_iters: 300               # SPINは精調整なので少なめ
+  orpo_batch_size: 2
+  orpo_lr: 5e-5                 # 精調整なので小さめ
+  orpo_beta: 0.1
