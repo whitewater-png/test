@@ -1,0 +1,41 @@
+# Qwen3-8B 日本語ファインチューニング設定
+# MacBook Pro M4 Max 36GB 最適化
+
+# モデル設定
+model: "Qwen/Qwen3-8B"
+model_path: "./models/qwen3-8b"
+
+# データ設定
+data_dir: "./data"
+train_file: "train.jsonl"
+valid_file: "valid.jsonl"
+
+# LoRA設定（M4 Max 36GB向け）
+# 他アプリを同時使用する場合は lora_layers: 8 に下げる
+lora_layers: 16
+lora_rank: 16
+lora_scale: 20.0
+
+# 学習設定
+batch_size: 4           # OOMなら 2 に下げる
+iters: 1000             # 約1〜2時間（M4 Max）
+learning_rate: 0.0001
+lr_schedule: "cosine_decay"
+warmup_steps: 100
+val_batches: 25
+steps_per_eval: 200
+save_every: 200
+
+# 出力設定
+adapter_path: "./adapters/japanese-v1"
+fused_model_path: "./models/qwen3-8b-japanese"
+
+# メモリ最適化
+max_seq_length: 2048    # 長いほどVRAM増加（OOMなら 1024 に下げる）
+grad_checkpoint: true   # trueでVRAM約30%削減
+
+# シード
+seed: 42
+
+# システムプロンプト（推論時）
+system_prompt: "あなたは優秀な日本語AIアシスタントです。アプリケーション開発と文章執筆を得意とし、常に正確で自然な日本語で回答します。"

@@ -1,0 +1,14 @@
+# ベース（Apple Silicon必須）
+mlx-lm>=0.21.0
+
+# データセット準備
+datasets>=2.20.0
+huggingface_hub>=0.23.0
+tqdm>=4.66.0
+
+# 設定ファイル読み込み
+pyyaml>=6.0
+
+# オプション（詳細な評価・可視化）
+# matplotlib>=3.9.0
+# pandas>=2.2.0
