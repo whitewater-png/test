@@ -1,0 +1,312 @@
+import Foundation
+
+/// マスコットの人格(全プロバイダー共通のシステムプロンプト)。
+enum AssistantPersona {
+    static let systemPrompt = """
+    あなたはデスクトップに住む小さなマスコットキャラクター「モチ」です。\
+    ユーザーのパソコン画面の隅にいて、話しかけられたらおしゃべりする相棒です。
+
+    - 明るくフレンドリーで、ちょっとおっとりした性格です
+    - 一人称は「ぼく」、語尾はやわらかく話します
+    - 返事は基本的に短く(1〜3文程度)。長い説明を求められたときだけ詳しく答えます
+    - 難しい質問にもできる範囲で誠実に答えます
+    - 絵文字をたまに使います(使いすぎない)
+    """
+}
+
+/// 1ターン分の会話(バックエンドに渡す中立表現)。
+struct ChatTurn {
+    let role: ChatRole
+    let text: String
+}
+
+struct BackendError: Error, LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
+
+/// AIプロバイダーの抽象。会話履歴を送り、応答テキストのチャンクを順次返す。
+protocol ChatBackend {
+    func streamReply(
+        history: [ChatTurn],
+        apiKey: String,
+        model: String
+    ) async throws -> AsyncThrowingStream<String, Error>
+}
+
+// MARK: - 共通ヘルパー
+
+/// リクエストを送り、HTTP 200 のときだけSSEバイト列を返す。
+/// 非200のときはボディを読み取り、プロバイダーのエラーメッセージを添えて投げる。
+private func openValidatedStream(_ request: URLRequest) async throws -> URLSession.AsyncBytes {
+    let (bytes, response) = try await URLSession.shared.bytes(for: request)
+    guard let http = response as? HTTPURLResponse else {
+        throw BackendError(message: "サーバーから不正な応答を受信しました")
+    }
+    guard http.statusCode == 200 else {
+        var body = ""
+        for try await line in bytes.lines { body += line }
+        throw BackendError(
+            message: parseProviderError(body) ?? "APIエラー (HTTP \(http.statusCode))"
+        )
+    }
+    return bytes
+}
+
+/// Anthropic / OpenAI / Google いずれも `{"error":{"message":...}}` 形式のためまとめて解釈する。
+private func parseProviderError(_ body: String) -> String? {
+    struct ErrorEnvelope: Decodable {
+        struct Detail: Decodable { let message: String? }
+        let error: Detail?
+    }
+    guard let data = body.data(using: .utf8) else { return body.isEmpty ? nil : body }
+    if let decoded = try? JSONDecoder().decode(ErrorEnvelope.self, from: data),
+       let message = decoded.error?.message {
+        return message
+    }
+    return body.isEmpty ? nil : body
+}
+
+/// SSEの1行から `data:` ペイロードを取り出す(先頭の空白も除去)。
+private func ssePayload(_ line: String) -> String? {
+    guard line.hasPrefix("data:") else { return nil }
+    var payload = String(line.dropFirst(5))
+    if payload.first == " " { payload.removeFirst() }
+    return payload
+}
+
+// MARK: - Anthropic (Claude Messages API)
+
+final class AnthropicBackend: ChatBackend {
+    func streamReply(
+        history: [ChatTurn],
+        apiKey: String,
+        model: String
+    ) async throws -> AsyncThrowingStream<String, Error> {
+        var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        request.timeoutInterval = 120
+
+        struct Message: Encodable {
+            let role: String
+            let content: String
+        }
+        struct Body: Encodable {
+            let model: String
+            let max_tokens: Int
+            let system: String
+            let stream: Bool
+            let messages: [Message]
+        }
+
+        let body = Body(
+            model: model,
+            max_tokens: 4096,
+            system: AssistantPersona.systemPrompt,
+            stream: true,
+            messages: history.map {
+                Message(role: $0.role == .user ? "user" : "assistant", content: $0.text)
+            }
+        )
+        request.httpBody = try JSONEncoder().encode(body)
+
+        let bytes = try await openValidatedStream(request)
+
+        struct Event: Decodable {
+            let type: String
+            let delta: Delta?
+            struct Delta: Decodable {
+                let type: String?
+                let text: String?
+            }
+        }
+
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await line in bytes.lines {
+                        guard let payload = ssePayload(line),
+                              let data = payload.data(using: .utf8),
+                              let event = try? JSONDecoder().decode(Event.self, from: data)
+                        else { continue }
+
+                        switch event.type {
+                        case "content_block_delta":
+                            if event.delta?.type == "text_delta", let text = event.delta?.text {
+                                continuation.yield(text)
+                            }
+                        case "message_stop":
+                            continuation.finish()
+                            return
+                        case "error":
+                            continuation.finish(
+                                throwing: BackendError(message: "ストリーミング中にエラーが発生しました")
+                            )
+                            return
+                        default:
+                            break
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+}
+
+// MARK: - OpenAI (Chat Completions API)
+
+final class OpenAIBackend: ChatBackend {
+    func streamReply(
+        history: [ChatTurn],
+        apiKey: String,
+        model: String
+    ) async throws -> AsyncThrowingStream<String, Error> {
+        var request = URLRequest(url: URL(string: "https://api.openai.com/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 120
+
+        struct Message: Encodable {
+            let role: String
+            let content: String
+        }
+        struct Body: Encodable {
+            let model: String
+            let stream: Bool
+            let max_tokens: Int
+            let messages: [Message]
+        }
+
+        var messages = [Message(role: "system", content: AssistantPersona.systemPrompt)]
+        messages += history.map {
+            Message(role: $0.role == .user ? "user" : "assistant", content: $0.text)
+        }
+        let body = Body(model: model, stream: true, max_tokens: 4096, messages: messages)
+        request.httpBody = try JSONEncoder().encode(body)
+
+        let bytes = try await openValidatedStream(request)
+
+        struct Chunk: Decodable {
+            struct Choice: Decodable {
+                struct Delta: Decodable { let content: String? }
+                let delta: Delta?
+            }
+            let choices: [Choice]
+        }
+
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await line in bytes.lines {
+                        guard let payload = ssePayload(line) else { continue }
+                        if payload == "[DONE]" {
+                            continuation.finish()
+                            return
+                        }
+                        guard let data = payload.data(using: .utf8),
+                              let chunk = try? JSONDecoder().decode(Chunk.self, from: data)
+                        else { continue }
+
+                        if let text = chunk.choices.first?.delta?.content, !text.isEmpty {
+                            continuation.yield(text)
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+}
+
+// MARK: - Google (Gemini generateContent API)
+
+final class GoogleBackend: ChatBackend {
+    func streamReply(
+        history: [ChatTurn],
+        apiKey: String,
+        model: String
+    ) async throws -> AsyncThrowingStream<String, Error> {
+        // alt=sse を付けると Server-Sent Events 形式で返る
+        let urlString =
+            "https://generativelanguage.googleapis.com/v1beta/models/\(model):streamGenerateContent?alt=sse"
+        guard let url = URL(string: urlString) else {
+            throw BackendError(message: "モデル名が不正です: \(model)")
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+        request.timeoutInterval = 120
+
+        struct Part: Encodable { let text: String }
+        struct Content: Encodable {
+            let role: String
+            let parts: [Part]
+        }
+        struct SystemInstruction: Encodable { let parts: [Part] }
+        struct GenerationConfig: Encodable { let maxOutputTokens: Int }
+        struct Body: Encodable {
+            let systemInstruction: SystemInstruction
+            let contents: [Content]
+            let generationConfig: GenerationConfig
+        }
+
+        let contents = history.map {
+            // Gemini のロールは user / model
+            Content(role: $0.role == .user ? "user" : "model", parts: [Part(text: $0.text)])
+        }
+        let body = Body(
+            systemInstruction: SystemInstruction(parts: [Part(text: AssistantPersona.systemPrompt)]),
+            contents: contents,
+            generationConfig: GenerationConfig(maxOutputTokens: 4096)
+        )
+        request.httpBody = try JSONEncoder().encode(body)
+
+        let bytes = try await openValidatedStream(request)
+
+        struct Chunk: Decodable {
+            struct Candidate: Decodable {
+                struct Content: Decodable {
+                    struct Part: Decodable { let text: String? }
+                    let parts: [Part]?
+                }
+                let content: Content?
+            }
+            let candidates: [Candidate]?
+        }
+
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await line in bytes.lines {
+                        guard let payload = ssePayload(line),
+                              let data = payload.data(using: .utf8),
+                              let chunk = try? JSONDecoder().decode(Chunk.self, from: data)
+                        else { continue }
+
+                        if let parts = chunk.candidates?.first?.content?.parts {
+                            let text = parts.compactMap { $0.text }.joined()
+                            if !text.isEmpty { continuation.yield(text) }
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+}

@@ -8,9 +8,9 @@ import SwiftUI
 /// チャットを閉じている間はキャラクター分の最小サイズに縮めておく)
 final class MascotWindow: NSWindow {
     /// チャットを閉じているとき(キャラクターのみ)のサイズ
-    static let compactSize = NSSize(width: 180, height: 190)
+    static let compactSize = NSSize(width: 200, height: 260)
     /// チャットを開いているときのサイズ
-    static let expandedSize = NSSize(width: 340, height: 600)
+    static let expandedSize = NSSize(width: 340, height: 680)
 
     init() {
         let screenFrame = NSScreen.main?.visibleFrame

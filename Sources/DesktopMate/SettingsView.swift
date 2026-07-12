@@ -1,50 +1,143 @@
+import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SettingsView: View {
-    @State private var apiKey: String = AppSettings.loadAPIKey() ?? ""
+    @State private var provider: LLMProvider = AppSettings.selectedProvider
+    @State private var apiKey: String = ""
+    @State private var model: String = ""
     @State private var statusText: String?
 
+    @State private var hasCustomImage = MascotImageStore.hasCustomImage()
+    @State private var removeWhiteBackground = MascotImageStore.removeWhiteBackground
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Anthropic APIキー")
+        VStack(alignment: .leading, spacing: 18) {
+            providerSection
+
+            Divider()
+
+            imageSection
+        }
+        .padding(20)
+        .frame(width: 460)
+        .onAppear { loadForProvider(provider) }
+    }
+
+    // MARK: - AIプロバイダー設定
+
+    private var providerSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("AIプロバイダー設定")
                 .font(.headline)
 
-            Text("マスコットとの会話にはClaude APIを使用します。[Anthropic Console](https://console.anthropic.com/settings/keys) で発行したAPIキーを入力してください。キーはmacOSのキーチェーンに安全に保存されます。")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            Picker("プロバイダー", selection: $provider) {
+                ForEach(LLMProvider.allCases) { provider in
+                    Text(provider.displayName).tag(provider)
+                }
+            }
+            .onChange(of: provider) { _, newValue in
+                statusText = nil
+                loadForProvider(newValue)
+            }
 
-            SecureField("sk-ant-…", text: $apiKey)
-                .textFieldStyle(.roundedBorder)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("APIキー").font(.subheadline)
+                SecureField(provider.keyPlaceholder, text: $apiKey)
+                    .textFieldStyle(.roundedBorder)
+                Text(provider.keyHelp)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("モデル").font(.subheadline)
+                TextField(provider.defaultModel, text: $model)
+                    .textFieldStyle(.roundedBorder)
+                Text("空欄にすると既定 (\(provider.defaultModel)) を使います。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
             HStack {
-                Button("保存") {
-                    let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if AppSettings.saveAPIKey(trimmed) {
-                        statusText = trimmed.isEmpty ? "APIキーを削除しました" : "保存しました ✓"
-                    } else {
-                        statusText = "キーチェーンへの保存に失敗しました"
-                    }
-                }
-                .keyboardShortcut(.defaultAction)
-
+                Button("保存") { save() }
+                    .keyboardShortcut(.defaultAction)
                 if let statusText {
                     Text(statusText)
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
-
                 Spacer()
             }
+        }
+    }
 
-            Divider()
+    // MARK: - キャラクター画像
 
-            Text("環境変数 `ANTHROPIC_API_KEY` が設定されている場合は、キーチェーンに保存がなければそちらが使われます。")
+    private var imageSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("キャラクター画像")
+                .font(.headline)
+
+            Text("お気に入りの画像 (PNG / JPEG) を選ぶと、マスコットがその絵に変わります。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Button("画像を選択…") { pickImage() }
+                if hasCustomImage {
+                    Button("デフォルトに戻す") {
+                        MascotImageStore.clear()
+                        hasCustomImage = false
+                    }
+                }
+            }
+
+            Toggle("白い背景を透過する", isOn: $removeWhiteBackground)
+                .onChange(of: removeWhiteBackground) { _, newValue in
+                    MascotImageStore.removeWhiteBackground = newValue
+                }
+            Text("背景が白い一枚絵でも、白地を抜いてキャラクターだけを浮かせます。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(20)
-        .frame(width: 420)
+    }
+
+    // MARK: - アクション
+
+    private func loadForProvider(_ provider: LLMProvider) {
+        apiKey = AppSettings.storedKey(for: provider) ?? ""
+        model = AppSettings.model(for: provider)
+    }
+
+    private func save() {
+        AppSettings.selectedProvider = provider
+        AppSettings.setModel(model, for: provider)
+        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if AppSettings.saveAPIKey(trimmedKey, for: provider) {
+            statusText = "保存しました ✓"
+        } else {
+            statusText = "キーチェーンへの保存に失敗しました"
+        }
+    }
+
+    private func pickImage() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.png, .jpeg, .image]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.prompt = "設定"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        do {
+            try MascotImageStore.importImage(from: url)
+            hasCustomImage = true
+            statusText = "キャラクター画像を設定しました ✓"
+        } catch {
+            statusText = "画像の読み込みに失敗しました"
+        }
     }
 }

@@ -25,7 +25,6 @@ final class ChatViewModel: ObservableObject {
     /// 自動スクロールのトリガー
     @Published var scrollTick = 0
 
-    private let client = ClaudeClient()
     private var currentTask: Task<Void, Never>?
 
     var isResponding: Bool {
@@ -42,31 +41,30 @@ final class ChatViewModel: ObservableObject {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !isResponding else { return }
 
-        guard let apiKey = AppSettings.resolveAPIKey() else {
-            errorMessage = "APIキーが未設定です。メニューバーのアイコン → 「設定」からAnthropic APIキーを登録してください。"
+        let provider = AppSettings.selectedProvider
+        guard let apiKey = AppSettings.apiKey(for: provider) else {
+            errorMessage = "\(provider.displayName) のAPIキーが未設定です。メニューバーのアイコン → 「設定」から登録してください。"
             return
         }
+        let model = AppSettings.model(for: provider)
+        let backend = provider.makeBackend()
 
         inputText = ""
         errorMessage = nil
         messages.append(ChatMessage(role: .user, text: text))
         scrollTick += 1
 
-        let history = messages.map { message in
-            ClaudeClient.APIMessage(
-                role: message.role == .user ? "user" : "assistant",
-                content: message.text
-            )
-        }
+        let history = messages.map { ChatTurn(role: $0.role, text: $0.text) }
 
         isWaitingForFirstToken = true
 
         currentTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let stream = try await self.client.streamReply(
+                let stream = try await backend.streamReply(
                     history: history,
-                    apiKey: apiKey
+                    apiKey: apiKey,
+                    model: model
                 )
 
                 // Intのインデックスではなく UUID で追記先メッセージを特定する。

@@ -18,7 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         NSApp.activate()
 
-        if AppSettings.resolveAPIKey() == nil {
+        if AppSettings.apiKey(for: AppSettings.selectedProvider) == nil {
             openSettings()
         }
     }
@@ -77,7 +77,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let window = NSWindow(contentViewController: hosting)
         window.title = "DesktopMate 設定"
         window.styleMask = [.titled, .closable]
-        window.setContentSize(NSSize(width: 420, height: 260))
+        window.setContentSize(NSSize(width: 460, height: 560))
         window.center()
         window.isReleasedWhenClosed = false
         window.makeKeyAndOrderFront(nil)

@@ -1,3 +1,5 @@
+import AppKit
+import Combine
 import SwiftUI
 
 enum MascotMood {
@@ -6,15 +8,72 @@ enum MascotMood {
     case talking
 }
 
-/// デスクトップに住むまんまるマスコット。
-/// SwiftUIの図形だけで描画しているため、画像アセット不要。
+/// デスクトップに住むマスコット。
+/// ユーザーが画像を設定していればそれを、なければ図形で描いたまんまるキャラを表示する。
 struct MascotView: View {
     let mood: MascotMood
 
     @State private var isBobbing = false
     @State private var isBlinking = false
+    @State private var customImage: NSImage?
 
     var body: some View {
+        Group {
+            if let image = customImage {
+                imageMascot(image)
+            } else {
+                drawnMascot
+            }
+        }
+        .onAppear {
+            reloadImage()
+            isBobbing = true
+        }
+        // 設定画面で画像や透過設定が変わったら反映する
+        .onReceive(NotificationCenter.default.publisher(for: MascotImageStore.didChangeNotification)) { _ in
+            reloadImage()
+        }
+        .task {
+            await blinkLoop()
+        }
+    }
+
+    private func reloadImage() {
+        customImage = MascotImageStore.loadProcessedImage()
+    }
+
+    // MARK: - ユーザー画像のマスコット
+
+    private func imageMascot(_ image: NSImage) -> some View {
+        ZStack {
+            // 影(接地感)
+            Ellipse()
+                .fill(Color.black.opacity(0.18))
+                .frame(width: 120, height: 20)
+                .offset(y: 120)
+                .blur(radius: 3)
+
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 190, height: 250)
+                .offset(y: isBobbing ? -5 : 5)
+                .animation(
+                    .easeInOut(duration: 1.8).repeatForever(autoreverses: true),
+                    value: isBobbing
+                )
+
+            if mood == .thinking {
+                ThinkingDotsView()
+                    .offset(x: 60, y: -120)
+            }
+        }
+        .frame(width: 200, height: 260)
+    }
+
+    // MARK: - 図形で描いたマスコット(画像未設定時)
+
+    private var drawnMascot: some View {
         ZStack {
             // 影(接地感)
             Ellipse()
@@ -72,13 +131,7 @@ struct MascotView: View {
                 value: isBobbing
             )
         }
-        .frame(width: 160, height: 150)
-        .onAppear {
-            isBobbing = true
-        }
-        .task {
-            await blinkLoop()
-        }
+        .frame(width: 200, height: 260)
     }
 
     private var eye: some View {
