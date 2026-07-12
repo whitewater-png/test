@@ -31,7 +31,7 @@ struct ChatBubbleView: View {
 
     private var header: some View {
         HStack {
-            Text("モチとおしゃべり")
+            Text("セナとおしゃべり")
                 .font(.headline)
             Spacer()
             if !chat.messages.isEmpty {
@@ -56,7 +56,7 @@ struct ChatBubbleView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
                     if chat.messages.isEmpty {
-                        Text("こんにちは！なんでも話しかけてね 🍡")
+                        Text("おハロー！ なんでも話しかけてね！")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .center)

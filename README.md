@@ -1,11 +1,11 @@
 # DesktopMate 🍡
 
-デスクトップに住む小さなマスコット「モチ」と、AIでおしゃべりできるMac用アプリです。
+デスクトップに住む小さなマスコット「セナ」と、AIでおしゃべりできるMac用アプリです。
 [Desktop Mate](https://www.infiniteloop.co.jp/desktopmate) のように、キャラクターが常に画面の隅にいて、話しかけるとAI(Anthropic Claude / OpenAI GPT / Google Gemini)が返事をしてくれます。
 
 ```
         ┌──────────────────┐
-        │  モチとおしゃべり      │
+        │  セナとおしゃべり      │
         │ ┌──────────────┐ │
         │ │ こんにちは！     │ │
         │ │    やっほー！🍡 │ │
