@@ -55,10 +55,22 @@ enum MascotImageStore {
         NotificationCenter.default.post(name: didChangeNotification, object: nil)
     }
 
-    /// 表示用の画像を返す(設定に応じて白背景を透過)。未設定なら nil。
+    /// 表示用の画像を返す。
+    /// ユーザーが選んだ画像があればそれ(設定に応じて白背景を透過)、
+    /// なければ同梱の既定キャラクター画像を返す。どちらも無ければ nil。
     static func loadProcessedImage() -> NSImage? {
-        guard hasCustomImage(), let image = NSImage(contentsOf: sourceURL) else { return nil }
-        return removeWhiteBackground ? imageByRemovingWhite(image) : image
+        if hasCustomImage(), let image = NSImage(contentsOf: sourceURL) {
+            return removeWhiteBackground ? imageByRemovingWhite(image) : image
+        }
+        return bundledDefaultImage()
+    }
+
+    /// アプリに同梱した既定キャラクター画像(透過PNG)。
+    static func bundledDefaultImage() -> NSImage? {
+        guard let url = Bundle.module.url(forResource: "mascot-default", withExtension: "png") else {
+            return nil
+        }
+        return NSImage(contentsOf: url)
     }
 
     // MARK: - 白背景の透過処理

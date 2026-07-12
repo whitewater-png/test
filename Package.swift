@@ -9,7 +9,11 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "DesktopMate",
-            path: "Sources/DesktopMate"
+            path: "Sources/DesktopMate",
+            resources: [
+                // 既定のキャラクター画像を同梱する
+                .process("Resources")
+            ]
         )
     ]
 )
