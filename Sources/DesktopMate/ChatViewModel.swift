@@ -69,29 +69,46 @@ final class ChatViewModel: ObservableObject {
                     apiKey: apiKey
                 )
 
-                var assistantIndex: Int?
+                // Intのインデックスではなく UUID で追記先メッセージを特定する。
+                // 受信中に会話がリセットされても、古いインデックスで
+                // 配列外アクセスしてクラッシュすることがないようにするため。
+                var assistantID: UUID?
                 for try await chunk in stream {
-                    if assistantIndex == nil {
+                    if Task.isCancelled { break }
+
+                    if assistantID == nil {
                         self.isWaitingForFirstToken = false
                         self.isStreaming = true
-                        self.messages.append(ChatMessage(role: .assistant, text: ""))
-                        assistantIndex = self.messages.count - 1
+                        let message = ChatMessage(role: .assistant, text: "")
+                        assistantID = message.id
+                        self.messages.append(message)
                     }
-                    if let index = assistantIndex {
+                    if let id = assistantID {
+                        guard let index = self.messages.firstIndex(where: { $0.id == id }) else {
+                            // 会話がリセットされて追記先が消えた場合は受信を打ち切る
+                            break
+                        }
                         self.messages[index].text += chunk
                         self.scrollTick += 1
                     }
                 }
 
                 // 一文字も返らずに終了した場合(セーフティ拒否など)
-                if assistantIndex == nil {
+                if assistantID == nil, !Task.isCancelled {
                     self.errorMessage = "応答を取得できませんでした。もう一度試してみてください。"
                 }
             } catch {
-                self.errorMessage = "エラー: \(error.localizedDescription)"
+                // リセットによるキャンセルはエラーとして表示しない
+                if !Task.isCancelled {
+                    self.errorMessage = "エラー: \(error.localizedDescription)"
+                }
             }
-            self.isWaitingForFirstToken = false
-            self.isStreaming = false
+            // キャンセル時は clearConversation() 側で状態をリセット済み。
+            // (直後に始まった新しい送信の状態を上書きしないようにする)
+            if !Task.isCancelled {
+                self.isWaitingForFirstToken = false
+                self.isStreaming = false
+            }
         }
     }
 

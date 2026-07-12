@@ -38,7 +38,7 @@ cat > "${APP_DIR}/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
+    <string>14.0</string>
     <key>LSUIElement</key>
     <true/>
     <key>NSHighResolutionCapable</key>
@@ -48,8 +48,9 @@ cat > "${APP_DIR}/Contents/Info.plist" <<'PLIST'
 PLIST
 
 echo "==> Ad-hoc code signing..."
-codesign --force --deep --sign - "${APP_DIR}"
+codesign --force --sign - "${APP_DIR}"
 
 echo ""
 echo "完了! dist/${APP_NAME}.app が生成されました。"
 echo "open dist/${APP_NAME}.app で起動できます。"
+echo "注意: ad-hoc署名のため、配布する場合はDeveloper ID署名+公証(notarization)が必要です。"

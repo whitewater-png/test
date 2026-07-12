@@ -49,6 +49,8 @@ enum AppSettings {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecValueData as String: Data(value.utf8),
+            // ロック解除中のみアクセス可・iCloudキーチェーンに同期しない
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
         ]
         return SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess
     }

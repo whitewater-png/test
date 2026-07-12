@@ -16,7 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         mascotWindow = window
 
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
 
         if AppSettings.resolveAPIKey() == nil {
             openSettings()
@@ -62,14 +62,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.orderOut(nil)
         } else {
             window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            NSApp.activate()
         }
     }
 
     @objc func openSettings() {
         if let window = settingsWindow {
             window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            NSApp.activate()
             return
         }
 
@@ -81,7 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.center()
         window.isReleasedWhenClosed = false
         window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
         settingsWindow = window
     }
 

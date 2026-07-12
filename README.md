@@ -30,7 +30,7 @@
 
 ## 動作環境
 
-- macOS 13 (Ventura) 以降
+- macOS 14 (Sonoma) 以降
 - Swift 5.9 以降 (Xcode 15+ または Command Line Tools)
 - Anthropic APIキー ([Anthropic Console](https://console.anthropic.com/settings/keys) で発行)
 

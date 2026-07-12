@@ -42,6 +42,8 @@ struct ChatBubbleView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
+                // 応答受信中のリセットは受信処理と競合するため無効化する
+                .disabled(chat.isResponding)
                 .help("会話をリセット")
             }
         }
@@ -80,7 +82,7 @@ struct ChatBubbleView: View {
                 }
                 .padding(12)
             }
-            .onChange(of: chat.scrollTick) { _ in
+            .onChange(of: chat.scrollTick) { _, _ in
                 if let lastID = chat.messages.last?.id {
                     withAnimation(.easeOut(duration: 0.15)) {
                         proxy.scrollTo(lastID, anchor: .bottom)
