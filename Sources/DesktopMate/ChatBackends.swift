@@ -240,9 +240,32 @@ final class OpenAIBackend: ChatBackend {
 // MARK: - Google (Gemini generateContent API)
 
 final class GoogleBackend: ChatBackend {
-    /// モデル名が無効(404)だった場合に試す既知の有効モデル。
+    /// モデル名が無効だった場合に試す既知の有効モデル。
     /// 将来のモデル名変更で「動かない」状態を避けるための自己修復用。
     private static let fallbackModels = ["gemini-2.0-flash", "gemini-1.5-flash"]
+
+    /// 入力されたモデル名をGemini APIのID形式へ正規化する。
+    /// - 前後の空白と「models/」接頭辞を除去
+    /// - 表示名(スペースや大文字を含む)は小文字化しスペースをハイフンに
+    ///   例: "Gemini 3.1 Flash Lite" → "gemini-3.1-flash-lite"
+    static func normalizedModelName(_ raw: String) -> String {
+        var name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if name.hasPrefix("models/") {
+            name.removeFirst("models/".count)
+        }
+        if name.contains(" ") || name.contains(where: { $0.isUppercase }) {
+            name = name.lowercased().replacingOccurrences(of: " ", with: "-")
+        }
+        return name
+    }
+
+    /// このエラーなら別のモデル候補を試すべきか。
+    /// モデル未検出(404)や、モデル名の形式エラー(400でメッセージが model に言及)が対象。
+    static func shouldTryNextModel(_ error: BackendError) -> Bool {
+        if error.statusCode == 404 { return true }
+        if error.statusCode == 400, error.message.lowercased().contains("model") { return true }
+        return false
+    }
 
     func streamReply(
         history: [ChatTurn],
@@ -289,8 +312,10 @@ final class GoogleBackend: ChatBackend {
             return request
         }
 
-        // 指定モデル → 既知の有効モデル の順に試す。404(モデル未検出)のときだけ次へ。
-        var candidates = [model]
+        // 入力モデル名を正規化(例:「Gemini 3.1 Flash Lite」→「gemini-3.1-flash-lite」)
+        // → 既知の有効モデル の順に試す。モデル未検出/名前形式エラーのときだけ次へ。
+        let requested = Self.normalizedModelName(model)
+        var candidates = [requested]
         for fallback in Self.fallbackModels where !candidates.contains(fallback) {
             candidates.append(fallback)
         }
@@ -300,12 +325,12 @@ final class GoogleBackend: ChatBackend {
         for candidate in candidates {
             do {
                 bytes = try await openValidatedStream(try makeRequest(for: candidate))
-                // 指定モデルが無効で別モデルに切り替わった場合は設定を更新して次回から直接使う
+                // 別モデルに切り替わった/正規化された場合は設定を更新して次回から直接使う
                 if candidate != model {
                     AppSettings.setModel(candidate, for: .google)
                 }
                 break
-            } catch let error as BackendError where error.statusCode == 404 {
+            } catch let error as BackendError where Self.shouldTryNextModel(error) {
                 lastError = error
                 continue
             }
