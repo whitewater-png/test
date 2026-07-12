@@ -22,6 +22,13 @@ struct ChatTurn {
 
 struct BackendError: Error, LocalizedError {
     let message: String
+    var statusCode: Int?
+
+    init(message: String, statusCode: Int? = nil) {
+        self.message = message
+        self.statusCode = statusCode
+    }
+
     var errorDescription: String? { message }
 }
 
@@ -47,7 +54,8 @@ private func openValidatedStream(_ request: URLRequest) async throws -> URLSessi
         var body = ""
         for try await line in bytes.lines { body += line }
         throw BackendError(
-            message: parseProviderError(body) ?? "APIエラー (HTTP \(http.statusCode))"
+            message: parseProviderError(body) ?? "APIエラー (HTTP \(http.statusCode))",
+            statusCode: http.statusCode
         )
     }
     return bytes
@@ -232,24 +240,15 @@ final class OpenAIBackend: ChatBackend {
 // MARK: - Google (Gemini generateContent API)
 
 final class GoogleBackend: ChatBackend {
+    /// モデル名が無効(404)だった場合に試す既知の有効モデル。
+    /// 将来のモデル名変更で「動かない」状態を避けるための自己修復用。
+    private static let fallbackModels = ["gemini-2.0-flash", "gemini-1.5-flash"]
+
     func streamReply(
         history: [ChatTurn],
         apiKey: String,
         model: String
     ) async throws -> AsyncThrowingStream<String, Error> {
-        // alt=sse を付けると Server-Sent Events 形式で返る
-        let urlString =
-            "https://generativelanguage.googleapis.com/v1beta/models/\(model):streamGenerateContent?alt=sse"
-        guard let url = URL(string: urlString) else {
-            throw BackendError(message: "モデル名が不正です: \(model)")
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
-        request.timeoutInterval = 120
-
         struct Part: Encodable { let text: String }
         struct Content: Encodable {
             let role: String
@@ -272,9 +271,49 @@ final class GoogleBackend: ChatBackend {
             contents: contents,
             generationConfig: GenerationConfig(maxOutputTokens: 4096)
         )
-        request.httpBody = try JSONEncoder().encode(body)
+        let encodedBody = try JSONEncoder().encode(body)
 
-        let bytes = try await openValidatedStream(request)
+        func makeRequest(for model: String) throws -> URLRequest {
+            // alt=sse を付けると Server-Sent Events 形式で返る
+            let urlString =
+                "https://generativelanguage.googleapis.com/v1beta/models/\(model):streamGenerateContent?alt=sse"
+            guard let url = URL(string: urlString) else {
+                throw BackendError(message: "モデル名が不正です: \(model)")
+            }
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+            request.timeoutInterval = 120
+            request.httpBody = encodedBody
+            return request
+        }
+
+        // 指定モデル → 既知の有効モデル の順に試す。404(モデル未検出)のときだけ次へ。
+        var candidates = [model]
+        for fallback in Self.fallbackModels where !candidates.contains(fallback) {
+            candidates.append(fallback)
+        }
+
+        var bytes: URLSession.AsyncBytes?
+        var lastError: Error?
+        for candidate in candidates {
+            do {
+                bytes = try await openValidatedStream(try makeRequest(for: candidate))
+                // 指定モデルが無効で別モデルに切り替わった場合は設定を更新して次回から直接使う
+                if candidate != model {
+                    AppSettings.setModel(candidate, for: .google)
+                }
+                break
+            } catch let error as BackendError where error.statusCode == 404 {
+                lastError = error
+                continue
+            }
+        }
+
+        guard let bytes else {
+            throw lastError ?? BackendError(message: "Geminiに接続できませんでした")
+        }
 
         struct Chunk: Decodable {
             struct Candidate: Decodable {
