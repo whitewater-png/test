@@ -16,10 +16,14 @@ struct MascotView: View {
     @State private var isBobbing = false
     @State private var isBlinking = false
     @State private var customImage: NSImage?
+    @State private var vrmActive = VRMStore.hasVRM()
+    @State private var vrmToken = 0
 
     var body: some View {
         Group {
-            if let image = customImage {
+            if vrmActive {
+                vrmMascot
+            } else if let image = customImage {
                 imageMascot(image)
             } else {
                 drawnMascot
@@ -33,6 +37,11 @@ struct MascotView: View {
         .onReceive(NotificationCenter.default.publisher(for: MascotImageStore.didChangeNotification)) { _ in
             reloadImage()
         }
+        // VRMの選択/解除を反映する
+        .onReceive(NotificationCenter.default.publisher(for: VRMStore.didChangeNotification)) { _ in
+            vrmActive = VRMStore.hasVRM()
+            vrmToken += 1
+        }
         .task {
             await blinkLoop()
         }
@@ -40,6 +49,21 @@ struct MascotView: View {
 
     private func reloadImage() {
         customImage = MascotImageStore.loadProcessedImage()
+    }
+
+    // MARK: - VRM(3Dモデル)のマスコット
+
+    private var vrmMascot: some View {
+        ZStack(alignment: .top) {
+            VRMView(reloadToken: vrmToken)
+                .frame(width: 200, height: 260)
+
+            if mood == .thinking {
+                ThinkingDotsView()
+                    .padding(.top, 4)
+            }
+        }
+        .frame(width: 200, height: 260)
     }
 
     // MARK: - ユーザー画像のマスコット

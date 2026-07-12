@@ -11,16 +11,24 @@ struct SettingsView: View {
     @State private var hasCustomImage = MascotImageStore.hasCustomImage()
     @State private var removeWhiteBackground = MascotImageStore.removeWhiteBackground
 
+    @State private var hasVRM = VRMStore.hasVRM()
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            providerSection
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                providerSection
 
-            Divider()
+                Divider()
 
-            imageSection
+                imageSection
+
+                Divider()
+
+                vrmSection
+            }
+            .padding(20)
         }
-        .padding(20)
-        .frame(width: 460)
+        .frame(width: 460, height: 620)
         .onAppear { loadForProvider(provider) }
     }
 
@@ -106,6 +114,35 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - 3Dモデル (VRM)
+
+    private var vrmSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("3Dモデル (VRM)")
+                .font(.headline)
+
+            Text("VRMファイル (.vrm) を選ぶと、3Dアバターとして表示します(画像より優先)。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Button("VRMを選択…") { pickVRM() }
+                if hasVRM {
+                    Button("VRMを外す") {
+                        VRMStore.clear()
+                        hasVRM = false
+                    }
+                }
+            }
+
+            Text("※ 3D描画ライブラリを起動時にインターネットから読み込みます(要ネット接続)。表示位置やサイズはモデルにより調整が必要な場合があります。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     // MARK: - アクション
 
     private func loadForProvider(_ provider: LLMProvider) {
@@ -138,6 +175,25 @@ struct SettingsView: View {
             statusText = "キャラクター画像を設定しました ✓"
         } catch {
             statusText = "画像の読み込みに失敗しました"
+        }
+    }
+
+    private func pickVRM() {
+        let panel = NSOpenPanel()
+        if let vrmType = UTType(filenameExtension: "vrm") {
+            panel.allowedContentTypes = [vrmType]
+        }
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.prompt = "設定"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        do {
+            try VRMStore.importVRM(from: url)
+            hasVRM = true
+            statusText = "VRMモデルを設定しました ✓"
+        } catch {
+            statusText = "VRMの読み込みに失敗しました"
         }
     }
 }
