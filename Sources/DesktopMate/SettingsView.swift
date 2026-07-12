@@ -118,25 +118,25 @@ struct SettingsView: View {
 
     private var vrmSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("3Dモデル (VRM)")
+            Text("3Dモデル (VRM / GLB)")
                 .font(.headline)
 
-            Text("VRMファイル (.vrm) を選ぶと、3Dアバターとして表示します(画像より優先)。")
+            Text("VRM/GLB/glTF ファイルを選ぶと、3Dアバターとして表示します(画像より優先)。VRM拡張があればまばたき等も動き、素のGLBは3Dモデルとして表示します。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
             HStack {
-                Button("VRMを選択…") { pickVRM() }
+                Button("モデルを選択…") { pickVRM() }
                 if hasVRM {
-                    Button("VRMを外す") {
+                    Button("モデルを外す") {
                         VRMStore.clear()
                         hasVRM = false
                     }
                 }
             }
 
-            Text("※ 3D描画ライブラリを起動時にインターネットから読み込みます(要ネット接続)。表示位置やサイズはモデルにより調整が必要な場合があります。")
+            Text("※ 3D描画ライブラリを起動時にインターネットから読み込みます(要ネット接続)。表示位置やサイズはモデルにより調整が必要な場合があります。.gltf は外部ファイル参照があると読み込めないことがあります(自己完結の .glb 推奨)。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -180,8 +180,10 @@ struct SettingsView: View {
 
     private func pickVRM() {
         let panel = NSOpenPanel()
-        if let vrmType = UTType(filenameExtension: "vrm") {
-            panel.allowedContentTypes = [vrmType]
+        // .vrm / .glb / .gltf を選べるようにする(解決できた型だけ許可)
+        let types = ["vrm", "glb", "gltf"].compactMap { UTType(filenameExtension: $0) }
+        if !types.isEmpty {
+            panel.allowedContentTypes = types
         }
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
@@ -191,9 +193,9 @@ struct SettingsView: View {
         do {
             try VRMStore.importVRM(from: url)
             hasVRM = true
-            statusText = "VRMモデルを設定しました ✓"
+            statusText = "3Dモデルを設定しました ✓"
         } catch {
-            statusText = "VRMの読み込みに失敗しました"
+            statusText = "モデルの読み込みに失敗しました"
         }
     }
 }

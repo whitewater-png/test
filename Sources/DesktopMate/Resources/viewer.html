@@ -65,28 +65,45 @@ try {
   window.addEventListener('resize', resize);
   resize();
 
-  let currentVRM = null;
+  let currentVRM = null;      // VRM拡張がある場合のみ
+  let displayObject = null;   // 表示中のオブジェクト(VRM/素のglTF共通)
+  let mixer = null;           // 素のglTFにアニメーションがある場合
   const clock = new THREE.Clock();
 
   const loader = new GLTFLoader();
   loader.register((parser) => new VRMLoaderPlugin(parser));
 
+  // 拡張子は .vrm 固定で保存しているが、GLTFLoader は中身(glTFバイナリ)で
+  // 判別するため、.glb / .gltf を .vrm 名で保存していても読み込める。
   loader.load(
     './model.vrm',
     (gltf) => {
       const vrm = gltf.userData.vrm;
-      currentVRM = vrm;
-      try { VRMUtils.removeUnnecessaryVertices?.(gltf.scene); } catch (_) {}
-      try { VRMUtils.combineSkeletons?.(gltf.scene); } catch (_) {}
 
-      // VRM0 は VRM1 と正面の向きが逆。-Z 向きに正規化してからカメラを -Z 側に置く。
-      const isVRM0 = !!(vrm.meta && (vrm.meta.metaVersion === '0' || vrm.meta.metaVersion === 0));
-      scene.add(vrm.scene);
-      if (isVRM0) { try { VRMUtils.rotateVRM0?.(vrm); } catch (_) {} }
-      vrm.scene.updateWorldMatrix(true, true);
+      if (vrm) {
+        // VRM拡張あり(.vrm、またはVRM拡張入りの.glb)
+        currentVRM = vrm;
+        displayObject = vrm.scene;
+        try { VRMUtils.removeUnnecessaryVertices?.(gltf.scene); } catch (_) {}
+        try { VRMUtils.combineSkeletons?.(gltf.scene); } catch (_) {}
+        scene.add(vrm.scene);
+        // VRM0 は VRM1 と正面の向きが逆。-Z 向きに正規化する。
+        const isVRM0 = !!(vrm.meta && (vrm.meta.metaVersion === '0' || vrm.meta.metaVersion === 0));
+        if (isVRM0) { try { VRMUtils.rotateVRM0?.(vrm); } catch (_) {} }
+      } else {
+        // VRM拡張なしの素の glTF / GLB。3Dモデルとして表示する。
+        displayObject = gltf.scene;
+        scene.add(displayObject);
+        if (gltf.animations && gltf.animations.length) {
+          mixer = new THREE.AnimationMixer(displayObject);
+          gltf.animations.forEach((clip) => mixer.clipAction(clip).play());
+        }
+      }
+
+      displayObject.updateWorldMatrix(true, true);
 
       // 顔〜上半身が収まるようにカメラを自動調整(モデルの寸法から算出)
-      const box = new THREE.Box3().setFromObject(vrm.scene);
+      const box = new THREE.Box3().setFromObject(displayObject);
       const size = box.getSize(new THREE.Vector3());
       const center = box.getCenter(new THREE.Vector3());
       const lookY = box.max.y - size.y * 0.16;
@@ -121,9 +138,15 @@ try {
           nextBlink = 2 + Math.random() * 3;
         }
       }
-      // ゆるやかな呼吸のような上下動
-      currentVRM.scene.position.y = Math.sin(performance.now() / 1400) * 0.01;
       currentVRM.update(dt);
+    }
+
+    // 素のglTFにアニメーションがあれば再生
+    if (mixer) { mixer.update(dt); }
+
+    // ゆるやかな呼吸のような上下動(VRM/素モデル共通)
+    if (displayObject) {
+      displayObject.position.y = Math.sin(performance.now() / 1400) * 0.01;
     }
 
     renderer.render(scene, camera);
