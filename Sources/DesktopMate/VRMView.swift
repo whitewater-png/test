@@ -16,10 +16,6 @@ struct VRMView: NSViewRepresentable {
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.setURLSchemeHandler(context.coordinator, forURLScheme: VRMView.scheme)
-        // モデルのバイト列は fetch ではなく、このメッセージハンドラ経由で JS に渡す。
-        config.userContentController.addScriptMessageHandler(
-            context.coordinator, contentWorld: .page, name: "model"
-        )
 
         let webView = WKWebView(frame: .zero, configuration: config)
 
@@ -47,7 +43,7 @@ struct VRMView: NSViewRepresentable {
         Coordinator(reloadToken: reloadToken)
     }
 
-    final class Coordinator: NSObject, WKURLSchemeHandler, WKScriptMessageHandlerWithReply {
+    final class Coordinator: NSObject, WKURLSchemeHandler {
         var lastToken: Int
 
         init(reloadToken: Int) {
@@ -57,21 +53,6 @@ struct VRMView: NSViewRepresentable {
         func load(into webView: WKWebView) {
             guard let url = URL(string: "\(VRMView.scheme)://app/viewer.html") else { return }
             webView.load(URLRequest(url: url))
-        }
-
-        // MARK: - WKScriptMessageHandlerWithReply
-        // JS から要求されたら、モデルのバイト列を base64 文字列で返す。
-
-        func userContentController(
-            _ userContentController: WKUserContentController,
-            didReceive message: WKScriptMessage,
-            replyHandler: @escaping (Any?, String?) -> Void
-        ) {
-            guard let data = try? Data(contentsOf: VRMStore.modelURL) else {
-                replyHandler(nil, "モデルファイルが見つかりません")
-                return
-            }
-            replyHandler(data.base64EncodedString(), nil)
         }
 
         // MARK: - WKURLSchemeHandler
@@ -87,21 +68,21 @@ struct VRMView: NSViewRepresentable {
 
             switch url.lastPathComponent {
             case "viewer.html":
-                // viewer.html の //__VRM_BUNDLE__ マーカーを、同梱の bundle.js
-                // (three.js + three-vrm + 描画ロジック)で差し替えてインライン配信する。
-                // これによりサブリソース読込もCDNアクセスも不要になる。
+                // viewer.html に、同梱の bundle.js(three.js + three-vrm + 描画ロジック)と
+                // モデルのバイト列(base64)を差し込んでインライン配信する。
+                // これで fetch・メッセージハンドラ・CDN・サブリソース読込を全て排除し、
+                // 唯一「このHTMLをスキーム配信する」仕組みだけで完結する。
                 if let htmlURL = Bundle.module.url(forResource: "viewer", withExtension: "html"),
                    var html = try? String(contentsOf: htmlURL, encoding: .utf8) {
                     if let bundleURL = Bundle.module.url(forResource: "bundle", withExtension: "js"),
                        let js = try? String(contentsOf: bundleURL, encoding: .utf8) {
                         html = html.replacingOccurrences(of: "//__VRM_BUNDLE__", with: js)
                     }
+                    let modelB64 = (try? Data(contentsOf: VRMStore.modelURL))?.base64EncodedString() ?? ""
+                    html = html.replacingOccurrences(of: "__MODEL_B64_TOKEN__", with: modelB64)
                     payload = html.data(using: .utf8)
                 }
                 mimeType = "text/html; charset=utf-8"
-            case "model.vrm":
-                payload = try? Data(contentsOf: VRMStore.modelURL)
-                mimeType = "model/gltf-binary"
             default:
                 break
             }

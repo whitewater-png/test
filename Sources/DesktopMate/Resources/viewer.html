@@ -18,17 +18,20 @@
 <div id="err"></div>
 
 <!-- 3Dライブラリ(three.js + @pixiv/three-vrm)と描画ロジックを同梱。
-     ネット接続不要・サブリソース読込なし(CDN依存を排除)。
-     このスクリプトの中身は Swift 側が bundle.js を読み込んで差し込む。 -->
+     中身は Swift 側が bundle.js を読み込んで差し込む。CDN・サブリソース読込なし。 -->
 <script>
 //__VRM_BUNDLE__
 </script>
 
+<!-- モデルのバイト列(base64)も Swift 側がここに差し込む。fetch もメッセージ
+     ハンドラも使わず、全てを1つのHTMLに含める(唯一使う仕組みは、動作実績のある
+     「スキームハンドラがこのHTMLを配信する」ことだけ)。 -->
+<script>window.__MODEL_B64__ = "__MODEL_B64_TOKEN__";</script>
+
 <script>
-  // モデルのバイト列は Swift から base64 で受け取る(fetch は一切使わない)
   window.__startVRM__(async function () {
-    const b64 = await window.webkit.messageHandlers.model.postMessage('get');
-    if (!b64) { throw new Error('モデルデータが空です'); }
+    const b64 = window.__MODEL_B64__ || '';
+    if (!b64) { throw new Error('モデルが設定されていません'); }
     const binary = atob(b64);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) { bytes[i] = binary.charCodeAt(i); }
