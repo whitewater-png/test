@@ -13,6 +13,9 @@ struct VRMView: NSViewRepresentable {
     /// この値が変わると再読み込みする(モデル差し替え時)
     let reloadToken: Int
 
+    /// チャットの状態(考え中/発話中)。VRMの表情・動きに連動させる。
+    let mood: MascotMood
+
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.setURLSchemeHandler(context.coordinator, forURLScheme: VRMView.scheme)
@@ -35,8 +38,27 @@ struct VRMView: NSViewRepresentable {
     func updateNSView(_ webView: WKWebView, context: Context) {
         if context.coordinator.lastToken != reloadToken {
             context.coordinator.lastToken = reloadToken
+            context.coordinator.lastMoodKey = ""   // 再読み込み後に状態を再送する
             context.coordinator.load(into: webView)
         }
+        pushState(to: webView, coordinator: context.coordinator)
+    }
+
+    /// チャット状態の変化を JS(__setState__)へ送り、表情・動きに反映する。
+    private func pushState(to webView: WKWebView, coordinator: Coordinator) {
+        let moodStr: String
+        let talking: Bool
+        switch mood {
+        case .idle: moodStr = "idle"; talking = false
+        case .thinking: moodStr = "thinking"; talking = false
+        case .talking: moodStr = "talking"; talking = true
+        }
+        let key = "\(moodStr)-\(talking)"
+        guard coordinator.lastMoodKey != key else { return }
+        coordinator.lastMoodKey = key
+
+        let js = "window.__setState__ && window.__setState__({mood:'\(moodStr)',talking:\(talking)})"
+        webView.evaluateJavaScript(js, completionHandler: nil)
     }
 
     func makeCoordinator() -> Coordinator {
@@ -45,6 +67,7 @@ struct VRMView: NSViewRepresentable {
 
     final class Coordinator: NSObject, WKURLSchemeHandler {
         var lastToken: Int
+        var lastMoodKey: String = ""
 
         init(reloadToken: Int) {
             self.lastToken = reloadToken

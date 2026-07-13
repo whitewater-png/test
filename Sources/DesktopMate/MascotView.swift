@@ -55,7 +55,7 @@ struct MascotView: View {
 
     private var vrmMascot: some View {
         ZStack(alignment: .top) {
-            VRMView(reloadToken: vrmToken)
+            VRMView(reloadToken: vrmToken, mood: mood)
                 .frame(width: 200, height: 260)
 
             if mood == .thinking {
