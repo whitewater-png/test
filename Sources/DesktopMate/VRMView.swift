@@ -10,6 +10,10 @@ import WebKit
 struct VRMView: NSViewRepresentable {
     static let scheme = "desktopmate"
 
+    /// メニューの「しぐさ」指示を VRM に伝えるための通知
+    /// (userInfo["name"] に "sit" / "stand" / "wave")
+    static let gestureNotification = Notification.Name("DesktopMate.gesture")
+
     /// この値が変わると再読み込みする(モデル差し替え時)
     let reloadToken: Int
 
@@ -37,6 +41,7 @@ struct VRMView: NSViewRepresentable {
 
         context.coordinator.load(into: webView)
         context.coordinator.startPointerTracking(webView)
+        context.coordinator.startGestureObserver(webView)
         return webView
     }
 
@@ -80,12 +85,16 @@ struct VRMView: NSViewRepresentable {
 
         private weak var webView: WKWebView?
         private var pointerTimer: Timer?
+        private var gestureObserver: NSObjectProtocol?
 
         init(reloadToken: Int) {
             self.lastToken = reloadToken
         }
 
-        deinit { pointerTimer?.invalidate() }
+        deinit {
+            pointerTimer?.invalidate()
+            if let o = gestureObserver { NotificationCenter.default.removeObserver(o) }
+        }
 
         func load(into webView: WKWebView) {
             guard let url = URL(string: "\(VRMView.scheme)://app/viewer.html") else { return }
@@ -110,6 +119,22 @@ struct VRMView: NSViewRepresentable {
         func stopPointerTracking() {
             pointerTimer?.invalidate()
             pointerTimer = nil
+        }
+
+        // MARK: - しぐさ(メニューからの指示)
+
+        /// メニューの「しぐさ」通知を購読し、JS(__gesture__)へ転送する。
+        func startGestureObserver(_ webView: WKWebView) {
+            if gestureObserver != nil { return }
+            gestureObserver = NotificationCenter.default.addObserver(
+                forName: VRMView.gestureNotification, object: nil, queue: .main
+            ) { [weak webView] note in
+                guard let webView = webView,
+                      let name = note.userInfo?["name"] as? String else { return }
+                // 想定値(sit/stand/wave)以外は無視して注入を安全にする
+                guard ["sit", "stand", "wave"].contains(name) else { return }
+                webView.evaluateJavaScript("window.__gesture__ && window.__gesture__('\(name)')", completionHandler: nil)
+            }
         }
 
         private func tickPointer() {

@@ -58,6 +58,7 @@ async function start(getBytes) {
     const bone = {};
     const baseArmZ = THREE.MathUtils.degToRad(72); // 腕を下ろす角度
     let baseRootY = Math.PI;
+    let modelHeight = 1.5; // 座る時の沈み込み量などに使う(読み込み後に実測値へ)
 
     loader.parse(buffer, '', (gltf) => {
       const vrm = gltf.userData.vrm;
@@ -87,6 +88,7 @@ async function start(getBytes) {
       displayObject.updateWorldMatrix(true, true);
       const box = new THREE.Box3().setFromObject(displayObject);
       const size = box.getSize(new THREE.Vector3());
+      modelHeight = size.y;
       const center = box.getCenter(new THREE.Vector3());
       const dist = size.y * 1.95 + 0.4;
       camera.position.set(center.x, center.y, dist);
@@ -107,6 +109,17 @@ async function start(getBytes) {
     let headPitch = 0, headPitchTarget = 0;     // 頭の上下
     let lookH = 0, lookV = 0;                   // 'look' 行動での注視方向
     let walkAmt = 0, walkAmtTarget = 0, legPhase = 0; // 足踏み
+    let sitAmt = 0;                    // 0=立つ 1=座る(なめらかに遷移)
+    let waveAmt = 0, waveUntil = -1e9; // 大きく手を振る(時間指定)
+
+    // メニューからの「しぐさ」指示(Swiftが __gesture__ を呼ぶ)
+    // 'sit'=座る / 'stand'=立つ / 'wave'=頭上で大きく手を振る
+    let poseMode = 'stand';
+    window.__gesture__ = function (name) {
+      if (name === 'sit') poseMode = 'sit';
+      else if (name === 'stand') poseMode = 'stand';
+      else if (name === 'wave') waveUntil = performance.now() + 3200;
+    };
 
     function pickIdleBehavior() {
       const r = Math.random();
@@ -119,6 +132,7 @@ async function start(getBytes) {
 
     // テスト用: 特定の行動を強制する(アプリでは未使用。ヘッドレス検証で使う)
     window.__debugForce__ = function (name, dur) { behavior = name; behaviorDur = dur || 6; behaviorTime = 0; if (name === 'turn') bodyYawTarget = Math.PI * 0.6; if (name === 'look') { lookH = 0.5; lookV = 0.2; } };
+    window.__setYaw__ = function (v) { bodyYawTarget = v; }; // テスト用: 体の向きを固定(横から確認)
 
     function animate() {
       requestAnimationFrame(animate);
@@ -138,19 +152,25 @@ async function start(getBytes) {
         else { behavior = cls; behaviorDur = 1.5; behaviorTime = 0; }
       }
 
-      // 行動ごとの目標値
-      walkAmtTarget = (behavior === 'walk') ? 1 : 0;
+      // しぐさ(座る/手を振る)の量をなめらかに更新
+      sitAmt = lerp(sitAmt, poseMode === 'sit' ? 1 : 0, Math.min(1, dt * 4));
+      const waving = performance.now() < waveUntil;
+      waveAmt = lerp(waveAmt, waving ? 1 : 0, Math.min(1, dt * 6));
+
+      // 行動ごとの目標値(座っている間は歩かない)
+      walkAmtTarget = (behavior === 'walk' && sitAmt < 0.5) ? 1 : 0;
 
       // 頭・体の目標の向きを状況で決める
       if (pointerActive) {
-        // カーソルを体と頭で追いかける(頭を大きめ、体を控えめに)
+        // カーソルを体と頭で追いかける(頭を大きめ、体を控えめに)。
+        // 縦は「カーソルが上→見上げる」になるよう pointer.y をそのまま使う。
         headYawTarget = clamp(pointer.x * LOOK_SIGN * 0.6, -0.7, 0.7);
-        headPitchTarget = clamp(-pointer.y * 0.35, -0.35, 0.45);
+        headPitchTarget = clamp(pointer.y * 0.4, -0.4, 0.45);
         bodyYawTarget = clamp(pointer.x * LOOK_SIGN * 0.5, -0.6, 0.6);
       } else if (behavior === 'look') {
         headYawTarget = lookH; headPitchTarget = lookV;
       } else if (thinking) {
-        headYawTarget = 0.12; headPitchTarget = -0.14;
+        headYawTarget = 0.12; headPitchTarget = 0.12;
       } else {
         headYawTarget = 0; headPitchTarget = 0;
       }
@@ -175,7 +195,7 @@ async function start(getBytes) {
         setExpr('aa', mouthCur);
 
         // --- 表情 ---
-        const happyTarget = talking ? 0.35 : 0.12;
+        const happyTarget = waveAmt > 0.1 ? 0.6 : (talking ? 0.35 : 0.12);
         happyCur += (happyTarget - happyCur) * Math.min(1, dt * 4);
         setExpr('happy', happyCur);
         const relaxTarget = thinking ? 0.5 : 0.0;
@@ -194,31 +214,59 @@ async function start(getBytes) {
         // --- 上半身の軽いひねり(体の向きに追従)---
         if (bone.spine) bone.spine.rotation.y = bodyYaw * 0.25;
 
-        // --- 足踏み(その場歩き)+ 腕振り ---
+        // --- 脚: 足踏み(歩行) を 座りポーズ とブレンドする ---
         const walking = walkAmt > 0.02;
         if (walking) legPhase += dt * 7;
-        const sw = Math.sin(legPhase) * walkAmt;
-        if (bone.lUpLeg) bone.lUpLeg.rotation.x = 0.42 * sw;
-        if (bone.rUpLeg) bone.rUpLeg.rotation.x = -0.42 * sw;
-        if (bone.lLoLeg) bone.lLoLeg.rotation.x = Math.max(0, -sw) * 0.6 * walkAmt;
-        if (bone.rLoLeg) bone.rLoLeg.rotation.x = Math.max(0, sw) * 0.6 * walkAmt;
+        const sw = Math.sin(legPhase) * walkAmt;   // 太ももの前後スイング
+        const cw = Math.cos(legPhase) * walkAmt;   // 膝の曲げ(通過相)用の位相
+        // 実際の歩行サイクルに合わせる:
+        //  ・太ももは前後に振る(接地の前後では脚は伸ばす)
+        //  ・膝は「遊脚が体の下を通過する瞬間」だけ曲げる(cos が正の半周期)
+        //    → 前後の接地(sin が極値)では膝は伸び、接地脚は真っ直ぐになる
+        const THIGH = 0.5, KNEE = 1.05;
+        const walkThighL = -THIGH * sw, walkThighR = THIGH * sw;
+        const walkShinL = Math.max(0, cw) * KNEE, walkShinR = Math.max(0, -cw) * KNEE;
+        // 座り時の脚角度(太ももを前へ上げ、膝を曲げる。左右少し開く)
+        const sp = window.__sitp__ || {};
+        const sitThigh = (sp.thigh !== undefined ? sp.thigh : -1.35);
+        const sitShin = (sp.shin !== undefined ? sp.shin : 1.5);
+        const sitOpen = 0.18;
+        if (bone.lUpLeg) { bone.lUpLeg.rotation.x = lerp(walkThighL, sitThigh, sitAmt); bone.lUpLeg.rotation.z = lerp(0, sitOpen, sitAmt); }
+        if (bone.rUpLeg) { bone.rUpLeg.rotation.x = lerp(walkThighR, sitThigh, sitAmt); bone.rUpLeg.rotation.z = lerp(0, -sitOpen, sitAmt); }
+        if (bone.lLoLeg) bone.lLoLeg.rotation.x = lerp(walkShinL, sitShin, sitAmt);
+        if (bone.rLoLeg) bone.rLoLeg.rotation.x = lerp(walkShinR, sitShin, sitAmt);
+        if (bone.hips) bone.hips.rotation.x = lerp(0, (sp.hips !== undefined ? sp.hips : 0.1), sitAmt);
+        if (bone.spine) bone.spine.rotation.x = lerp(0, (sp.lean !== undefined ? sp.lean : 0.12), sitAmt); // 上体を少し前傾
 
-        // 腕: 基本は下ろした姿勢。歩行中だけ、左右対称に前後へ小さく振る。
-        // (片腕だけを動かすと不自然なので、両腕を必ず同じ扱いにする)
-        if (bone.lUpArm) { bone.lUpArm.rotation.z = baseArmZ; bone.lUpArm.rotation.x = -0.16 * sw; }
-        if (bone.rUpArm) { bone.rUpArm.rotation.z = -baseArmZ; bone.rUpArm.rotation.x = 0.16 * sw; }
+        // --- 腕: 通常は下ろした姿勢(歩行中は左右対称に前後へ小さく振る)。
+        //     手を振る時は右腕を頭上へ上げて大きく振る ---
+        let lArmZ = baseArmZ, lArmX = -0.16 * sw;
+        let rArmZ = -baseArmZ, rArmX = 0.16 * sw;
+        if (waveAmt > 0.01) {
+          // 右腕を頭上へ上げる(z を大きく) + 左右へ大きく振る
+          const swing = Math.sin(t * 9) * 0.32;
+          rArmZ = lerp(rArmZ, 1.35 + swing, waveAmt);
+          rArmX = lerp(rArmX, -0.1, waveAmt);
+          if (bone.rLoArm) bone.rLoArm.rotation.z = lerp(bone.rLoArm.rotation.z || 0, -0.25, waveAmt);
+        } else if (bone.rLoArm) {
+          bone.rLoArm.rotation.z = lerp(bone.rLoArm.rotation.z || 0, 0, Math.min(1, dt * 6));
+        }
+        if (bone.lUpArm) { bone.lUpArm.rotation.z = lArmZ; bone.lUpArm.rotation.x = lArmX; }
+        if (bone.rUpArm) { bone.rUpArm.rotation.z = rArmZ; bone.rUpArm.rotation.x = rArmX; }
 
         currentVRM.update(dt);
       }
       if (mixer) mixer.update(dt);
 
-      // --- ルート: 体の向き + 待機の揺れ + 呼吸/足踏みの上下動 ---
+      // --- ルート: 体の向き + 待機の揺れ + 呼吸/足踏みの上下動 + 座りの沈み込み ---
       if (displayObject) {
-        const sway = Math.sin(t * 1.1) * 0.03 * (talking ? 1 : 0.4);
+        const sway = Math.sin(t * 1.1) * 0.03 * (talking ? 1 : 0.4) * (1 - sitAmt);
         displayObject.rotation.y = baseRootY + bodyYaw + sway;
         const bob = Math.sin(t / 1.4) * 0.008;                 // 呼吸
-        const step = walkAmt * Math.abs(Math.sin(legPhase)) * 0.012; // 足踏みの弾み
-        displayObject.position.y = bob + step;
+        const step = walkAmt * Math.abs(Math.cos(legPhase)) * 0.01; // 通過相で少し伸び上がる弾み
+        const dropf = (window.__sitp__ && window.__sitp__.drop !== undefined) ? window.__sitp__.drop : 0.32;
+        const sitDrop = sitAmt * modelHeight * dropf;          // 座ると腰を落とす
+        displayObject.position.y = bob + step - sitDrop;
       }
 
       renderer.render(scene, camera);
