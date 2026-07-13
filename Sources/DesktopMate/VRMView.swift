@@ -22,11 +22,15 @@ struct VRMView: NSViewRepresentable {
 
         let webView = WKWebView(frame: .zero, configuration: config)
 
-        // 背景を透過させる(キャラクターだけを浮かせる)
+        // 背景を透過させる(キャラクターだけを浮かせる)。
+        // WKWebView は既定で不透明な白い背景を描くため、これを止めないと
+        // キャラの周りが白い箱になる。macOS には公開APIが無く、WebKit は
+        // drawsBackground をプライベートの _drawsBackground ivar で保持している。
+        // responds(to: setDrawsBackground:) は環境によって false を返す(公開
+        // セッターメソッドが無いため)が、KVC は ivar へ直接書き込めるので
+        // ガードせず設定する(WebKit が長年サポートしている定番手法)。
+        webView.setValue(false, forKey: "drawsBackground")
         webView.underPageBackgroundColor = .clear
-        if webView.responds(to: NSSelectorFromString("setDrawsBackground:")) {
-            webView.setValue(false, forKey: "drawsBackground")
-        }
         webView.wantsLayer = true
         webView.layer?.isOpaque = false
         webView.layer?.backgroundColor = NSColor.clear.cgColor
