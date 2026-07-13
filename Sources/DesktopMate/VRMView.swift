@@ -87,8 +87,16 @@ struct VRMView: NSViewRepresentable {
 
             switch url.lastPathComponent {
             case "viewer.html":
-                if let htmlURL = Bundle.module.url(forResource: "viewer", withExtension: "html") {
-                    payload = try? Data(contentsOf: htmlURL)
+                // viewer.html の //__VRM_BUNDLE__ マーカーを、同梱の bundle.js
+                // (three.js + three-vrm + 描画ロジック)で差し替えてインライン配信する。
+                // これによりサブリソース読込もCDNアクセスも不要になる。
+                if let htmlURL = Bundle.module.url(forResource: "viewer", withExtension: "html"),
+                   var html = try? String(contentsOf: htmlURL, encoding: .utf8) {
+                    if let bundleURL = Bundle.module.url(forResource: "bundle", withExtension: "js"),
+                       let js = try? String(contentsOf: bundleURL, encoding: .utf8) {
+                        html = html.replacingOccurrences(of: "//__VRM_BUNDLE__", with: js)
+                    }
+                    payload = html.data(using: .utf8)
                 }
                 mimeType = "text/html; charset=utf-8"
             case "model.vrm":
