@@ -30,10 +30,14 @@ async function start(getBytes) {
     const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
     renderer.setClearColor(0x000000, 0);
     renderer.setPixelRatio(window.devicePixelRatio || 1);
+    renderer.toneMappingExposure = 1.15;   // 全体を少し明るめに
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(30, window.innerWidth / Math.max(1, window.innerHeight), 0.1, 100);
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x444455, 1.3));
-    const dl = new THREE.DirectionalLight(0xffffff, 1.0); dl.position.set(0.5, 1.5, 2); scene.add(dl);
+    // 明るく柔らかい照明: 空/地面の環境光を強めつつ、正面フィルトで影を起こす
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8f99, 2.0));
+    const dl = new THREE.DirectionalLight(0xffffff, 1.5); dl.position.set(0.5, 1.5, 2); scene.add(dl);
+    const fill = new THREE.DirectionalLight(0xffffff, 0.7); fill.position.set(-0.6, 0.6, 1.5); scene.add(fill);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.35));
     function resize() { renderer.setSize(window.innerWidth, window.innerHeight, false); camera.aspect = window.innerWidth / Math.max(1, window.innerHeight); camera.updateProjectionMatrix(); }
     window.addEventListener('resize', resize); resize();
 
@@ -75,6 +79,7 @@ async function start(getBytes) {
           bone.lLoArm = g('leftLowerArm'); bone.rLoArm = g('rightLowerArm');
           bone.lUpLeg = g('leftUpperLeg'); bone.rUpLeg = g('rightUpperLeg');
           bone.lLoLeg = g('leftLowerLeg'); bone.rLoLeg = g('rightLowerLeg');
+          bone.lFoot = g('leftFoot'); bone.rFoot = g('rightFoot');
           if (bone.lUpArm) bone.lUpArm.rotation.z = baseArmZ;
           if (bone.rUpArm) bone.rUpArm.rotation.z = -baseArmZ;
         }
@@ -133,6 +138,12 @@ async function start(getBytes) {
     // テスト用: 特定の行動を強制する(アプリでは未使用。ヘッドレス検証で使う)
     window.__debugForce__ = function (name, dur) { behavior = name; behaviorDur = dur || 6; behaviorTime = 0; if (name === 'turn') bodyYawTarget = Math.PI * 0.6; if (name === 'look') { lookH = 0.5; lookV = 0.2; } };
     window.__setYaw__ = function (v) { bodyYawTarget = v; }; // テスト用: 体の向きを固定(横から確認)
+    // テスト用: 左足のワールド座標と遊脚判定(歩行の前後方向を数値で検証する)
+    window.__footInfo__ = function () {
+      const v = new THREE.Vector3();
+      if (bone.lFoot) bone.lFoot.getWorldPosition(v);
+      return { z: v.z, x: v.x, cw: Math.cos(legPhase), sw: Math.sin(legPhase) };
+    };
 
     function animate() {
       requestAnimationFrame(animate);
@@ -218,25 +229,26 @@ async function start(getBytes) {
         const walking = walkAmt > 0.02;
         if (walking) legPhase += dt * 7;
         const sw = Math.sin(legPhase) * walkAmt;   // 太ももの前後スイング
-        const cw = Math.cos(legPhase) * walkAmt;   // 膝の曲げ(通過相)用の位相
-        // 実際の歩行サイクルに合わせる:
-        //  ・太ももは前後に振る(接地の前後では脚は伸ばす)
-        //  ・膝は「遊脚が体の下を通過する瞬間」だけ曲げる(cos が正の半周期)
-        //    → 前後の接地(sin が極値)では膝は伸び、接地脚は真っ直ぐになる
+        const cw = Math.cos(legPhase) * walkAmt;   // 膝の曲げ(遊脚)用の位相
+        // 実際の歩行サイクル(前進):
+        //  ・太ももは前後に振る。足の実測で upperLeg.rotation.x は「正=前」。
+        //  ・膝は遊脚が後ろ→体の下を通過→前へ運ばれる間だけ曲げ(cos>0 の半周期)、
+        //    接地の前後(sin が極値)では伸ばす。これで前脚は伸びて接地、
+        //    後ろの脚は膝を曲げて前へ振り出す = 生態的に自然な前進歩行になる。
         const THIGH = 0.5, KNEE = 1.05;
-        const walkThighL = -THIGH * sw, walkThighR = THIGH * sw;
+        const walkThighL = THIGH * sw, walkThighR = -THIGH * sw;
         const walkShinL = Math.max(0, cw) * KNEE, walkShinR = Math.max(0, -cw) * KNEE;
         // 座り時の脚角度(太ももを前へ上げ、膝を曲げる。左右少し開く)
         const sp = window.__sitp__ || {};
-        const sitThigh = (sp.thigh !== undefined ? sp.thigh : -1.35);
-        const sitShin = (sp.shin !== undefined ? sp.shin : 1.5);
+        const sitThigh = (sp.thigh !== undefined ? sp.thigh : 1.45);  // 正=前(太ももを前へ畳む)
+        const sitShin = (sp.shin !== undefined ? sp.shin : 1.85);     // 膝を曲げてすねを立てる
         const sitOpen = 0.18;
         if (bone.lUpLeg) { bone.lUpLeg.rotation.x = lerp(walkThighL, sitThigh, sitAmt); bone.lUpLeg.rotation.z = lerp(0, sitOpen, sitAmt); }
         if (bone.rUpLeg) { bone.rUpLeg.rotation.x = lerp(walkThighR, sitThigh, sitAmt); bone.rUpLeg.rotation.z = lerp(0, -sitOpen, sitAmt); }
         if (bone.lLoLeg) bone.lLoLeg.rotation.x = lerp(walkShinL, sitShin, sitAmt);
         if (bone.rLoLeg) bone.rLoLeg.rotation.x = lerp(walkShinR, sitShin, sitAmt);
-        if (bone.hips) bone.hips.rotation.x = lerp(0, (sp.hips !== undefined ? sp.hips : 0.1), sitAmt);
-        if (bone.spine) bone.spine.rotation.x = lerp(0, (sp.lean !== undefined ? sp.lean : 0.12), sitAmt); // 上体を少し前傾
+        if (bone.hips) bone.hips.rotation.x = lerp(0, (sp.hips !== undefined ? sp.hips : 0.05), sitAmt);
+        if (bone.spine) bone.spine.rotation.x = lerp(0, (sp.lean !== undefined ? sp.lean : 0.16), sitAmt); // 上体を少し前傾
 
         // --- 腕: 通常は下ろした姿勢(歩行中は左右対称に前後へ小さく振る)。
         //     手を振る時は右腕を頭上へ上げて大きく振る ---
@@ -264,7 +276,7 @@ async function start(getBytes) {
         displayObject.rotation.y = baseRootY + bodyYaw + sway;
         const bob = Math.sin(t / 1.4) * 0.008;                 // 呼吸
         const step = walkAmt * Math.abs(Math.cos(legPhase)) * 0.01; // 通過相で少し伸び上がる弾み
-        const dropf = (window.__sitp__ && window.__sitp__.drop !== undefined) ? window.__sitp__.drop : 0.32;
+        const dropf = (window.__sitp__ && window.__sitp__.drop !== undefined) ? window.__sitp__.drop : 0.30;
         const sitDrop = sitAmt * modelHeight * dropf;          // 座ると腰を落とす
         displayObject.position.y = bob + step - sitDrop;
       }
