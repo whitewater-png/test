@@ -36,7 +36,12 @@ struct VRMView: NSViewRepresentable {
         webView.layer?.backgroundColor = NSColor.clear.cgColor
 
         context.coordinator.load(into: webView)
+        context.coordinator.startPointerTracking(webView)
         return webView
+    }
+
+    static func dismantleNSView(_ nsView: WKWebView, coordinator: Coordinator) {
+        coordinator.stopPointerTracking()
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
@@ -73,13 +78,55 @@ struct VRMView: NSViewRepresentable {
         var lastToken: Int
         var lastMoodKey: String = ""
 
+        private weak var webView: WKWebView?
+        private var pointerTimer: Timer?
+
         init(reloadToken: Int) {
             self.lastToken = reloadToken
         }
 
+        deinit { pointerTimer?.invalidate() }
+
         func load(into webView: WKWebView) {
             guard let url = URL(string: "\(VRMView.scheme)://app/viewer.html") else { return }
             webView.load(URLRequest(url: url))
+        }
+
+        // MARK: - マウスカーソル追従
+
+        /// デスクトップ上のカーソル位置を定期的に読み取り、キャラの近くにある時だけ
+        /// 方向を JS(__setPointer__)へ送る。近くにいない間はキャラ自身の
+        /// 待機アニメーション(歩く/振り向く等)に任せる。
+        func startPointerTracking(_ webView: WKWebView) {
+            self.webView = webView
+            pointerTimer?.invalidate()
+            let timer = Timer(timeInterval: 1.0 / 20.0, repeats: true) { [weak self] _ in
+                self?.tickPointer()
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            pointerTimer = timer
+        }
+
+        func stopPointerTracking() {
+            pointerTimer?.invalidate()
+            pointerTimer = nil
+        }
+
+        private func tickPointer() {
+            guard let webView = webView, let win = webView.window, win.isVisible else { return }
+            let mouse = NSEvent.mouseLocation              // 画面座標(左下原点)
+            let f = win.frame
+            let refX = f.midX
+            let refY = f.midY + f.height * 0.18            // 頭のあたりを基準にする
+            let dx = mouse.x - refX
+            let dy = mouse.y - refY
+            let dist = (dx * dx + dy * dy).squareRoot()
+            guard dist < 440 else { return }               // 近くにいる時だけ追う
+            let scale: CGFloat = 260
+            let nx = max(-1, min(1, dx / scale))
+            let ny = max(-1, min(1, dy / scale))
+            let js = "window.__setPointer__ && window.__setPointer__({x:\(String(format: "%.3f", nx)),y:\(String(format: "%.3f", ny))})"
+            webView.evaluateJavaScript(js, completionHandler: nil)
         }
 
         // MARK: - WKURLSchemeHandler

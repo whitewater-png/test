@@ -3,3 +3,4 @@ dist/
 .DS_Store
 .swiftpm/
 *.xcodeproj
+web/node_modules/
