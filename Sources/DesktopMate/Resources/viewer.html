@@ -90,9 +90,15 @@ try {
         try { VRMUtils.removeUnnecessaryVertices?.(gltf.scene); } catch (_) {}
         try { VRMUtils.combineSkeletons?.(gltf.scene); } catch (_) {}
         scene.add(vrm.scene);
-        // VRM0 は VRM1 と正面の向きが逆。-Z 向きに正規化する。
-        const isVRM0 = !!(vrm.meta && (vrm.meta.metaVersion === '0' || vrm.meta.metaVersion === 0));
-        if (isVRM0) { try { VRMUtils.rotateVRM0?.(vrm); } catch (_) {} }
+        // 既定はTポーズ(腕が真横)なので、両腕を下ろして自然な立ち姿にする。
+        if (vrm.humanoid) {
+          const la = vrm.humanoid.getNormalizedBoneNode('leftUpperArm');
+          const ra = vrm.humanoid.getNormalizedBoneNode('rightUpperArm');
+          const a = THREE.MathUtils.degToRad(72);
+          if (la) { la.rotation.z = a; }
+          if (ra) { ra.rotation.z = -a; }
+        }
+        if (vrm.update) { vrm.update(0); }
       } else {
         // VRM拡張なしの素の glTF / GLB。3Dモデルとして表示する。
         displayObject = gltf.scene;
@@ -103,16 +109,18 @@ try {
         }
       }
 
+      // 正面をカメラに向ける(180°回転 + カメラを +Z 側に置く)。
+      // ヘッドレスChromiumでの実描画検証でこの向き・距離を確定済み。
+      displayObject.rotation.y = Math.PI;
       displayObject.updateWorldMatrix(true, true);
 
-      // 顔〜上半身が収まるようにカメラを自動調整(モデルの寸法から算出)
+      // 全身が収まるようにカメラを自動調整(モデルの寸法から算出)
       const box = new THREE.Box3().setFromObject(displayObject);
       const size = box.getSize(new THREE.Vector3());
       const center = box.getCenter(new THREE.Vector3());
-      const lookY = box.max.y - size.y * 0.16;
-      const dist = size.y * 0.9 + 0.4;
-      camera.position.set(center.x, lookY, -dist);
-      camera.lookAt(center.x, lookY, center.z);
+      const dist = size.y * 1.95 + 0.4;
+      camera.position.set(center.x, center.y, dist);
+      camera.lookAt(center.x, center.y, center.z);
   }
 
   // Swift から base64 でモデルのバイト列を受け取り、ArrayBuffer にして parse。
