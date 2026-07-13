@@ -18,8 +18,8 @@ window.__setState__ = function (s) { if (s) Object.assign(uiState, s); };
 const pointer = { x: 0, y: 0, ts: -1e9 };
 window.__setPointer__ = function (p) { if (p) { pointer.x = p.x; pointer.y = p.y; pointer.ts = performance.now(); } };
 
-// カーソルの見る向きの符号(実機で左右が逆に感じたらここを 1 に戻す)
-const LOOK_SIGN = -1;
+// カーソルの見る向きの符号(実機で左右が逆に感じたらここを反転)
+const LOOK_SIGN = 1;
 
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const lerp = (a, b, t) => a + (b - a) * t;
@@ -107,15 +107,13 @@ async function start(getBytes) {
     let headPitch = 0, headPitchTarget = 0;     // 頭の上下
     let lookH = 0, lookV = 0;                   // 'look' 行動での注視方向
     let walkAmt = 0, walkAmtTarget = 0, legPhase = 0; // 足踏み
-    let waveAmt = 0, waveAmtTarget = 0;         // 手振り
 
     function pickIdleBehavior() {
       const r = Math.random();
-      if (r < 0.34) { behavior = 'idle'; behaviorDur = 2.5 + Math.random() * 3; }
-      else if (r < 0.56) { behavior = 'look'; behaviorDur = 2 + Math.random() * 2.5; lookH = (Math.random() * 2 - 1) * 0.5; lookV = (Math.random() * 2 - 1) * 0.22; }
-      else if (r < 0.74) { behavior = 'turn'; behaviorDur = 3 + Math.random() * 3; bodyYawTarget = (Math.random() * 2 - 1) * Math.PI * 0.85; }
-      else if (r < 0.90) { behavior = 'walk'; behaviorDur = 2.5 + Math.random() * 3; }
-      else { behavior = 'wave'; behaviorDur = 2.2 + Math.random() * 1.3; }
+      if (r < 0.36) { behavior = 'idle'; behaviorDur = 2.5 + Math.random() * 3; }
+      else if (r < 0.60) { behavior = 'look'; behaviorDur = 2 + Math.random() * 2.5; lookH = (Math.random() * 2 - 1) * 0.5; lookV = (Math.random() * 2 - 1) * 0.22; }
+      else if (r < 0.80) { behavior = 'turn'; behaviorDur = 3 + Math.random() * 3; bodyYawTarget = (Math.random() * 2 - 1) * Math.PI * 0.85; }
+      else { behavior = 'walk'; behaviorDur = 2.5 + Math.random() * 3; }
       behaviorTime = 0;
     }
 
@@ -132,7 +130,7 @@ async function start(getBytes) {
 
       // 状況クラスが変わったら行動を切り替える(会話中は歩かない等)
       const cls = talking ? 'talk' : thinking ? 'think' : pointerActive ? 'follow' : 'idle';
-      if (cls !== ctxClass) { ctxClass = cls; behaviorTime = behaviorDur + 1; walkAmtTarget = 0; waveAmtTarget = 0; }
+      if (cls !== ctxClass) { ctxClass = cls; behaviorTime = behaviorDur + 1; walkAmtTarget = 0; }
 
       behaviorTime += dt;
       if (behaviorTime > behaviorDur) {
@@ -142,7 +140,6 @@ async function start(getBytes) {
 
       // 行動ごとの目標値
       walkAmtTarget = (behavior === 'walk') ? 1 : 0;
-      waveAmtTarget = (behavior === 'wave') ? 1 : 0;
 
       // 頭・体の目標の向きを状況で決める
       if (pointerActive) {
@@ -164,7 +161,6 @@ async function start(getBytes) {
       headYaw = lerp(headYaw, headYawTarget, Math.min(1, dt * 5));
       headPitch = lerp(headPitch, headPitchTarget, Math.min(1, dt * 5));
       walkAmt = lerp(walkAmt, walkAmtTarget, Math.min(1, dt * 4));
-      waveAmt = lerp(waveAmt, waveAmtTarget, Math.min(1, dt * 5));
 
       if (currentVRM) {
         // --- まばたき ---
@@ -179,7 +175,7 @@ async function start(getBytes) {
         setExpr('aa', mouthCur);
 
         // --- 表情 ---
-        const happyTarget = talking ? 0.35 : (behavior === 'wave' ? 0.5 : 0.12);
+        const happyTarget = talking ? 0.35 : 0.12;
         happyCur += (happyTarget - happyCur) * Math.min(1, dt * 4);
         setExpr('happy', happyCur);
         const relaxTarget = thinking ? 0.5 : 0.0;
@@ -207,18 +203,10 @@ async function start(getBytes) {
         if (bone.lLoLeg) bone.lLoLeg.rotation.x = Math.max(0, -sw) * 0.6 * walkAmt;
         if (bone.rLoLeg) bone.rLoLeg.rotation.x = Math.max(0, sw) * 0.6 * walkAmt;
 
-        // 腕: 基本は下ろした姿勢。歩行中は前後に小さく振る
-        let lArmZ = baseArmZ, rArmZ = -baseArmZ, lArmX = -0.16 * sw, rArmX = 0.16 * sw;
-        // 手を振る: 右腕を上げてヒラヒラ
-        if (waveAmt > 0.01) {
-          rArmZ = lerp(-baseArmZ, -0.35, waveAmt);
-          rArmX = lerp(rArmX, -0.2, waveAmt);
-          if (bone.rLoArm) bone.rLoArm.rotation.z = -0.4 + Math.sin(t * 10) * 0.4 * waveAmt;
-        } else if (bone.rLoArm) {
-          bone.rLoArm.rotation.z = lerp(bone.rLoArm.rotation.z || 0, 0, Math.min(1, dt * 5));
-        }
-        if (bone.lUpArm) { bone.lUpArm.rotation.z = lArmZ; bone.lUpArm.rotation.x = lArmX; }
-        if (bone.rUpArm) { bone.rUpArm.rotation.z = rArmZ; bone.rUpArm.rotation.x = rArmX; }
+        // 腕: 基本は下ろした姿勢。歩行中だけ、左右対称に前後へ小さく振る。
+        // (片腕だけを動かすと不自然なので、両腕を必ず同じ扱いにする)
+        if (bone.lUpArm) { bone.lUpArm.rotation.z = baseArmZ; bone.lUpArm.rotation.x = -0.16 * sw; }
+        if (bone.rUpArm) { bone.rUpArm.rotation.z = -baseArmZ; bone.rUpArm.rotation.x = 0.16 * sw; }
 
         currentVRM.update(dt);
       }
