@@ -16,6 +16,10 @@ struct VRMView: NSViewRepresentable {
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.setURLSchemeHandler(context.coordinator, forURLScheme: VRMView.scheme)
+        // モデルのバイト列は fetch ではなく、このメッセージハンドラ経由で JS に渡す。
+        config.userContentController.addScriptMessageHandler(
+            context.coordinator, contentWorld: .page, name: "model"
+        )
 
         let webView = WKWebView(frame: .zero, configuration: config)
 
@@ -43,7 +47,7 @@ struct VRMView: NSViewRepresentable {
         Coordinator(reloadToken: reloadToken)
     }
 
-    final class Coordinator: NSObject, WKURLSchemeHandler {
+    final class Coordinator: NSObject, WKURLSchemeHandler, WKScriptMessageHandlerWithReply {
         var lastToken: Int
 
         init(reloadToken: Int) {
@@ -53,6 +57,21 @@ struct VRMView: NSViewRepresentable {
         func load(into webView: WKWebView) {
             guard let url = URL(string: "\(VRMView.scheme)://app/viewer.html") else { return }
             webView.load(URLRequest(url: url))
+        }
+
+        // MARK: - WKScriptMessageHandlerWithReply
+        // JS から要求されたら、モデルのバイト列を base64 文字列で返す。
+
+        func userContentController(
+            _ userContentController: WKUserContentController,
+            didReceive message: WKScriptMessage,
+            replyHandler: @escaping (Any?, String?) -> Void
+        ) {
+            guard let data = try? Data(contentsOf: VRMStore.modelURL) else {
+                replyHandler(nil, "モデルファイルが見つかりません")
+                return
+            }
+            replyHandler(data.base64EncodedString(), nil)
         }
 
         // MARK: - WKURLSchemeHandler

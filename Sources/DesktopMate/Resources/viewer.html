@@ -73,11 +73,14 @@ try {
   const loader = new GLTFLoader();
   loader.register((parser) => new VRMLoaderPlugin(parser));
 
-  // 拡張子は .vrm 固定で保存しているが、GLTFLoader は中身(glTFバイナリ)で
-  // 判別するため、.glb / .gltf を .vrm 名で保存していても読み込める。
-  loader.load(
-    './model.vrm',
-    (gltf) => {
+  function onLoadError(e) {
+    showErr('モデル読み込み失敗: ' + (e && e.message ? e.message : e));
+  }
+
+  // モデルのバイト列は Swift 側から直接受け取り、fetch を使わず parse する。
+  // (WKWebView は file:// / custom scheme への fetch を弾くことがあるため、
+  //  fetch を完全に排除してこの問題を回避する)
+  function handleGltf(gltf) {
       const vrm = gltf.userData.vrm;
 
       if (vrm) {
@@ -110,10 +113,19 @@ try {
       const dist = size.y * 0.9 + 0.4;
       camera.position.set(center.x, lookY, -dist);
       camera.lookAt(center.x, lookY, center.z);
-    },
-    undefined,
-    (e) => showErr('モデル読み込み失敗: ' + (e && e.message ? e.message : e))
-  );
+  }
+
+  // Swift から base64 でモデルのバイト列を受け取り、ArrayBuffer にして parse。
+  try {
+    const b64 = await window.webkit.messageHandlers.model.postMessage('get');
+    if (!b64) { throw new Error('モデルデータが空です'); }
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) { bytes[i] = binary.charCodeAt(i); }
+    loader.parse(bytes.buffer, '', handleGltf, onLoadError);
+  } catch (e) {
+    showErr('モデル取得エラー: ' + (e && e.message ? e.message : e));
+  }
 
   // まばたき用タイマー
   let blinkTimer = 0;
