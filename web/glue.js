@@ -255,7 +255,7 @@ async function start(getBytes) {
         const stx = (sp.thighX !== undefined ? sp.thighX : 1.5);   // 前傾(flex)大きめで太ももを寝かせお尻を床へ
         const stz = (sp.thighZ !== undefined ? sp.thighZ : 0.15);  // 外転(膝の開き)
         const sty = (sp.thighY !== undefined ? sp.thighY : -0.7);  // 内旋(すねを外へ送る)
-        const ssx = (sp.shinX  !== undefined ? sp.shinX  : -2.3);  // 膝を深く曲げてすねを後ろへ畳む
+        const ssx = (sp.shinX  !== undefined ? sp.shinX  : -3.2);  // 膝を深く曲げ、足裏をお尻へ・すねを床に寝かせる
         const ssy = (sp.shinY  !== undefined ? sp.shinY  : -0.5);  // すねを外側へ開く
         const ssz = (sp.shinZ  !== undefined ? sp.shinZ  : 0.0);   // すねのひねり(微調整)
         if (bone.lUpLeg) bone.lUpLeg.rotation.set(lerp(walkThighL, stx, sitAmt), lerp(0,  sty, sitAmt), lerp(0,  stz, sitAmt));
