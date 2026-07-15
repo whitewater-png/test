@@ -252,7 +252,7 @@ async function start(getBytes) {
 
         // ぺたん座り(割座/W-sit): 太ももを前へ+内旋、膝を深く曲げてすねを後ろ+外へ開く
         const sp = window.__sitp__ || {};
-        const stx = (sp.thighX !== undefined ? sp.thighX : 1.0);   // 前傾(flex)
+        const stx = (sp.thighX !== undefined ? sp.thighX : 1.5);   // 前傾(flex)大きめで太ももを寝かせお尻を床へ
         const stz = (sp.thighZ !== undefined ? sp.thighZ : 0.15);  // 外転(膝の開き)
         const sty = (sp.thighY !== undefined ? sp.thighY : -0.7);  // 内旋(すねを外へ送る)
         const ssx = (sp.shinX  !== undefined ? sp.shinX  : -2.3);  // 膝を深く曲げてすねを後ろへ畳む
@@ -286,8 +286,15 @@ async function start(getBytes) {
         } else if (bone.rLoArm) {
           bone.rLoArm.rotation.z = lerp(bone.rLoArm.rotation.z || 0, 0, Math.min(1, dt * 6));
         }
-        if (bone.lUpArm) { bone.lUpArm.rotation.z = lArmZ; bone.lUpArm.rotation.x = lArmX; }
-        if (bone.rUpArm) { bone.rUpArm.rotation.z = rArmZ; bone.rUpArm.rotation.x = rArmX; }
+        // 座り時は両手を前(両足の間)へ寄せて床につく感じにする。
+        // 腕は下ろしたまま(z=baseArmZ)、前へ屈曲(x)+内側へ(y)。
+        const saX  = (sp.armX  !== undefined ? sp.armX  : 0.6);  // 肩の屈曲(前へ)
+        const saY  = (sp.armY  !== undefined ? sp.armY  : 0.5);  // 内転/内旋(手を中央へ)
+        const saLo = (sp.loArm !== undefined ? sp.loArm : 0.4);  // 肘を軽く曲げる
+        if (bone.lUpArm) bone.lUpArm.rotation.set(lerp(lArmX, saX, sitAmt), lerp(0,  saY, sitAmt), lerp(lArmZ,  baseArmZ, sitAmt));
+        if (bone.rUpArm) bone.rUpArm.rotation.set(lerp(rArmX, saX, sitAmt), lerp(0, -saY, sitAmt), lerp(rArmZ, -baseArmZ, sitAmt));
+        if (bone.lLoArm) bone.lLoArm.rotation.x = lerp(0, saLo, sitAmt);
+        if (bone.rLoArm && waveAmt <= 0.01) bone.rLoArm.rotation.x = lerp(0, saLo, sitAmt);
 
         currentVRM.update(dt);
       }
@@ -299,7 +306,7 @@ async function start(getBytes) {
         displayObject.rotation.y = baseRootY + bodyYaw + sway;
         const bob = Math.sin(t / 1.4) * 0.008 * (1 - walkAmt);        // 呼吸(歩行中は控えめ)
         const walkBob = -0.012 * Math.cos(2 * legPhase) * walkAmt;    // 歩調の上下動(2歩で1周期・接地で沈む)
-        const dropf = (window.__sitp__ && window.__sitp__.drop !== undefined) ? window.__sitp__.drop : 0.40;
+        const dropf = (window.__sitp__ && window.__sitp__.drop !== undefined) ? window.__sitp__.drop : 0.48;
         const sitDrop = sitAmt * modelHeight * dropf;                 // 座ると腰を落とす
         displayObject.position.y = bob + walkBob - sitDrop;
         displayObject.position.x = 0.025 * Math.sin(legPhase) * walkAmt; // 立脚側へ重心を移す左右の揺れ
