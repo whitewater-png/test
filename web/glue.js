@@ -310,9 +310,11 @@ async function start(getBytes) {
         if (bone.rLoArm && waveAmt <= 0.01) bone.rLoArm.rotation.set(lerp(0, saLo, sitAmt), lerp(0, -saLoY, sitAmt), 0);
         // 手首: 前腕だけでは手のひらが正面/上を向くため、手首を曲げて太ももの上で
         // 手の甲が上(手のひらが太もも側/下)を向くようにする。
-        const shX = (sp.handX !== undefined ? sp.handX : 1.0);    // 手首の曲げ(手のひらを下へ回す主軸)
-        const shY = (sp.handY !== undefined ? sp.handY : 1.5);    // 手首のひねり(内側へ・手のひらを下向きに保つ)
-        const shZ = (sp.handZ !== undefined ? sp.handZ : 0.0);    // 手首の左右振り(微調整用)
+        // 値は指/親指ボーンの実測方向から「指先=前やや下・手の甲=上」になる
+        // 手首Eulerを逆算して決定(親指が内側=手のひら下向きをズーム画像で確認済み)
+        const shX = (sp.handX !== undefined ? sp.handX : 1.54);   // 手首の曲げ
+        const shY = (sp.handY !== undefined ? sp.handY : 0.50);   // 手首のひねり
+        const shZ = (sp.handZ !== undefined ? sp.handZ : 1.31);   // 手首の左右振り
         if (bone.lHand) bone.lHand.rotation.set(lerp(0, shX, sitAmt), lerp(0, shY, sitAmt), lerp(0, shZ, sitAmt));
         if (bone.rHand && waveAmt <= 0.01) bone.rHand.rotation.set(lerp(0, shX, sitAmt), lerp(0, -shY, sitAmt), lerp(0, -shZ, sitAmt));
 
