@@ -297,12 +297,13 @@ async function start(getBytes) {
         // 座り時は両手を前(両足の間)へ寄せて床につく感じにする。
         // 腕は下ろしたまま(z=baseArmZ)、前へ屈曲(x)+内側へ(y)。
         // 座り時は両手を膝(太ももの前)の上に置く。
-        // 値は手と膝のワールド座標を実測してグリッド探索で決定(手が膝に載る)
-        const saX  = (sp.armX  !== undefined ? sp.armX  : 0.8);       // 肩の屈曲(前へ=膝へ)
-        const saY  = (sp.armY  !== undefined ? sp.armY  : 0.1);       // 左右(内転/外転)
-        const saZ  = (sp.armZ  !== undefined ? sp.armZ  : 1.6);       // 上腕の下ろし量(下げて肘を体側へ)
-        const saLo = (sp.loArm !== undefined ? sp.loArm : 1.1);       // 肘の曲げ(前腕を膝へ)
-        const saLoY = (sp.loArmY !== undefined ? sp.loArmY : 0.0);    // 前腕のひねり(手を膝の上へ)
+        // 深い割座では膝が床近くで肩から遠く、腕を伸ばしたままでは手が届かない。
+        // 前腕を太もも(膝側)の上に載せて手のひらを下向きに接地させる。
+        const saX  = (sp.armX  !== undefined ? sp.armX  : 0.5);       // 肩の屈曲(前へ)
+        const saY  = (sp.armY  !== undefined ? sp.armY  : 0.15);      // 左右(内転)
+        const saZ  = (sp.armZ  !== undefined ? sp.armZ  : 1.5);       // 上腕は下ろし気味(肘を体側へ)
+        const saLo = (sp.loArm !== undefined ? sp.loArm : 1.35);      // 肘を曲げ前腕を太ももへ載せる
+        const saLoY = (sp.loArmY !== undefined ? sp.loArmY : 0.0);    // 前腕のひねり(0=手のひら下)
         if (bone.lUpArm) bone.lUpArm.rotation.set(lerp(lArmX, saX, sitAmt), lerp(0,  saY, sitAmt), lerp(lArmZ,  saZ, sitAmt));
         if (bone.rUpArm) bone.rUpArm.rotation.set(lerp(rArmX, saX, sitAmt), lerp(0, -saY, sitAmt), lerp(rArmZ, -saZ, sitAmt));
         if (bone.lLoArm) bone.lLoArm.rotation.set(lerp(0, saLo, sitAmt), lerp(0, saLoY, sitAmt), 0);
