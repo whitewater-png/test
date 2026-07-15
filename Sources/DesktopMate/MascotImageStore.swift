@@ -56,21 +56,14 @@ enum MascotImageStore {
     }
 
     /// 表示用の画像を返す。
-    /// ユーザーが選んだ画像があればそれ(設定に応じて白背景を透過)、
-    /// なければ同梱の既定キャラクター画像を返す。どちらも無ければ nil。
+    /// ユーザーが選んだ画像があればそれ(設定に応じて白背景を透過)を返す。
+    /// 未設定なら nil を返し、MascotView は図形描画にフォールバックする。
+    /// (配布時の著作権配慮から、既定のキャラクター画像は同梱していない)
     static func loadProcessedImage() -> NSImage? {
         if hasCustomImage(), let image = NSImage(contentsOf: sourceURL) {
             return removeWhiteBackground ? imageByRemovingWhite(image) : image
         }
-        return bundledDefaultImage()
-    }
-
-    /// アプリに同梱した既定キャラクター画像(透過PNG)。
-    static func bundledDefaultImage() -> NSImage? {
-        guard let url = Bundle.module.url(forResource: "mascot-default", withExtension: "png") else {
-            return nil
-        }
-        return NSImage(contentsOf: url)
+        return nil
     }
 
     // MARK: - 白背景の透過処理

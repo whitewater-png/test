@@ -25,7 +25,7 @@
 - ✋ **ドラッグで移動** — キャラクターを掴んで好きな場所に置ける
 - 🤖 **マルチベンダー対応** — Anthropic (Claude) / OpenAI (GPT) / Google (Gemini) を設定で切替
 - 💬 **ストリーミング応答** — どのプロバイダーでも返事がリアルタイムに表示される
-- 🧑‍🎨 **キャラクター同梱** — 既定でイラストのキャラクターが表示される(透過PNGを同梱)
+- 🧑‍🎨 **既定は図形キャラ** — 何も設定しなくても、図形で描いたまんまるキャラが表示される
 - 🖼️ **キャラクター画像の差し替え** — 好きな画像を選べばマスコットを変更できる(白背景の自動透過つき)
 - 🧍 **VRM / GLB(3Dモデル)対応** — `.vrm` / `.glb` / `.gltf` を選ぶと3Dアバターとして表示(three.js + @pixiv/three-vrm)。VRM拡張があればまばたき等も動作
 - 😊 **アニメーション** — ぷかぷか浮遊・まばたき・表情変化。VRMは待機中も自律的に動く(キョロキョロ・振り向き・膝を曲げたその場歩き)、発話に合わせた口パク/表情、そして**マウスカーソルを頭と体で追いかける**
@@ -51,9 +51,12 @@ cd test
 # そのまま実行(開発用)
 swift run
 
-# または .app バンドルを作成
+# または .app バンドルを作成(Apple Silicon / Intel 両対応・アイコン付き)
 ./scripts/build-app.sh
 open dist/DesktopMate.app
+
+# 配布用の .zip / .dmg までまとめて作る
+./scripts/package.sh 1.0.0
 ```
 
 初回起動時に設定ウィンドウが開きます。使いたいプロバイダーを選び、APIキーを入力して「保存」を押してください。
@@ -95,7 +98,7 @@ open dist/DesktopMate.app
 ```
 
 - プロバイダーは `ChatBackend` プロトコルで抽象化し、選択に応じて実装を切り替えます
-- キャラクターは「VRM(3Dモデル)→ ユーザー選択画像 → 同梱の既定画像 (`Resources/mascot-default.png`) → 図形描画」の順に表示を切り替えます
+- キャラクターは「VRM(3Dモデル)→ ユーザー選択画像 → 図形描画」の順に表示を切り替えます(既定は図形描画)
 - VRMは透明な `WKWebView` 上で three.js + @pixiv/three-vrm により描画します(`Resources/viewer.html`)。3D描画ライブラリは実行時にCDN(esm.sh)から読み込むため、VRM表示時はネット接続が必要です
 - 会話履歴はアプリ内に保持し、毎リクエストで全履歴を送信します(APIはステートレス)
 - 応答はServer-Sent Eventsでストリーミング受信し、少しずつ吹き出しに表示します
@@ -109,6 +112,23 @@ open dist/DesktopMate.app
 | 既定モデル | `LLMProvider.defaultModel` (アプリの設定画面でも変更可) |
 | キャラクターの見た目(図形) | `Sources/DesktopMate/MascotView.swift` |
 | 初期位置・ウィンドウサイズ | `Sources/DesktopMate/MascotWindow.swift` |
+
+## 配布する
+
+他の人に配りたいときは [`DISTRIBUTION.md`](DISTRIBUTION.md) を参照してください。要点だけ:
+
+```bash
+./scripts/package.sh 1.0.0     # dist/ に .dmg と .zip ができる
+```
+
+- Apple Silicon / Intel 両対応のユニバーサルバイナリで書き出します。
+- **未署名配布**を前提にしています。受け取った人は初回だけ **右クリック →「開く」** で起動します（詳細は DISTRIBUTION.md）。警告を完全になくすには Apple Developer Program（年 $99）での署名＋公証が必要です。
+- 配布物には `LICENSE` と `THIRD_PARTY_LICENSES.md` を同梱してください。
+- ⚠️ 他者が作った画像や VRM を同梱して再配布する場合は、その作者の許諾条件を必ず確認してください（本体には既定画像を同梱していません）。
+
+## ライセンス
+
+本体は MIT ライセンス（[`LICENSE`](LICENSE)）です。VRM/GLB 描画に使う three.js / @pixiv/three-vrm（いずれも MIT）のクレジットは [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) にまとめています。
 
 ## 料金について
 
