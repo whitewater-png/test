@@ -144,6 +144,14 @@ async function start(getBytes) {
       if (bone.lFoot) bone.lFoot.getWorldPosition(v);
       return { z: v.z, x: v.x, cw: Math.cos(legPhase), sw: Math.sin(legPhase) };
     };
+    // テスト用: 左脚(股関節/膝/足首)のワールド座標。膝の曲がる向きの検証に使う
+    window.__legGeo__ = function () {
+      const hip = new THREE.Vector3(), knee = new THREE.Vector3(), ank = new THREE.Vector3();
+      if (bone.lUpLeg) bone.lUpLeg.getWorldPosition(hip);
+      if (bone.lLoLeg) bone.lLoLeg.getWorldPosition(knee);
+      if (bone.lFoot) bone.lFoot.getWorldPosition(ank);
+      return { hip: [hip.y, hip.z], knee: [knee.y, knee.z], ank: [ank.y, ank.z], cw: Math.cos(legPhase), sw: Math.sin(legPhase) };
+    };
 
     function animate() {
       requestAnimationFrame(animate);
@@ -235,10 +243,11 @@ async function start(getBytes) {
         //  ・太もも: 前後スイング(接地で前=正) + 遊脚でわずかに持ち上げ(足が地面をこする程度)
         //  ・膝: 遊脚で自然に曲げ(膝が山なり)、接地では伸ばす
         //  ・足首: 前接地でつま先を上げかかとから / 蹴り出しでつま先立ち
+        // 膝は負方向でふくらはぎが後ろに畳まれる(実測で確定)。正だと膝が逆に曲がる。
         const THIGH = 0.42, KNEE = 1.0, LIFT = 0.12, ANKLE = 0.5;
         const walkThighL =  THIGH * cwALK + LIFT * swingL;
         const walkThighR = -THIGH * cwALK + LIFT * swingR;
-        const walkShinL = KNEE * swingL, walkShinR = KNEE * swingR;
+        const walkShinL = -KNEE * swingL, walkShinR = -KNEE * swingR;
         const walkAnkleL =  ANKLE * cwALK, walkAnkleR = -ANKLE * cwALK;
 
         // あぐら(cross-legged): 太ももを前へ+外へ開き(外転)+外旋、すねを内側へ組む
