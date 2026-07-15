@@ -250,17 +250,18 @@ async function start(getBytes) {
         const walkShinL = -KNEE * swingL, walkShinR = -KNEE * swingR;
         const walkAnkleL =  ANKLE * cwALK, walkAnkleR = -ANKLE * cwALK;
 
-        // あぐら(cross-legged): 太ももを前へ+外へ開き(外転)+外旋、すねを内側へ組む
+        // ぺたん座り(割座/W-sit): 太ももを前へ+内旋、膝を深く曲げてすねを後ろ+外へ開く
         const sp = window.__sitp__ || {};
-        const stx = (sp.thighX !== undefined ? sp.thighX : 1.45); // 前傾(flex)
-        const stz = (sp.thighZ !== undefined ? sp.thighZ : 0.8);  // 外転(膝を横へ開く)
-        const sty = (sp.thighY !== undefined ? sp.thighY : 0.3);  // 外旋
-        const ssx = (sp.shinX  !== undefined ? sp.shinX  : 2.6);  // 膝を深く曲げてすねを床へ畳む(足を下げる)
-        const ssy = (sp.shinY  !== undefined ? sp.shinY  : 0.7);  // すねを内側へ組む(前で交差)
+        const stx = (sp.thighX !== undefined ? sp.thighX : 1.0);   // 前傾(flex)
+        const stz = (sp.thighZ !== undefined ? sp.thighZ : 0.15);  // 外転(膝の開き)
+        const sty = (sp.thighY !== undefined ? sp.thighY : -0.7);  // 内旋(すねを外へ送る)
+        const ssx = (sp.shinX  !== undefined ? sp.shinX  : -2.3);  // 膝を深く曲げてすねを後ろへ畳む
+        const ssy = (sp.shinY  !== undefined ? sp.shinY  : -0.5);  // すねを外側へ開く
+        const ssz = (sp.shinZ  !== undefined ? sp.shinZ  : 0.0);   // すねのひねり(微調整)
         if (bone.lUpLeg) bone.lUpLeg.rotation.set(lerp(walkThighL, stx, sitAmt), lerp(0,  sty, sitAmt), lerp(0,  stz, sitAmt));
         if (bone.rUpLeg) bone.rUpLeg.rotation.set(lerp(walkThighR, stx, sitAmt), lerp(0, -sty, sitAmt), lerp(0, -stz, sitAmt));
-        if (bone.lLoLeg) bone.lLoLeg.rotation.set(lerp(walkShinL, ssx, sitAmt), lerp(0,  ssy, sitAmt), 0);
-        if (bone.rLoLeg) bone.rLoLeg.rotation.set(lerp(walkShinR, ssx, sitAmt), lerp(0, -ssy, sitAmt), 0);
+        if (bone.lLoLeg) bone.lLoLeg.rotation.set(lerp(walkShinL, ssx, sitAmt), lerp(0,  ssy, sitAmt), lerp(0,  ssz, sitAmt));
+        if (bone.rLoLeg) bone.rLoLeg.rotation.set(lerp(walkShinR, ssx, sitAmt), lerp(0, -ssy, sitAmt), lerp(0, -ssz, sitAmt));
         if (bone.lFoot) bone.lFoot.rotation.x = lerp(walkAnkleL, 0, sitAmt);
         if (bone.rFoot) bone.rFoot.rotation.x = lerp(walkAnkleR, 0, sitAmt);
 
@@ -298,7 +299,7 @@ async function start(getBytes) {
         displayObject.rotation.y = baseRootY + bodyYaw + sway;
         const bob = Math.sin(t / 1.4) * 0.008 * (1 - walkAmt);        // 呼吸(歩行中は控えめ)
         const walkBob = -0.012 * Math.cos(2 * legPhase) * walkAmt;    // 歩調の上下動(2歩で1周期・接地で沈む)
-        const dropf = (window.__sitp__ && window.__sitp__.drop !== undefined) ? window.__sitp__.drop : 0.44;
+        const dropf = (window.__sitp__ && window.__sitp__.drop !== undefined) ? window.__sitp__.drop : 0.40;
         const sitDrop = sitAmt * modelHeight * dropf;                 // 座ると腰を落とす
         displayObject.position.y = bob + walkBob - sitDrop;
         displayObject.position.x = 0.025 * Math.sin(legPhase) * walkAmt; // 立脚側へ重心を移す左右の揺れ
