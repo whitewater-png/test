@@ -222,23 +222,20 @@ async function start(getBytes) {
         }
         if (bone.neck) bone.neck.rotation.y = headYaw * 0.35;
 
-        // --- 上半身の軽いひねり(体の向きに追従)---
-        if (bone.spine) bone.spine.rotation.y = bodyYaw * 0.25;
-
         // --- 脚: 歩行サイクル を あぐら(座り)とブレンドする ---
         const walking = walkAmt > 0.02;
         if (window.__legLock__ !== undefined) legPhase = window.__legLock__; // テスト用: 位相固定
-        else if (walking) legPhase += dt * 7;
+        else if (walking) legPhase += dt * 5.5;              // 歩調(少しゆっくり)
         const a = legPhase;
-        const sw = Math.sin(a) * walkAmt;                    // 腕振り等に流用
+        const sw = Math.sin(a) * walkAmt;
         const cwALK = Math.cos(a) * walkAmt;
         const swingL = Math.max(0, -Math.sin(a)) * walkAmt;  // 左脚の遊脚量(0..1) 中央でピーク
         const swingR = Math.max(0,  Math.sin(a)) * walkAmt;  // 右脚の遊脚量
-        // 歩行(前進):
-        //  ・太もも: 前後スイング(接地で前=正) + 遊脚での持ち上げ(膝が山なりに上がる)
-        //  ・膝: 遊脚の間だけ大きく曲げ、接地の前後では伸ばす
-        //  ・足首: 前接地でつま先を上げてかかとから接地 / 蹴り出しでつま先立ち
-        const THIGH = 0.5, KNEE = 1.3, LIFT = 0.35, ANKLE = 0.55;
+        // 人間の歩行に近づける:
+        //  ・太もも: 前後スイング(接地で前=正) + 遊脚でわずかに持ち上げ(足が地面をこする程度)
+        //  ・膝: 遊脚で自然に曲げ(膝が山なり)、接地では伸ばす
+        //  ・足首: 前接地でつま先を上げかかとから / 蹴り出しでつま先立ち
+        const THIGH = 0.42, KNEE = 1.0, LIFT = 0.12, ANKLE = 0.5;
         const walkThighL =  THIGH * cwALK + LIFT * swingL;
         const walkThighR = -THIGH * cwALK + LIFT * swingR;
         const walkShinL = KNEE * swingL, walkShinR = KNEE * swingR;
@@ -257,13 +254,19 @@ async function start(getBytes) {
         if (bone.rLoLeg) bone.rLoLeg.rotation.set(lerp(walkShinR, ssx, sitAmt), lerp(0, -ssy, sitAmt), 0);
         if (bone.lFoot) bone.lFoot.rotation.x = lerp(walkAnkleL, 0, sitAmt);
         if (bone.rFoot) bone.rFoot.rotation.x = lerp(walkAnkleR, 0, sitAmt);
-        if (bone.hips) bone.hips.rotation.x = lerp(0, (sp.hips !== undefined ? sp.hips : 0.0), sitAmt);
-        if (bone.spine) bone.spine.rotation.x = lerp(0, (sp.lean !== undefined ? sp.lean : 0.06), sitAmt); // 上体を少し前傾
+
+        // 骨盤と上体: 歩行の重心移動・ひねりが人間らしさの要。座り時は前傾のみ。
+        const sitHipsX = (sp.hips !== undefined ? sp.hips : 0.0);
+        const sitLean  = (sp.lean !== undefined ? sp.lean : 0.06);
+        if (bone.hips) bone.hips.rotation.set(lerp(0, sitHipsX, sitAmt), -0.10 * cwALK, 0.05 * sw);
+        if (bone.spine) bone.spine.rotation.set(lerp(0, sitLean, sitAmt), bodyYaw * 0.25 + 0.06 * cwALK, 0);
+        if (bone.chest) bone.chest.rotation.y = 0.04 * cwALK; // 肩を骨盤と逆にひねる
 
         // --- 腕: 通常は下ろした姿勢(歩行中は左右対称に前後へ小さく振る)。
         //     手を振る時は右腕を頭上へ上げて大きく振る ---
-        let lArmZ = baseArmZ, lArmX = -0.16 * sw;
-        let rArmZ = -baseArmZ, rArmX = 0.16 * sw;
+        // 腕は同じ側の脚と逆位相で振る(前脚のとき腕は後ろ)
+        let lArmZ = baseArmZ, lArmX = -0.3 * cwALK;
+        let rArmZ = -baseArmZ, rArmX = 0.3 * cwALK;
         if (waveAmt > 0.01) {
           // 右腕を頭上へ上げる(z を大きく) + 左右へ大きく振る
           const swing = Math.sin(t * 9) * 0.32;
@@ -280,15 +283,16 @@ async function start(getBytes) {
       }
       if (mixer) mixer.update(dt);
 
-      // --- ルート: 体の向き + 待機の揺れ + 呼吸/足踏みの上下動 + 座りの沈み込み ---
+      // --- ルート: 体の向き + 待機の揺れ + 呼吸/歩調の上下動 + 重心移動 + 座りの沈み込み ---
       if (displayObject) {
-        const sway = Math.sin(t * 1.1) * 0.03 * (talking ? 1 : 0.4) * (1 - sitAmt);
+        const sway = Math.sin(t * 1.1) * 0.03 * (talking ? 1 : 0.4) * (1 - sitAmt) * (1 - walkAmt);
         displayObject.rotation.y = baseRootY + bodyYaw + sway;
-        const bob = Math.sin(t / 1.4) * 0.008;                 // 呼吸
-        const step = walkAmt * Math.abs(Math.cos(legPhase)) * 0.01; // 通過相で少し伸び上がる弾み
+        const bob = Math.sin(t / 1.4) * 0.008 * (1 - walkAmt);        // 呼吸(歩行中は控えめ)
+        const walkBob = -0.012 * Math.cos(2 * legPhase) * walkAmt;    // 歩調の上下動(2歩で1周期・接地で沈む)
         const dropf = (window.__sitp__ && window.__sitp__.drop !== undefined) ? window.__sitp__.drop : 0.44;
-        const sitDrop = sitAmt * modelHeight * dropf;          // 座ると腰を落とす
-        displayObject.position.y = bob + step - sitDrop;
+        const sitDrop = sitAmt * modelHeight * dropf;                 // 座ると腰を落とす
+        displayObject.position.y = bob + walkBob - sitDrop;
+        displayObject.position.x = 0.025 * Math.sin(legPhase) * walkAmt; // 立脚側へ重心を移す左右の揺れ
       }
 
       renderer.render(scene, camera);
