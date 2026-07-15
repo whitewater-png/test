@@ -1,13 +1,15 @@
 #!/bin/bash
-# DesktopMate.app バンドルを生成するスクリプト（配布用）
+# DesktopMate.app バンドルを生成するスクリプト
 #
 # 使い方:
 #   ./scripts/build-app.sh [バージョン]
 #   例) ./scripts/build-app.sh 1.0.0
 #
-# ・Apple Silicon と Intel の両対応（ユニバーサルバイナリ）でビルドします
-# ・icon/AppIcon-1024.png があれば .icns を生成してアイコンを埋め込みます
-# ・ad-hoc 署名まで行います（未署名配布向け。手順は DISTRIBUTION.md 参照）
+# ・既定は「このMacのアーキテクチャ」でビルドします（確実・高速）。
+#   配布用に Apple Silicon + Intel の両対応にするには DESKTOPMATE_UNIVERSAL=1 を付けます
+#   （scripts/package.sh はこれを付けて呼びます）。
+# ・icon/AppIcon-1024.png があれば .icns を生成してアイコンを埋め込みます。
+# ・ad-hoc 署名まで行います（未署名配布向け。手順は DISTRIBUTION.md 参照）。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -17,20 +19,41 @@ VERSION="${1:-1.0.0}"
 BUNDLE_ID="${DESKTOPMATE_BUNDLE_ID:-com.example.desktopmate}"
 APP_DIR="dist/${APP_NAME}.app"
 
-echo "==> ユニバーサルバイナリをビルド (arm64 + x86_64)..."
-swift build -c release --arch arm64 --arch x86_64
-BIN_DIR="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)"
+# 既定は単一アーキ。DESKTOPMATE_UNIVERSAL=1 のときだけユニバーサル。
+# （macOS 標準の bash 3.2 では set -u と空配列展開が両立しないため、配列は使わない）
+if [[ "${DESKTOPMATE_UNIVERSAL:-0}" == "1" ]]; then
+  echo "==> ユニバーサルバイナリをビルド (arm64 + x86_64)..."
+  swift build -c release --arch arm64 --arch x86_64
+  BIN_DIR="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path | tail -1)"
+else
+  echo "==> リリースビルド..."
+  swift build -c release
+  BIN_DIR="$(swift build -c release --show-bin-path | tail -1)"
+fi
 BIN="${BIN_DIR}/${APP_NAME}"
+if [[ ! -x "$BIN" ]]; then
+  echo "✗ ビルド成果物が見つかりません: $BIN"
+  exit 1
+fi
 
 echo "==> .app バンドルを作成..."
 rm -rf dist
 mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
-cp "${BIN}" "${APP_DIR}/Contents/MacOS/${APP_NAME}"
+cp "$BIN" "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 
-# SwiftPM のリソースバンドル（bundle.js / viewer.html など）を一緒に入れる
+# リソースバンドル（bundle.js / viewer.html を含む DesktopMate_DesktopMate.bundle）を同梱。
+# Bundle.module は .app の Contents/Resources を探すため、ここに置く。
+copied_bundle=0
 for b in "${BIN_DIR}"/*.bundle; do
-  [ -e "$b" ] && cp -R "$b" "${APP_DIR}/Contents/Resources/"
+  if [[ -e "$b" ]]; then
+    cp -R "$b" "${APP_DIR}/Contents/Resources/"
+    copied_bundle=1
+  fi
 done
+if [[ "$copied_bundle" == "0" ]]; then
+  echo "   ⚠ リソースバンドル(*.bundle)が見つかりませんでした（VRM表示に必要）。"
+  echo "     ${BIN_DIR} を確認してください。"
+fi
 
 # --- アプリアイコン (.icns) を生成 ---
 ICON_SRC="icon/AppIcon-1024.png"
@@ -87,7 +110,6 @@ echo "==> ad-hoc 署名..."
 codesign --force --deep --sign - "${APP_DIR}"
 
 echo ""
-echo "✓ 完了: ${APP_DIR}（バージョン ${VERSION} / ユニバーサル）"
+echo "✓ 完了: ${APP_DIR}（バージョン ${VERSION}）"
 echo "  起動: open \"${APP_DIR}\""
 echo "  配布用の .zip / .dmg を作るには: ./scripts/package.sh ${VERSION}"
-echo "  ※ ad-hoc 署名のため、配布時はユーザーが初回「右クリック→開く」で許可します（DISTRIBUTION.md 参照）"

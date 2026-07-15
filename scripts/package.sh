@@ -13,8 +13,8 @@ APP_NAME="DesktopMate"
 VERSION="${1:-1.0.0}"
 APP_DIR="dist/${APP_NAME}.app"
 
-# 最新の .app をビルド
-./scripts/build-app.sh "$VERSION"
+# 最新の .app をビルド（配布用は Apple Silicon + Intel の両対応にする）
+DESKTOPMATE_UNIVERSAL=1 ./scripts/build-app.sh "$VERSION"
 
 echo "==> .zip を作成..."
 ZIP="dist/${APP_NAME}-${VERSION}.zip"
