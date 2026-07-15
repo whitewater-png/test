@@ -77,6 +77,7 @@ async function start(getBytes) {
           bone.hips = g('hips');
           bone.lUpArm = g('leftUpperArm'); bone.rUpArm = g('rightUpperArm');
           bone.lLoArm = g('leftLowerArm'); bone.rLoArm = g('rightLowerArm');
+          bone.lHand = g('leftHand'); bone.rHand = g('rightHand');
           bone.lUpLeg = g('leftUpperLeg'); bone.rUpLeg = g('rightUpperLeg');
           bone.lLoLeg = g('leftLowerLeg'); bone.rLoLeg = g('rightLowerLeg');
           bone.lFoot = g('leftFoot'); bone.rFoot = g('rightFoot');
@@ -138,6 +139,13 @@ async function start(getBytes) {
     // テスト用: 特定の行動を強制する(アプリでは未使用。ヘッドレス検証で使う)
     window.__debugForce__ = function (name, dur) { behavior = name; behaviorDur = dur || 6; behaviorTime = 0; if (name === 'turn') bodyYawTarget = Math.PI * 0.6; if (name === 'look') { lookH = 0.5; lookV = 0.2; } };
     window.__setYaw__ = function (v) { bodyYawTarget = v; }; // テスト用: 体の向きを固定(横から確認)
+    // テスト用: 左手と左膝のワールド座標(手を膝に載せる腕角度の検証に使う)
+    window.__armGeo__ = function () {
+      const h = new THREE.Vector3(), k = new THREE.Vector3();
+      if (bone.lHand) bone.lHand.getWorldPosition(h);
+      if (bone.lLoLeg) bone.lLoLeg.getWorldPosition(k);
+      return { hand: [h.x, h.y, h.z], knee: [k.x, k.y, k.z] };
+    };
     // テスト用: 左足のワールド座標と遊脚判定(歩行の前後方向を数値で検証する)
     window.__footInfo__ = function () {
       const v = new THREE.Vector3();
@@ -289,13 +297,16 @@ async function start(getBytes) {
         // 座り時は両手を前(両足の間)へ寄せて床につく感じにする。
         // 腕は下ろしたまま(z=baseArmZ)、前へ屈曲(x)+内側へ(y)。
         // 座り時は両手を膝(太ももの前)の上に置く。
-        const saX  = (sp.armX  !== undefined ? sp.armX  : 0.85); // 肩の屈曲(前へ=膝へ)
-        const saY  = (sp.armY  !== undefined ? sp.armY  : 0.0);  // 左右(膝幅に合わせて中央寄せは控えめ)
-        const saLo = (sp.loArm !== undefined ? sp.loArm : 0.6);  // 肘を曲げて前腕を膝に載せる
-        if (bone.lUpArm) bone.lUpArm.rotation.set(lerp(lArmX, saX, sitAmt), lerp(0,  saY, sitAmt), lerp(lArmZ,  baseArmZ, sitAmt));
-        if (bone.rUpArm) bone.rUpArm.rotation.set(lerp(rArmX, saX, sitAmt), lerp(0, -saY, sitAmt), lerp(rArmZ, -baseArmZ, sitAmt));
-        if (bone.lLoArm) bone.lLoArm.rotation.x = lerp(0, saLo, sitAmt);
-        if (bone.rLoArm && waveAmt <= 0.01) bone.rLoArm.rotation.x = lerp(0, saLo, sitAmt);
+        // 値は手と膝のワールド座標を実測してグリッド探索で決定(手が膝に載る)
+        const saX  = (sp.armX  !== undefined ? sp.armX  : 0.8);       // 肩の屈曲(前へ=膝へ)
+        const saY  = (sp.armY  !== undefined ? sp.armY  : 0.1);       // 左右(内転/外転)
+        const saZ  = (sp.armZ  !== undefined ? sp.armZ  : 1.6);       // 上腕の下ろし量(下げて肘を体側へ)
+        const saLo = (sp.loArm !== undefined ? sp.loArm : 1.1);       // 肘の曲げ(前腕を膝へ)
+        const saLoY = (sp.loArmY !== undefined ? sp.loArmY : 0.0);    // 前腕のひねり(手を膝の上へ)
+        if (bone.lUpArm) bone.lUpArm.rotation.set(lerp(lArmX, saX, sitAmt), lerp(0,  saY, sitAmt), lerp(lArmZ,  saZ, sitAmt));
+        if (bone.rUpArm) bone.rUpArm.rotation.set(lerp(rArmX, saX, sitAmt), lerp(0, -saY, sitAmt), lerp(rArmZ, -saZ, sitAmt));
+        if (bone.lLoArm) bone.lLoArm.rotation.set(lerp(0, saLo, sitAmt), lerp(0, saLoY, sitAmt), 0);
+        if (bone.rLoArm && waveAmt <= 0.01) bone.rLoArm.rotation.set(lerp(0, saLo, sitAmt), lerp(0, -saLoY, sitAmt), 0);
 
         currentVRM.update(dt);
       }
