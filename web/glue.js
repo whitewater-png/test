@@ -288,9 +288,10 @@ async function start(getBytes) {
         }
         // 座り時は両手を前(両足の間)へ寄せて床につく感じにする。
         // 腕は下ろしたまま(z=baseArmZ)、前へ屈曲(x)+内側へ(y)。
-        const saX  = (sp.armX  !== undefined ? sp.armX  : 0.6);  // 肩の屈曲(前へ)
-        const saY  = (sp.armY  !== undefined ? sp.armY  : 0.5);  // 内転/内旋(手を中央へ)
-        const saLo = (sp.loArm !== undefined ? sp.loArm : 0.4);  // 肘を軽く曲げる
+        // 座り時は両手を膝(太ももの前)の上に置く。
+        const saX  = (sp.armX  !== undefined ? sp.armX  : 0.85); // 肩の屈曲(前へ=膝へ)
+        const saY  = (sp.armY  !== undefined ? sp.armY  : 0.0);  // 左右(膝幅に合わせて中央寄せは控えめ)
+        const saLo = (sp.loArm !== undefined ? sp.loArm : 0.6);  // 肘を曲げて前腕を膝に載せる
         if (bone.lUpArm) bone.lUpArm.rotation.set(lerp(lArmX, saX, sitAmt), lerp(0,  saY, sitAmt), lerp(lArmZ,  baseArmZ, sitAmt));
         if (bone.rUpArm) bone.rUpArm.rotation.set(lerp(rArmX, saX, sitAmt), lerp(0, -saY, sitAmt), lerp(rArmZ, -baseArmZ, sitAmt));
         if (bone.lLoArm) bone.lLoArm.rotation.x = lerp(0, saLo, sitAmt);
