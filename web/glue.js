@@ -309,13 +309,14 @@ async function start(getBytes) {
         if (bone.rUpArm) bone.rUpArm.rotation.set(lerp(rArmX, saX, sitAmt), lerp(0, -saY, sitAmt), lerp(rArmZ, -saZ, sitAmt));
         if (bone.lLoArm) bone.lLoArm.rotation.set(lerp(0, saLo, sitAmt), lerp(0, saLoY, sitAmt), 0);
         if (bone.rLoArm && waveAmt <= 0.01) bone.rLoArm.rotation.set(lerp(0, saLo, sitAmt), lerp(0, -saLoY, sitAmt), 0);
-        // 手首: 前腕だけでは手のひらが正面/上を向くため、手首を曲げて太ももの上で
-        // 手の甲が上(手のひらが太もも側/下)を向くようにする。
-        // 値は指/親指ボーンの実測方向から「指先=前やや下・手の甲=上」になる
-        // 手首Eulerを逆算して決定(親指が内側=手のひら下向きをズーム画像で確認済み)
-        const shX = (sp.handX !== undefined ? sp.handX : 2.2);    // 手首の曲げ(太ももの上まで指先を折り込む)
-        const shY = (sp.handY !== undefined ? sp.handY : 0.50);   // 手首のひねり
-        const shZ = (sp.handZ !== undefined ? sp.handZ : 1.31);   // 手首の左右振り
+        // 手首: 値は反復フィット(適用→指/親指のワールド方向を実測→誤差回転で補正)で決定。
+        // 実測結果: 指=ほぼ水平前方(太もも平置き)、親指=内側やや上(y=+0.32)。
+        // ※このモデルは親指ボーンが指方向から約40°しか開かないため、
+        //   指を下に向けたまま親指を上げるのは幾何的に不可能。指を水平にして両立させた。
+        //   (旧値 handX=2.2/handY=0.50/handZ=1.31 は親指が外向き下=ユーザー指摘のNG状態)
+        const shX = (sp.handX !== undefined ? sp.handX : -2.406); // 手首の曲げ
+        const shY = (sp.handY !== undefined ? sp.handY : -0.296); // 手首のひねり
+        const shZ = (sp.handZ !== undefined ? sp.handZ : -0.654); // 手首の左右振り
         if (bone.lHand) bone.lHand.rotation.set(lerp(0, shX, sitAmt), lerp(0, shY, sitAmt), lerp(0, shZ, sitAmt));
         if (bone.rHand && waveAmt <= 0.01) bone.rHand.rotation.set(lerp(0, shX, sitAmt), lerp(0, -shY, sitAmt), lerp(0, -shZ, sitAmt));
 
