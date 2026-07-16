@@ -276,9 +276,10 @@ async function start(getBytes) {
         // 骨盤と上体: 歩行の重心移動・ひねりが人間らしさの要。座り時は前傾のみ。
         const sitHipsX = (sp.hips !== undefined ? sp.hips : 0.0);
         const sitLean  = (sp.lean !== undefined ? sp.lean : 0.06);
+        const sitChest = (sp.chestX !== undefined ? sp.chestX : -0.12);  // 胸を後ろへ開いて背筋を伸ばす
         if (bone.hips) bone.hips.rotation.set(lerp(0, sitHipsX, sitAmt), -0.10 * cwALK, 0.05 * sw);
         if (bone.spine) bone.spine.rotation.set(lerp(0, sitLean, sitAmt), bodyYaw * 0.25 + 0.06 * cwALK, 0);
-        if (bone.chest) bone.chest.rotation.y = 0.04 * cwALK; // 肩を骨盤と逆にひねる
+        if (bone.chest) { bone.chest.rotation.x = lerp(0, sitChest, sitAmt); bone.chest.rotation.y = 0.04 * cwALK; } // 肩を骨盤と逆にひねる
 
         // --- 腕: 通常は下ろした姿勢(歩行中は左右対称に前後へ小さく振る)。
         //     手を振る時は右腕を頭上へ上げて大きく振る ---
@@ -299,11 +300,11 @@ async function start(getBytes) {
         // 座り時は両手を膝(太ももの前)の上に置く。
         // 深い割座では膝が床近くで肩から遠く、腕を伸ばしたままでは手が届かない。
         // 前腕を太もも(膝側)の上に載せて手のひらを下向きに接地させる。
-        const saX  = (sp.armX  !== undefined ? sp.armX  : 0.5);       // 肩の屈曲(前へ)
+        const saX  = (sp.armX  !== undefined ? sp.armX  : 0.85);      // 肩の屈曲(前へ)
         const saY  = (sp.armY  !== undefined ? sp.armY  : 0.15);      // 左右(内転)
         const saZ  = (sp.armZ  !== undefined ? sp.armZ  : 1.5);       // 上腕は下ろし気味(肘を体側へ)
         const saLo = (sp.loArm !== undefined ? sp.loArm : 1.35);      // 肘を曲げ前腕を太ももへ載せる
-        const saLoY = (sp.loArmY !== undefined ? sp.loArmY : 0.0);    // 前腕のひねり(0=手のひら下)
+        const saLoY = (sp.loArmY !== undefined ? sp.loArmY : 0.55);   // 前腕のひねり(太ももの内側へ寄せる)
         if (bone.lUpArm) bone.lUpArm.rotation.set(lerp(lArmX, saX, sitAmt), lerp(0,  saY, sitAmt), lerp(lArmZ,  saZ, sitAmt));
         if (bone.rUpArm) bone.rUpArm.rotation.set(lerp(rArmX, saX, sitAmt), lerp(0, -saY, sitAmt), lerp(rArmZ, -saZ, sitAmt));
         if (bone.lLoArm) bone.lLoArm.rotation.set(lerp(0, saLo, sitAmt), lerp(0, saLoY, sitAmt), 0);
@@ -312,7 +313,7 @@ async function start(getBytes) {
         // 手の甲が上(手のひらが太もも側/下)を向くようにする。
         // 値は指/親指ボーンの実測方向から「指先=前やや下・手の甲=上」になる
         // 手首Eulerを逆算して決定(親指が内側=手のひら下向きをズーム画像で確認済み)
-        const shX = (sp.handX !== undefined ? sp.handX : 1.54);   // 手首の曲げ
+        const shX = (sp.handX !== undefined ? sp.handX : 2.2);    // 手首の曲げ(太ももの上まで指先を折り込む)
         const shY = (sp.handY !== undefined ? sp.handY : 0.50);   // 手首のひねり
         const shZ = (sp.handZ !== undefined ? sp.handZ : 1.31);   // 手首の左右振り
         if (bone.lHand) bone.lHand.rotation.set(lerp(0, shX, sitAmt), lerp(0, shY, sitAmt), lerp(0, shZ, sitAmt));
