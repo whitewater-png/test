@@ -4,7 +4,7 @@
 
 動画編集で低解像度の素材を拡大すると、補間の限界によりぼやけやジャギーが目立ち画質が荒くなってしまいます。このリポジトリでは、その問題を軽減するためのAI動画アップスケールツール `upscale.py` を提供しています。
 
-手法の比較や選定の考え方は [`docs/アップスケール手法比較.md`](docs/アップスケール手法比較.md) を参照してください（市販製品の ScaleUp / Topaz Video AI との比較、OSSの Real-ESRGAN / video2x / waifu2x / ffmpegフィルタとの比較を含みます）。
+手法の比較や選定の考え方は [`docs/アップスケール手法比較.md`](docs/アップスケール手法比較.md) を参照してください（市販製品の ScaleUp / Topaz Video AI との比較、OSSの Real-ESRGAN / video2x / waifu2x / ffmpegフィルタとの比較を含みます）。編集ソフト内で完結させたい場合は [`plugin/`](plugin/README.md) のPremiere Pro / After Effects用ネイティブプラグイン（macOSなら `bash plugin/setup_mac.sh` でワンショットセットアップ可能）も参照してください。
 
 ### 必要環境
 

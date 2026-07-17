@@ -12,3 +12,4 @@ plugin/build/
 plugin/third_party/onnxruntime*/
 plugin/models/
 *.onnx
+plugin/setup_log_*.log

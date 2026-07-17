@@ -1,5 +1,29 @@
 # AI Upscale プラグイン開発ガイド
 
+## クイックスタート（ワンショットセットアップ、macOS / Apple Silicon）
+
+MacBook Pro M4 Max等のApple Silicon Mac上であれば、以下の1コマンドで
+依存インストール〜ビルド〜モデル取得〜Premiere Proへのインストール〜
+動作確認までを一括実行できます。
+
+```bash
+bash plugin/setup_mac.sh
+```
+
+- 冪等です。何度実行しても、既に完了している工程は自動的にスキップされます。
+- 唯一の手動ステップは **Adobe After Effects SDKの初回ダウンロード**です
+  （Adobeのライセンス上、本リポジトリでは再配布できないため）。SDKが
+  見つからない場合、スクリプトが https://developer.adobe.com/after-effects/
+  を開いて案内し、`~/AdobeSDK` に展開後の再実行を促します。
+- Homebrew自体が未インストールの場合も、公式インストールコマンドを表示して
+  中断します（任意のインストールスクリプトを自動実行するのはセキュリティ上
+  避けているため、手動実行が必要です）。
+- `bash plugin/setup_mac.sh --uninstall` でPremiere/AEのMediaCoreフォルダから
+  プラグインを削除できます。
+- `bash plugin/setup_mac.sh --help` でオプション一覧を表示します。
+
+詳しい各工程の説明・トラブルシューティングは以下の各節を参照してください。
+
 FlashBack Japan の [ScaleUp](https://flashbackj.com/product/scaleup) と同形態の、
 Premiere Pro / After Effects 用ネイティブAIアップスケール・エフェクトプラグインです。
 編集ソフト内でエフェクトとして適用でき、Real-ESRGAN系のONNXモデルによる超解像処理で
@@ -332,7 +356,15 @@ https://github.com/xinntao/Real-ESRGAN/releases) からエクスポートでき�
 
 1. `src/core` + `src/cli`（Adobe非依存）はこの環境で実際にビルド・実行し、
    タイル処理を含めて動作確認しています。
-2. `src/plugin`（Adobe SDK層）はこの環境ではコンパイルできないため、
+2. `setup_mac.sh`（macOSワンショットセットアップスクリプト）は、
+   構文チェック (`bash -n`) 、shellcheck、`--check-only` / `--help` の
+   実行、およびSDK探索ロジック（`find_ae_sdk()`）をモックの `$HOME` で
+   関数単位に切り出して検証しています。ただしHomebrewでの実インストール、
+   `open` コマンドでのブラウザ起動、`sudo` を使った実際のファイルコピー、
+   実機Xcode/cmakeビルドはこの環境では検証できないため、**M4 Max実機での
+   確認が必要**です（安全側に倒すため、これらの操作は自動テストでは
+   モック関数に置き換えて呼び出しの発生のみを確認しています）。
+3. `src/plugin`（Adobe SDK層）はこの環境ではコンパイルできないため、
    AE SDKの実際のAPIシグネチャに忠実に書く一方、コンパイルエラーの
    機械的な検証はできていません。Adobe SDK入手後、最初のビルドで
    ヘッダパスやAPI詳細の細かな調整が必要になる可能性があります。CoreML EP

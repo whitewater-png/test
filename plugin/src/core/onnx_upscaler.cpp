@@ -392,8 +392,9 @@ void OnnxUpscaler::infer(const ImageRGBA8& in, ImageRGBA8& out) {
         Ort::Value& output_tensor = output_tensors.front();
         auto out_info = output_tensor.GetTensorTypeAndShapeInfo();
         auto out_shape = out_info.GetShape();
-        if (out_shape.size() != 4 || out_shape[1] != 3) {
-            throw OnnxUpscalerError("Unexpected model output shape (expected [1,3,H,W])");
+        if (out_shape.size() != 4 || out_shape[0] != 1 || out_shape[1] != 3) {
+            throw OnnxUpscalerError("Unexpected model output shape (expected [1,3,H,W], got batch=" +
+                                     std::to_string(out_shape.empty() ? -1 : out_shape[0]) + ")");
         }
         const int out_h = static_cast<int>(out_shape[2]);
         const int out_w = static_cast<int>(out_shape[3]);
