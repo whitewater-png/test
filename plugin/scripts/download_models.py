@@ -1,33 +1,46 @@
 #!/usr/bin/env python3
-"""download_models.py - Fetches Real-ESRGAN ONNX models into plugin/models/.
+"""download_models.py - Fetches Real-ESRGAN PyTorch weights into
+plugin/models/, for local conversion to ONNX (see export_realesrgan_onnx.py
+and setup_mac.sh step 5).
 
 Downloads:
-  - realesrgan-x4plus.onnx        (Photo mode, general-purpose 4x, 23-block RRDBNet)
-  - realesrgan-x4plus-anime.onnx  (Anime mode, compact 6-block RRDBNet)
+  - RealESRGAN_x4plus.pth           (Photo mode, general-purpose 4x, 23-block RRDBNet)
+  - RealESRGAN_x4plus_anime_6B.pth  (Anime mode, compact 6-block RRDBNet)
+
+Neither model is downloaded as a pre-exported ONNX file. Both are converted
+locally from the official PyTorch weights, via
+plugin/scripts/export_realesrgan_onnx.py, which traces the model with
+dynamic height/width axes so the resulting ONNX accepts arbitrary tile
+sizes.
+
+  Why not a pre-exported ONNX file for Photo mode? An earlier version of
+  this script downloaded a pre-exported ONNX mirror
+  (huggingface.co/qualcomm/Real-ESRGAN-x4plus), built for a fixed-shape NPU
+  pipeline: it hardcodes a 1x3x128x128 input shape. Real hardware testing
+  showed this fails for any tile that isn't exactly 128x128
+  ("Got invalid dimensions for input ... Got: 8 Expected: 128"), which is
+  incompatible with this plugin's tiled upscaling pipeline (tiles are not
+  all 128x128). Downloading the official .pth and exporting locally with
+  dynamic axes (the same approach already used for the Anime model) fixes
+  this and unifies both models onto one conversion path.
 
 Known-good source checked at the time this script was written (see
 plugin/README.md for the "if the URL is dead" fallback procedure):
 
-  Photo:  https://huggingface.co/qualcomm/Real-ESRGAN-x4plus
-          (direct file: Real-ESRGAN-x4plus.onnx, ~67MB, ONNX export of
-          xinntao/Real-ESRGAN's RealESRGAN_x4plus.pth). The URL below is
-          pinned to a specific immutable git revision (commit hash), not
-          the mutable "main" branch ref -- "main" 404'd after this file
-          was apparently removed from it upstream, and pinning to a
-          revision is also the right call from a supply-chain-integrity
-          angle regardless: a revision hash can't be silently swapped for
-          different content the way a branch ref can.
+  Photo:  https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/
+          RealESRGAN_x4plus.pth (official xinntao/Real-ESRGAN GitHub
+          release, ~67MB).
 
-  Anime:  As of this writing, no maintained direct ONNX release of the
-          6-block anime model (RealESRGAN_x4plus_anime_6B) was found; only
-          the original PyTorch weights are mirrored on GitHub/Hugging
-          Face. This script therefore downloads the .pth weights for the
-          anime model. setup_mac.sh converts these to ONNX automatically
-          (via export_anime_onnx.py, a basicsr-free exporter -- see that
-          script for why basicsr itself is avoided); this script just
-          prints a pointer to that instead of a manual basicsr-based
-          recipe. If a maintained ONNX mirror appears later, update
-          ANIME_ONNX_URL below and this script will use it directly.
+  Anime:  https://huggingface.co/amd/realesrgan-x4plus-anime-6b/resolve/main/
+          RealESRGAN_x4plus_anime_6B.pth (mirror of xinntao/Real-ESRGAN's
+          anime 6-block weights; no maintained direct ONNX release of this
+          variant was found at time of writing).
+
+setup_mac.sh converts both .pth files to ONNX automatically (via
+export_realesrgan_onnx.py, a basicsr-free exporter that also auto-detects
+each checkpoint's RRDB block count -- see that script for details); this
+script just downloads the source weights and prints a pointer to the
+manual conversion command as a fallback.
 
 Security notes:
   - HTTPS-only: every URL in this script is validated to use the https://
@@ -70,18 +83,10 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-PHOTO_ONNX_URL = (
-    "https://huggingface.co/qualcomm/Real-ESRGAN-x4plus/resolve/"
-    "01179a4da7bf5ac91faca650e6afbf282ac93933/Real-ESRGAN-x4plus.onnx"
-)
+PHOTO_PTH_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
+PHOTO_PTH_FILENAME = "RealESRGAN_x4plus.pth"
 PHOTO_ONNX_FILENAME = "realesrgan-x4plus.onnx"
 
-# No confirmed maintained ONNX mirror for the anime 6B model at time of
-# writing; left as None so the script clearly reports "not available"
-# rather than guessing a URL that 404s. See README.md for the PyTorch ->
-# ONNX export fallback (which is the actually-verified path for this
-# model).
-ANIME_ONNX_URL = None
 ANIME_PTH_URL = "https://huggingface.co/amd/realesrgan-x4plus-anime-6b/resolve/main/RealESRGAN_x4plus_anime_6B.pth"
 ANIME_PTH_FILENAME = "RealESRGAN_x4plus_anime_6B.pth"
 ANIME_ONNX_FILENAME = "realesrgan-x4plus-anime.onnx"
@@ -94,9 +99,22 @@ ANIME_ONNX_FILENAME = "realesrgan-x4plus-anime.onnx"
 # an explicit warning (not a silent pass) whenever a URL has no entry
 # here, so "verification was skipped" is always visible in the script's
 # output rather than assumed safe.
+#
+# Both hashes below are pinned from values observed on real hardware /
+# widely-published official values, not guessed:
+#   - Photo (RealESRGAN_x4plus.pth): the well-known published SHA-256 for
+#     xinntao/Real-ESRGAN's official v0.1.0 GitHub release asset.
+#   - Anime (RealESRGAN_x4plus_anime_6B.pth): the SHA-256 actually measured
+#     from a real download of amd/realesrgan-x4plus-anime-6b's mirrored
+#     file during on-device testing of this plugin.
+# If a real download's hash ever fails to match either pinned value, that
+# is surfaced to the user as a checksum-mismatch error (see
+# download_with_retry() below) rather than silently accepted -- so an
+# eventual upstream file change would be caught, not masked, by these
+# pins.
 KNOWN_SHA256: dict[str, str] = {
-    # "https://huggingface.co/qualcomm/Real-ESRGAN-x4plus/resolve/01179a4da7bf5ac91faca650e6afbf282ac93933/Real-ESRGAN-x4plus.onnx": "<fill in after manual verification>",
-    # "https://huggingface.co/amd/realesrgan-x4plus-anime-6b/resolve/main/RealESRGAN_x4plus_anime_6B.pth": "<fill in after manual verification>",
+    PHOTO_PTH_URL: "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1",
+    ANIME_PTH_URL: "f872d837d3c90ed2e05227bed711af5671a6fd1c9f7d7e91c911a61f155e99da",
 }
 
 MAX_RETRIES = 4
@@ -190,42 +208,37 @@ def main(argv: list[str]) -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     ok = True
+    exporter = Path(__file__).resolve().parent / "export_realesrgan_onnx.py"
 
-    print("Downloading Photo mode model (realesrgan-x4plus)...")
-    photo_dest = args.out_dir / PHOTO_ONNX_FILENAME
-    if not download_with_retry(PHOTO_ONNX_URL, photo_dest):
-        print(f"ERROR: could not download {PHOTO_ONNX_URL}")
-        print("See plugin/README.md 'モデル取得先が利用できない場合' for the manual export fallback.")
+    def _download_pth_weights(label: str, url: str, pth_filename: str, onnx_filename: str) -> bool:
+        pth_dest = args.out_dir / pth_filename
+        if not download_with_retry(url, pth_dest):
+            print(f"ERROR: could not download {url}")
+            print("See plugin/README.md 'モデル取得先が利用できない場合' for alternatives.")
+            return False
+        print(
+            f"\nDownloaded {label} PyTorch weights to {pth_dest}.\n"
+            f"This needs a local PyTorch -> ONNX export step (dynamic input shape, so the "
+            f"result works for any tile size -- see export_realesrgan_onnx.py's module "
+            f"docstring).\n\n"
+            f"If you're running plugin/setup_mac.sh, it detects this .pth file and runs the "
+            f"conversion automatically (in a dedicated venv, torch is not a hard dependency "
+            f"of this download script) -- no action needed.\n\n"
+            f"To convert manually instead:\n"
+            f"  pip3 install torch onnx\n"
+            f"  python3 {exporter} {pth_dest} {args.out_dir / onnx_filename}\n\n"
+            f"(The RRDB block count is auto-detected from the checkpoint; use --num-block to "
+            f"override if needed. Full walkthrough also in plugin/README.md.)"
+        )
+        return True
+
+    print("Downloading Photo mode model source weights...")
+    if not _download_pth_weights("Photo", PHOTO_PTH_URL, PHOTO_PTH_FILENAME, PHOTO_ONNX_FILENAME):
         ok = False
 
     print("\nDownloading Anime mode model source weights...")
-    if ANIME_ONNX_URL:
-        anime_dest = args.out_dir / ANIME_ONNX_FILENAME
-        if not download_with_retry(ANIME_ONNX_URL, anime_dest):
-            print(f"ERROR: could not download {ANIME_ONNX_URL}")
-            ok = False
-    else:
-        pth_dest = args.out_dir / ANIME_PTH_FILENAME
-        if download_with_retry(ANIME_PTH_URL, pth_dest):
-            print(
-                f"\nDownloaded PyTorch weights to {pth_dest}.\n"
-                f"No maintained ONNX mirror is known for this model, so it needs a local "
-                f"PyTorch -> ONNX export step.\n\n"
-                f"If you're running plugin/setup_mac.sh, it detects this .pth file and runs the "
-                f"conversion automatically (in a dedicated venv, torch is not a hard dependency "
-                f"of this download script) -- no action needed.\n\n"
-                f"To convert manually instead:\n"
-                f"  pip3 install torch onnx\n"
-                f"  python3 {Path(__file__).resolve().parent / 'export_anime_onnx.py'} "
-                f"{pth_dest} {args.out_dir / ANIME_ONNX_FILENAME}\n\n"
-                f"(This uses a basicsr-free exporter -- see export_anime_onnx.py's module "
-                f"docstring for why basicsr itself is avoided. Full walkthrough also in "
-                f"plugin/README.md.)"
-            )
-        else:
-            print(f"ERROR: could not download {ANIME_PTH_URL} either.")
-            print("See plugin/README.md 'モデル取得先が利用できない場合' for alternatives.")
-            ok = False
+    if not _download_pth_weights("Anime", ANIME_PTH_URL, ANIME_PTH_FILENAME, ANIME_ONNX_FILENAME):
+        ok = False
 
     if not ok:
         print(

@@ -553,46 +553,79 @@ plugin_bundle_path_result=""
 step5_models() {
     log_step 5 "モデル取得 (download_models.py)"
 
-    if [ -f "${MODELS_DIR}/realesrgan-x4plus.onnx" ]; then
-        log_skip "realesrgan-x4plus.onnx は既に ${MODELS_DIR} に存在します。"
+    step5a_quarantine_stale_photo_onnx
+
+    if [ -f "${MODELS_DIR}/RealESRGAN_x4plus.pth" ] && [ -f "${MODELS_DIR}/RealESRGAN_x4plus_anime_6B.pth" ]; then
+        log_skip "Photo/Anime用のPyTorch重みは既に ${MODELS_DIR} に存在します。"
     else
         log_info "python3 plugin/scripts/download_models.py を実行します..."
         log_info "注意: ダウンロードしたモデルにSHA-256の既知ハッシュが登録されていない場合、"
         log_info "      スクリプトは『検証をスキップした』という警告を表示します。これは"
         log_info "      ファイルが安全と保証されたわけではなく、単に照合対象のハッシュが"
         log_info "      まだ登録されていないことを意味します (plugin/scripts/download_models.py の"
-        log_info "      KNOWN_SHA256 参照)。入手元(Hugging Face)を信頼できる場合のみ使用してください。"
+        log_info "      KNOWN_SHA256 参照)。入手元(GitHub/Hugging Face)を信頼できる場合のみ使用してください。"
         python3 "${PLUGIN_DIR}/scripts/download_models.py" --out-dir "${MODELS_DIR}" || \
             log_warn "モデルダウンロードが一部失敗しました。plugin/README.md の手動エクスポート手順を参照してください。"
     fi
 
-    step5b_anime_onnx_convert
+    step5b_onnx_convert
 }
 
-# Anime用ONNXへの自動変換: download_models.py はONNX直配布が無いため
-# RealESRGAN_x4plus_anime_6B.pth (PyTorch重み) のみをダウンロードする。
-# ここでは basicsr 非依存の export_anime_onnx.py を使い、専用venv内で
-# torch/onnx をインストールした上でONNXへ変換する。
+# 固定形状(1x3x128x128)の旧Photo用ONNX (Qualcomm NPU向けエクスポート) が
+# models/ に残っている場合の対処。
 #
-# 冪等設計: 既に realesrgan-x4plus-anime.onnx が存在すればスキップする。
-# .pthが無ければ (ダウンロード失敗等) 何もしない (step7でanime系はスキップ
-# されるだけで、photo系のスモークテストは通常通り実行される)。
-step5b_anime_onnx_convert() {
+# 判定ロジック: realesrgan-x4plus.onnx が存在し、かつ RealESRGAN_x4plus.pth
+# が存在しない場合、それは「旧バージョンのdownload_models.pyがQualcomm版
+# ONNXを直接ダウンロードしていた世代」の産物である可能性が高いと判断する
+# (現行のdownload_models.pyは常に .pth を先にダウンロードしてから
+# step5b_onnx_convert でONNXに変換するため、.pthが無いのにONNXだけがある
+# 状態は基本的に旧世代の遺物でしか起こり得ない)。判定を複雑にしすぎない
+# ため、ONNXの中身 (入力形状など) までは検査しない -- 該当すれば無条件に
+# .bak へ退避し、.pth の再取得・再変換に進む。
+step5a_quarantine_stale_photo_onnx() {
+    local photo_onnx="${MODELS_DIR}/realesrgan-x4plus.onnx"
+    local photo_pth="${MODELS_DIR}/RealESRGAN_x4plus.pth"
+
+    if [ ! -f "${photo_onnx}" ]; then
+        return 0
+    fi
+    if [ -f "${photo_pth}" ]; then
+        # .pthも存在する = 現行フローで変換済みの可能性が高いのでそのまま。
+        return 0
+    fi
+
+    local backup="${photo_onnx}.bak.${TIMESTAMP}"
+    log_warn "固定形状(1x3x128x128)の可能性がある旧Photo用ONNX (${photo_onnx}) を検出しました"
+    log_warn "(RealESRGAN_x4plus.pth が無い = 旧バージョンのQualcomm ONNX直接ダウンロード世代の可能性)。"
+    log_warn "任意サイズのタイル推論に対応するため、退避して .pth から再取得・再変換します: ${backup}"
+    mv "${photo_onnx}" "${backup}"
+    log_ok "旧ONNXを退避しました: ${backup}"
+}
+
+# Photo/Anime両方のONNXへの自動変換: download_models.py はONNX直配布を
+# 行わず、両モデルとも公式PyTorch重み (.pth) をダウンロードする。ここでは
+# basicsr 非依存の export_realesrgan_onnx.py を使い、専用venv内で
+# torch/onnx をインストールした上でONNXへ変換する (num_blockはチェック
+# ポイントから自動推定される -- photo=23, anime=6)。
+#
+# 冪等設計: モデルごとに、対応するONNXが既に存在すればそのモデルの変換は
+# スキップする。.pthが無いモデルは (ダウンロード失敗等) スキップする
+# (step7では取得できたモデルのみでスモークテストが行われる)。
+step5b_onnx_convert() {
+    local photo_onnx="${MODELS_DIR}/realesrgan-x4plus.onnx"
+    local photo_pth="${MODELS_DIR}/RealESRGAN_x4plus.pth"
     local anime_onnx="${MODELS_DIR}/realesrgan-x4plus-anime.onnx"
     local anime_pth="${MODELS_DIR}/RealESRGAN_x4plus_anime_6B.pth"
 
-    if [ -f "${anime_onnx}" ]; then
-        log_skip "realesrgan-x4plus-anime.onnx は既に ${MODELS_DIR} に存在します。"
+    if [ -f "${photo_onnx}" ] && [ -f "${anime_onnx}" ]; then
+        log_skip "realesrgan-x4plus.onnx / realesrgan-x4plus-anime.onnx は既に ${MODELS_DIR} に存在します。"
         return 0
     fi
-
-    if [ ! -f "${anime_pth}" ]; then
-        log_warn "Anime用PyTorch重み (${anime_pth}) が見つからないため、ONNX変換をスキップします。"
+    if [ ! -f "${photo_pth}" ] && [ ! -f "${anime_pth}" ]; then
+        log_warn "Photo/Anime用のPyTorch重みが見つからないため、ONNX変換をスキップします。"
         log_warn "download_models.py のダウンロードが失敗した可能性があります。ログを確認してください。"
         return 0
     fi
-
-    log_info "Anime用ONNXへの自動変換を行います (${anime_pth} -> ${anime_onnx})。"
 
     local torch_venv="${BUILD_DIR}/torch-venv"
     if [ -x "${torch_venv}/bin/python3" ]; then
@@ -606,15 +639,37 @@ step5b_anime_onnx_convert() {
         "${torch_venv}/bin/pip" install torch onnx onnxruntime
     fi
 
-    log_info "python3 plugin/scripts/export_anime_onnx.py を実行します..."
-    "${torch_venv}/bin/python3" "${PLUGIN_DIR}/scripts/export_anime_onnx.py" \
-        "${anime_pth}" "${anime_onnx}"
+    step5b_convert_one "Photo" "${photo_pth}" "${photo_onnx}" "${torch_venv}"
+    step5b_convert_one "Anime" "${anime_pth}" "${anime_onnx}" "${torch_venv}"
+}
 
-    if [ -f "${anime_onnx}" ]; then
-        log_ok "Anime用ONNXへの変換が完了しました: ${anime_onnx}"
+# 1モデル分のPyTorch->ONNX変換を行うヘルパー。$1=ラベル(ログ用) $2=.pthパス
+# $3=出力ONNXパス $4=torch-venvパス。
+step5b_convert_one() {
+    local label="$1"
+    local pth_path="$2"
+    local onnx_path="$3"
+    local torch_venv="$4"
+
+    if [ -f "${onnx_path}" ]; then
+        log_skip "${label}用ONNX は既に ${onnx_path} に存在します。"
+        return 0
+    fi
+    if [ ! -f "${pth_path}" ]; then
+        log_warn "${label}用PyTorch重み (${pth_path}) が見つからないため、ONNX変換をスキップします。"
+        return 0
+    fi
+
+    log_info "${label}用ONNXへの自動変換を行います (${pth_path} -> ${onnx_path})。"
+    log_info "python3 plugin/scripts/export_realesrgan_onnx.py を実行します..."
+    "${torch_venv}/bin/python3" "${PLUGIN_DIR}/scripts/export_realesrgan_onnx.py" \
+        "${pth_path}" "${onnx_path}"
+
+    if [ -f "${onnx_path}" ]; then
+        log_ok "${label}用ONNXへの変換が完了しました: ${onnx_path}"
     else
-        log_warn "Anime用ONNXへの変換に失敗しました。plugin/scripts/export_anime_onnx.py を手動実行して"
-        log_warn "エラー内容を確認してください。Photo用モデルのみでの利用は引き続き可能です。"
+        log_warn "${label}用ONNXへの変換に失敗しました。plugin/scripts/export_realesrgan_onnx.py を手動実行して"
+        log_warn "エラー内容を確認してください。他方のモデルのみでの利用は引き続き可能です。"
     fi
 }
 

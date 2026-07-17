@@ -1,16 +1,40 @@
 #!/usr/bin/env python3
-"""export_anime_onnx.py - Exports the Real-ESRGAN anime 6-block PyTorch
-weights (RealESRGAN_x4plus_anime_6B.pth) to ONNX, without depending on the
+"""export_realesrgan_onnx.py - Exports Real-ESRGAN PyTorch weights to ONNX
+with dynamic (arbitrary-size) height/width input, without depending on the
 `basicsr` package.
 
-Why not just `pip install basicsr`? At the time this script was written,
-basicsr's `degradations.py` does `from torchvision.transforms.functional_tensor
-import rgb_to_grayscale`, a private torchvision module that was removed in
+This script is used for BOTH Real-ESRGAN checkpoints this plugin ships:
+  - Photo mode:  RealESRGAN_x4plus.pth          (23 RRDB blocks)
+  - Anime mode:  RealESRGAN_x4plus_anime_6B.pth  (6 RRDB blocks)
+Both variants share the same RRDBNet architecture and only differ in
+num_block (and, for arbitrary third-party checkpoints, potentially
+num_feat/num_grow_ch, though every checkpoint this plugin downloads uses the
+common num_feat=64, num_grow_ch=32). See `infer_num_block()` below: rather
+than hardcode which checkpoint is which, num_block is auto-detected from the
+checkpoint's own state_dict keys (`body.<N>....`), so this script works for
+either without a mode flag. `--num-block` is also available to override the
+detected value if a future checkpoint needs it.
+
+Why a from-scratch export (not the official Real-ESRGAN ONNX exporter or
+`pip install basicsr`)? At the time this script was written, basicsr's
+`degradations.py` does `from torchvision.transforms.functional_tensor import
+rgb_to_grayscale`, a private torchvision module that was removed in
 torchvision >= 0.17. On any reasonably current PyTorch/torchvision install,
 `import basicsr` (transitively pulled in by importing
 `basicsr.archs.rrdbnet_arch`) raises ModuleNotFoundError. Rather than pin an
 old torchvision (which drags in an old, potentially unpatched torch), this
 script defines the RRDBNet architecture itself, using nothing but `torch`.
+
+There is a second, independent reason this local-export path is required for
+the Photo model specifically, not just a basicsr-avoidance convenience: a
+pre-exported ONNX mirror (Qualcomm's NPU build of Real-ESRGAN-x4plus) was
+previously used for Photo mode, but that export was traced with a FIXED
+1x3x128x128 input shape (built for a fixed-shape NPU pipeline). Running
+arbitrary-size tiles through it fails at inference time
+("Got invalid dimensions for input ... Got: 8 Expected: 128"). Exporting
+locally with `dynamic_axes` on height/width (see `export()` below) is what
+makes the ONNX model actually usable for this plugin's tiled upscaling
+pipeline, for both Photo and Anime.
 
 Architecture note: RRDBNet / ResidualDenseBlock / RRDB below are a minimal
 re-implementation of the network architecture described in the Real-ESRGAN
@@ -23,12 +47,6 @@ structure (conv layer shapes, growth-channel wiring, residual scaling) is
 reproduced from the published architecture description because the exact
 layer names and shapes must match the state_dict keys inside the .pth
 checkpoint for load_state_dict() to succeed.
-
-This script targets the "anime 6B" variant specifically:
-  num_in_ch=3, num_out_ch=3, num_feat=64, num_block=6, num_grow_ch=32, scale=4
-(6 RRDB blocks, vs. 23 for the general-purpose "photo" x4plus model -- the
-photo model ships as a pre-exported ONNX file, see download_models.py, so
-this script does not need a num_block=23 mode.)
 
 Security note on loading the checkpoint:
   .pth files are pickle archives. Unpickling a *stock* torch.load() call
@@ -47,10 +65,14 @@ Security note on loading the checkpoint:
   script does not catch that error and retry with weights_only=False.
 
 Usage:
-    python3 export_anime_onnx.py <input.pth> <output.onnx>
+    python3 export_realesrgan_onnx.py <input.pth> <output.onnx> [--num-block N]
+
+    --num-block is optional; when omitted, the block count is inferred from
+    the checkpoint's own state_dict keys (see infer_num_block()).
 """
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -142,6 +164,34 @@ class RRDBNet(nn.Module):
         return out
 
 
+def infer_num_block(state_dict: dict) -> int:
+    """Infers num_block (the number of RRDB blocks in the network body)
+    from a state_dict's own key names, rather than requiring the caller to
+    know which checkpoint variant (photo x4plus / anime 6B / other) they
+    have.
+
+    RRDBNet's `body` submodule is an nn.Sequential of RRDB blocks, so its
+    parameters are keyed like "body.0.rdb1.conv1.weight",
+    "body.22.rdb3.conv5.bias", etc. The block count is one more than the
+    highest index N appearing in a "body.N...." key.
+
+    Raises ValueError if no "body.N...." keys are found at all (checkpoint
+    doesn't look like an RRDBNet state_dict).
+    """
+    max_index = -1
+    for key in state_dict:
+        parts = key.split(".")
+        if len(parts) >= 2 and parts[0] == "body" and parts[1].isdigit():
+            max_index = max(max_index, int(parts[1]))
+    if max_index < 0:
+        raise ValueError(
+            "Could not infer num_block: no 'body.<N>....' keys found in state_dict. "
+            "Is this an RRDBNet (Real-ESRGAN) checkpoint? Pass --num-block explicitly "
+            "to override auto-detection."
+        )
+    return max_index + 1
+
+
 def load_state_dict_safely(pth_path: Path) -> dict:
     """Loads a Real-ESRGAN .pth checkpoint with weights_only=True (see the
     module docstring for why this is required, not optional), and returns
@@ -162,9 +212,16 @@ def load_state_dict_safely(pth_path: Path) -> dict:
     )
 
 
-def export(pth_path: Path, onnx_path: Path) -> None:
-    model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=6, num_grow_ch=32, scale=4)
+def export(pth_path: Path, onnx_path: Path, num_block: int | None = None) -> None:
     state_dict = load_state_dict_safely(pth_path)
+
+    if num_block is None:
+        num_block = infer_num_block(state_dict)
+        print(f"Auto-detected num_block={num_block} from checkpoint state_dict.")
+    else:
+        print(f"Using explicit --num-block={num_block} (auto-detection skipped).")
+
+    model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=num_block, num_grow_ch=32, scale=4)
     model.load_state_dict(state_dict, strict=True)
     model.eval()
 
@@ -222,19 +279,23 @@ def _verify_with_onnxruntime(onnx_path: Path) -> None:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        print(__doc__)
-        print("Usage: python3 export_anime_onnx.py <input.pth> <output.onnx>", file=sys.stderr)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("pth_path", type=Path, help="Input .pth checkpoint (RRDBNet state_dict)")
+    parser.add_argument("onnx_path", type=Path, help="Output .onnx path")
+    parser.add_argument(
+        "--num-block", type=int, default=None,
+        help="Number of RRDB blocks (default: auto-detected from the checkpoint's "
+             "state_dict keys; use this to override if auto-detection is wrong).",
+    )
+    args = parser.parse_args(argv)
+
+    if not args.pth_path.is_file():
+        print(f"ERROR: input file not found: {args.pth_path}", file=sys.stderr)
         return 1
 
-    pth_path = Path(argv[0])
-    onnx_path = Path(argv[1])
-
-    if not pth_path.is_file():
-        print(f"ERROR: input file not found: {pth_path}", file=sys.stderr)
-        return 1
-
-    export(pth_path, onnx_path)
+    export(args.pth_path, args.onnx_path, num_block=args.num_block)
     return 0
 
 
