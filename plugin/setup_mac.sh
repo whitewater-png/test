@@ -208,6 +208,28 @@ step1_precheck() {
 # [2/7] 依存インストール: cmake, onnxruntime, ffmpeg (Homebrew)
 # ---------------------------------------------------------------------------
 brew_prefix_cache=""
+onnxruntime_include_dir_result=""
+
+# onnxruntimeのヘッダ (onnxruntime_cxx_api.h) を $1/include 配下から探索する。
+# Homebrewのonnxruntime formulaはバージョンによりヘッダを include/ 直下ではなく
+# include/onnxruntime/ サブディレクトリ (更に深い階層のこともある) に配置する
+# ため、固定パスをチェックするのではなく find で実際の設置場所を探し、見つかった
+# ディレクトリ (onnxruntime_cxx_api.h を含むディレクトリそのもの) を
+# onnxruntime_include_dir_result にセットする。複数見つかった場合は最初の1件を
+# 採用する。見つからない場合は onnxruntime_include_dir_result を空にして
+# 呼び出し元にエラーとして扱わせる。
+find_onnxruntime_include_dir() {
+    local prefix="$1"
+    onnxruntime_include_dir_result=""
+
+    local found
+    found="$(find "${prefix}/include" -name onnxruntime_cxx_api.h -print -quit 2>/dev/null || true)"
+    if [ -n "${found}" ]; then
+        onnxruntime_include_dir_result="$(dirname "${found}")"
+        return 0
+    fi
+    return 1
+}
 
 step2_dependencies() {
     log_step 2 "依存インストール (Homebrew: cmake, onnxruntime, ffmpeg)"
@@ -225,8 +247,15 @@ step2_dependencies() {
 
     brew_prefix_cache="$(brew --prefix onnxruntime)"
     log_info "onnxruntime prefix: ${brew_prefix_cache}"
-    if [ ! -f "${brew_prefix_cache}/include/onnxruntime_cxx_api.h" ]; then
-        log_error "onnxruntimeのヘッダが ${brew_prefix_cache}/include に見つかりません。"
+
+    if find_onnxruntime_include_dir "${brew_prefix_cache}"; then
+        log_ok "onnxruntimeのヘッダを検出しました: ${onnxruntime_include_dir_result}/onnxruntime_cxx_api.h"
+    else
+        log_error "onnxruntimeのヘッダ (onnxruntime_cxx_api.h) が ${brew_prefix_cache}/include 配下に見つかりません。"
+        log_error "${brew_prefix_cache}/include の内容:"
+        find "${brew_prefix_cache}/include" -maxdepth 3 2>&1 | while IFS= read -r line; do
+            log_error "  ${line}"
+        done
         log_error "brew reinstall onnxruntime を試してください。"
         exit 1
     fi
@@ -345,11 +374,12 @@ step4_build() {
     local ncpu
     ncpu="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 
-    log_info "cmake configure: -DONNXRUNTIME_ROOT=${brew_prefix_cache} -DAE_SDK_PATH=${ae_sdk_path_result}"
+    log_info "cmake configure: -DONNXRUNTIME_ROOT=${brew_prefix_cache} -DONNXRUNTIME_INCLUDE_DIR=${onnxruntime_include_dir_result} -DAE_SDK_PATH=${ae_sdk_path_result}"
     cmake -S "${PLUGIN_DIR}" -B "${BUILD_DIR}" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_OSX_ARCHITECTURES=arm64 \
         -DONNXRUNTIME_ROOT="${brew_prefix_cache}" \
+        -DONNXRUNTIME_INCLUDE_DIR="${onnxruntime_include_dir_result}" \
         -DAE_SDK_PATH="${ae_sdk_path_result}"
 
     log_info "cmake --build (並列度 ${ncpu})"

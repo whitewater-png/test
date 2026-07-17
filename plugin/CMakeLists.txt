@@ -16,7 +16,16 @@
 #                       (containing include/ and lib/). Get one from
 #                       https://github.com/microsoft/onnxruntime/releases
 #
-# Optional variable:
+# Optional variables:
+#   ONNXRUNTIME_INCLUDE_DIR - path to the directory directly containing
+#                        onnxruntime_cxx_api.h. Some distributions (notably
+#                        Homebrew's onnxruntime formula) nest the headers
+#                        under ${ONNXRUNTIME_ROOT}/include/onnxruntime/ (or
+#                        deeper) rather than directly under include/. When
+#                        set, this takes precedence over
+#                        ${ONNXRUNTIME_ROOT}/include for the include path.
+#                        Library resolution is unaffected and still uses
+#                        ${ONNXRUNTIME_ROOT}/lib.
 #   AE_SDK_PATH       - path to an extracted Adobe After Effects SDK
 #                        (https://developer.adobe.com/after-effects/).
 #                        Enables the AIUpscale target on Windows/macOS.
@@ -72,11 +81,27 @@ if(NOT DEFINED ONNXRUNTIME_ROOT)
         "Path to an extracted onnxruntime release (containing include/ and lib/)")
 endif()
 
-if(NOT EXISTS "${ONNXRUNTIME_ROOT}/include/onnxruntime_cxx_api.h")
+# ONNXRUNTIME_INCLUDE_DIR, when explicitly provided (e.g. by plugin/setup_mac.sh
+# after locating onnxruntime_cxx_api.h via `find`, since some distributions such
+# as Homebrew's onnxruntime formula nest headers under include/onnxruntime/ or
+# deeper rather than directly under include/), takes precedence over the
+# ${ONNXRUNTIME_ROOT}/include default below.
+if(DEFINED ONNXRUNTIME_INCLUDE_DIR AND NOT "${ONNXRUNTIME_INCLUDE_DIR}" STREQUAL "")
+    set(ONNXRUNTIME_INCLUDE_DIR "${ONNXRUNTIME_INCLUDE_DIR}" CACHE PATH
+        "Path to the directory directly containing onnxruntime_cxx_api.h" FORCE)
+else()
+    set(ONNXRUNTIME_INCLUDE_DIR "${ONNXRUNTIME_ROOT}/include" CACHE PATH
+        "Path to the directory directly containing onnxruntime_cxx_api.h")
+endif()
+
+if(NOT EXISTS "${ONNXRUNTIME_INCLUDE_DIR}/onnxruntime_cxx_api.h")
     message(WARNING
-        "onnxruntime headers not found at ${ONNXRUNTIME_ROOT}/include. "
+        "onnxruntime headers not found at ${ONNXRUNTIME_INCLUDE_DIR}. "
         "Set -DONNXRUNTIME_ROOT=/path/to/onnxruntime (extracted release from "
-        "https://github.com/microsoft/onnxruntime/releases). Configure will "
+        "https://github.com/microsoft/onnxruntime/releases), or "
+        "-DONNXRUNTIME_INCLUDE_DIR=/path/to/dir/containing/onnxruntime_cxx_api.h "
+        "directly if your onnxruntime distribution nests headers under a "
+        "subdirectory (e.g. Homebrew's include/onnxruntime/). Configure will "
         "likely fail at the upscale_core target.")
 endif()
 
@@ -102,7 +127,7 @@ target_include_directories(upscale_core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src/core
     PRIVATE
-        ${ONNXRUNTIME_ROOT}/include
+        ${ONNXRUNTIME_INCLUDE_DIR}
 )
 # Threads::Threads links -pthread (required for std::thread on
 # Linux/glibc); harmless no-op flag-wise on macOS/Windows.
@@ -184,7 +209,7 @@ if(DEFINED AE_SDK_PATH)
             ${AE_SDK_PATH}/Examples/Headers/SP
             ${AE_SDK_PATH}/Examples/Util
             ${AE_SDK_PATH}/Examples/Resources
-            ${ONNXRUNTIME_ROOT}/include
+            ${ONNXRUNTIME_INCLUDE_DIR}
         )
         target_link_libraries(AIUpscale PRIVATE upscale_core Threads::Threads)
 
