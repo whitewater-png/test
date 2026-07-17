@@ -10,15 +10,23 @@ plugin/README.md for the "if the URL is dead" fallback procedure):
 
   Photo:  https://huggingface.co/qualcomm/Real-ESRGAN-x4plus
           (direct file: Real-ESRGAN-x4plus.onnx, ~67MB, ONNX export of
-          xinntao/Real-ESRGAN's RealESRGAN_x4plus.pth)
+          xinntao/Real-ESRGAN's RealESRGAN_x4plus.pth). The URL below is
+          pinned to a specific immutable git revision (commit hash), not
+          the mutable "main" branch ref -- "main" 404'd after this file
+          was apparently removed from it upstream, and pinning to a
+          revision is also the right call from a supply-chain-integrity
+          angle regardless: a revision hash can't be silently swapped for
+          different content the way a branch ref can.
 
   Anime:  As of this writing, no maintained direct ONNX release of the
           6-block anime model (RealESRGAN_x4plus_anime_6B) was found; only
           the original PyTorch weights are mirrored on GitHub/Hugging
           Face. This script therefore downloads the .pth weights for the
-          anime model and prints the ONNX export command from
-          plugin/README.md rather than silently producing a fake file.
-          If a maintained ONNX mirror appears later, update
+          anime model. setup_mac.sh converts these to ONNX automatically
+          (via export_anime_onnx.py, a basicsr-free exporter -- see that
+          script for why basicsr itself is avoided); this script just
+          prints a pointer to that instead of a manual basicsr-based
+          recipe. If a maintained ONNX mirror appears later, update
           ANIME_ONNX_URL below and this script will use it directly.
 
 Security notes:
@@ -62,7 +70,10 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-PHOTO_ONNX_URL = "https://huggingface.co/qualcomm/Real-ESRGAN-x4plus/resolve/main/Real-ESRGAN-x4plus.onnx"
+PHOTO_ONNX_URL = (
+    "https://huggingface.co/qualcomm/Real-ESRGAN-x4plus/resolve/"
+    "01179a4da7bf5ac91faca650e6afbf282ac93933/Real-ESRGAN-x4plus.onnx"
+)
 PHOTO_ONNX_FILENAME = "realesrgan-x4plus.onnx"
 
 # No confirmed maintained ONNX mirror for the anime 6B model at time of
@@ -84,7 +95,7 @@ ANIME_ONNX_FILENAME = "realesrgan-x4plus-anime.onnx"
 # here, so "verification was skipped" is always visible in the script's
 # output rather than assumed safe.
 KNOWN_SHA256: dict[str, str] = {
-    # "https://huggingface.co/qualcomm/Real-ESRGAN-x4plus/resolve/main/Real-ESRGAN-x4plus.onnx": "<fill in after manual verification>",
+    # "https://huggingface.co/qualcomm/Real-ESRGAN-x4plus/resolve/01179a4da7bf5ac91faca650e6afbf282ac93933/Real-ESRGAN-x4plus.onnx": "<fill in after manual verification>",
     # "https://huggingface.co/amd/realesrgan-x4plus-anime-6b/resolve/main/RealESRGAN_x4plus_anime_6B.pth": "<fill in after manual verification>",
 }
 
@@ -138,8 +149,8 @@ def download_with_retry(url: str, dest: Path) -> bool:
                     total += len(chunk)
 
             expected_hash = KNOWN_SHA256.get(url)
+            actual_hash = sha256_of(part_path)
             if expected_hash:
-                actual_hash = sha256_of(part_path)
                 if actual_hash.lower() != expected_hash.lower():
                     print(f"  CHECKSUM MISMATCH for {dest.name}: expected {expected_hash}, got {actual_hash}")
                     part_path.unlink(missing_ok=True)
@@ -149,6 +160,9 @@ def download_with_retry(url: str, dest: Path) -> bool:
                 print(f"  WARNING: no known SHA-256 pinned for this URL; verification SKIPPED. "
                       f"See KNOWN_SHA256 in this script -- treat {dest.name} as unverified until a "
                       f"maintainer pins its hash.")
+                print(f"  Downloaded file sha256={actual_hash}")
+                print(f"  If you have manually confirmed this file is legitimate, you can pin this "
+                      f"value in KNOWN_SHA256[\"{url}\"] so future downloads are verified automatically.")
 
             # Atomic rename: dest either doesn't exist, or is a complete,
             # (when possible) verified file -- never a partial download.
@@ -195,23 +209,18 @@ def main(argv: list[str]) -> int:
         if download_with_retry(ANIME_PTH_URL, pth_dest):
             print(
                 f"\nDownloaded PyTorch weights to {pth_dest}.\n"
-                f"No maintained ONNX mirror is known for this model; export it yourself:\n\n"
-                f"  pip3 install torch basicsr realesrgan onnx\n"
-                f"  python3 -c \"\n"
-                f"import torch\n"
-                f"from basicsr.archs.rrdbnet_arch import RRDBNet\n"
-                f"model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=6, num_grow_ch=32, scale=4)\n"
-                f"state = torch.load('{pth_dest.name}', map_location='cpu')\n"
-                f"model.load_state_dict(state['params_ema'] if 'params_ema' in state else state)\n"
-                f"model.eval()\n"
-                f"dummy = torch.randn(1, 3, 64, 64)\n"
-                f"torch.onnx.export(model, dummy, '{ANIME_ONNX_FILENAME}',\n"
-                f"    input_names=['input'], output_names=['output'],\n"
-                f"    dynamic_axes={{'input': {{2: 'height', 3: 'width'}}, 'output': {{2: 'height', 3: 'width'}}}},\n"
-                f"    opset_version=13)\n"
-                f"\"\n\n"
-                f"Then move the resulting {ANIME_ONNX_FILENAME} into {args.out_dir}/.\n"
-                f"(Full walkthrough also in plugin/README.md.)"
+                f"No maintained ONNX mirror is known for this model, so it needs a local "
+                f"PyTorch -> ONNX export step.\n\n"
+                f"If you're running plugin/setup_mac.sh, it detects this .pth file and runs the "
+                f"conversion automatically (in a dedicated venv, torch is not a hard dependency "
+                f"of this download script) -- no action needed.\n\n"
+                f"To convert manually instead:\n"
+                f"  pip3 install torch onnx\n"
+                f"  python3 {Path(__file__).resolve().parent / 'export_anime_onnx.py'} "
+                f"{pth_dest} {args.out_dir / ANIME_ONNX_FILENAME}\n\n"
+                f"(This uses a basicsr-free exporter -- see export_anime_onnx.py's module "
+                f"docstring for why basicsr itself is avoided. Full walkthrough also in "
+                f"plugin/README.md.)"
             )
         else:
             print(f"ERROR: could not download {ANIME_PTH_URL} either.")

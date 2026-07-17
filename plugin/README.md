@@ -193,34 +193,47 @@ python3 plugin/scripts/download_models.py --out-dir plugin/models
 ### モデル取得先が利用できない場合
 
 - Photo用 (`realesrgan-x4plus`): 本スクリプトは Hugging Face の
-  `qualcomm/Real-ESRGAN-x4plus` リポジトリの `Real-ESRGAN-x4plus.onnx` を
-  取得します。URLが変わっている場合は https://huggingface.co/models?search=real-esrgan
-  で ONNX 形式のミラーを探すか、下記のPyTorch→ONNXエクスポート手順を使ってください。
+  `qualcomm/Real-ESRGAN-x4plus` リポジトリの `Real-ESRGAN-x4plus.onnx` を、
+  可変の `main` ブランチではなく特定のgitリビジョン（コミットハッシュ
+  `01179a4da7bf5ac91faca650e6afbf282ac93933`）にピン留めして取得します
+  （`main` はある時点でこのファイルが削除され404になったため。immutableな
+  リビジョンへのピン留めはURL切れ対策であると同時に、配布物の改ざん耐性の
+  面でも可変refより望ましい選択です）。このリビジョンURLも将来利用できなく
+  なった場合は https://huggingface.co/qualcomm/Real-ESRGAN-x4plus/commits/main
+  で新しいリビジョンを確認するか、
+  https://huggingface.co/models?search=real-esrgan で ONNX 形式の別ミラーを
+  探すか、下記のPyTorch→ONNXエクスポート手順を使ってください。
 - Anime用 (`realesrgan-x4plus-anime`): 執筆時点で維持されているONNX直配布が
   見当たらなかったため、本スクリプトは `amd/realesrgan-x4plus-anime-6b` の
-  `.pth`（PyTorch重み、xinntao/Real-ESRGAN由来）をダウンロードし、以下の
-  エクスポート手順を案内します。
+  `.pth`（PyTorch重み、xinntao/Real-ESRGAN由来）をダウンロードします。
+
+  `plugin/setup_mac.sh` を使う場合、この `.pth` からのONNX変換は自動で行われます
+  （ステップ5。専用venv `plugin/build/torch-venv` を作成し、
+  `plugin/scripts/export_anime_onnx.py` で変換します）。手動で行いたい場合は
+  以下のコマンドで実行できます:
 
 ```bash
-pip3 install torch basicsr realesrgan onnx
-python3 -c "
-import torch
-from basicsr.archs.rrdbnet_arch import RRDBNet
-model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=6, num_grow_ch=32, scale=4)
-state = torch.load('RealESRGAN_x4plus_anime_6B.pth', map_location='cpu')
-model.load_state_dict(state['params_ema'] if 'params_ema' in state else state)
-model.eval()
-dummy = torch.randn(1, 3, 64, 64)
-torch.onnx.export(model, dummy, 'realesrgan-x4plus-anime.onnx',
-    input_names=['input'], output_names=['output'],
-    dynamic_axes={'input': {2: 'height', 3: 'width'}, 'output': {2: 'height', 3: 'width'}},
-    opset_version=13)
-"
+pip3 install torch onnx
+python3 plugin/scripts/export_anime_onnx.py \
+    plugin/models/RealESRGAN_x4plus_anime_6B.pth \
+    plugin/models/realesrgan-x4plus-anime.onnx
 ```
 
-Photo用 (`realesrgan-x4plus`, 23-block RRDBNet) も同様のコードで
-`num_block=23` としてPyTorch重み (`RealESRGAN_x4plus.pth`,
-https://github.com/xinntao/Real-ESRGAN/releases) からエクスポートできます。
+  `export_anime_onnx.py` は `basicsr` に依存しません
+  （`basicsr` は新しいtorchvisionで壊れている既知の問題があるため —
+  詳細はスクリプト先頭のコメント参照）。RRDBNetアーキテクチャをtorchのみで
+  インライン定義し、`.pth` の読み込みには
+  `torch.load(path, map_location="cpu", weights_only=True)` を使用します。
+  `.pth` はpickle形式であり、`weights_only=True` を指定しない `torch.load()`
+  は任意コード実行につながり得るため、このスクリプトは常に
+  `weights_only=True` でロードし、テンソル以外のオブジェクトが混入して
+  いた場合は（安全側に倒して）ロードごと失敗させます。
+
+Photo用 (`realesrgan-x4plus`, 23-block RRDBNet) は現状ONNX直配布を使用して
+いるためエクスポートは不要ですが、手元でPyTorch重み
+(`RealESRGAN_x4plus.pth`, https://github.com/xinntao/Real-ESRGAN/releases)
+から再エクスポートしたい場合は、`export_anime_onnx.py` の `RRDBNet` 呼び出しを
+`num_block=23` に変更した上で同様の手順で行えます。
 
 ### インストール先
 

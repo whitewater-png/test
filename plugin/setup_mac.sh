@@ -565,6 +565,57 @@ step5_models() {
         python3 "${PLUGIN_DIR}/scripts/download_models.py" --out-dir "${MODELS_DIR}" || \
             log_warn "モデルダウンロードが一部失敗しました。plugin/README.md の手動エクスポート手順を参照してください。"
     fi
+
+    step5b_anime_onnx_convert
+}
+
+# Anime用ONNXへの自動変換: download_models.py はONNX直配布が無いため
+# RealESRGAN_x4plus_anime_6B.pth (PyTorch重み) のみをダウンロードする。
+# ここでは basicsr 非依存の export_anime_onnx.py を使い、専用venv内で
+# torch/onnx をインストールした上でONNXへ変換する。
+#
+# 冪等設計: 既に realesrgan-x4plus-anime.onnx が存在すればスキップする。
+# .pthが無ければ (ダウンロード失敗等) 何もしない (step7でanime系はスキップ
+# されるだけで、photo系のスモークテストは通常通り実行される)。
+step5b_anime_onnx_convert() {
+    local anime_onnx="${MODELS_DIR}/realesrgan-x4plus-anime.onnx"
+    local anime_pth="${MODELS_DIR}/RealESRGAN_x4plus_anime_6B.pth"
+
+    if [ -f "${anime_onnx}" ]; then
+        log_skip "realesrgan-x4plus-anime.onnx は既に ${MODELS_DIR} に存在します。"
+        return 0
+    fi
+
+    if [ ! -f "${anime_pth}" ]; then
+        log_warn "Anime用PyTorch重み (${anime_pth}) が見つからないため、ONNX変換をスキップします。"
+        log_warn "download_models.py のダウンロードが失敗した可能性があります。ログを確認してください。"
+        return 0
+    fi
+
+    log_info "Anime用ONNXへの自動変換を行います (${anime_pth} -> ${anime_onnx})。"
+
+    local torch_venv="${BUILD_DIR}/torch-venv"
+    if [ -x "${torch_venv}/bin/python3" ]; then
+        log_skip "torch-venv は既に ${torch_venv} に存在します。"
+    else
+        log_info "変換用の専用venvを作成します: ${torch_venv}"
+        python3 -m venv "${torch_venv}"
+        log_info "torch / onnx / onnxruntime をインストールします (初回のみ数分かかります。torchは"
+        log_info "数百MB〜数GB程度のダウンロードになります)..."
+        "${torch_venv}/bin/pip" install --upgrade pip >/dev/null
+        "${torch_venv}/bin/pip" install torch onnx onnxruntime
+    fi
+
+    log_info "python3 plugin/scripts/export_anime_onnx.py を実行します..."
+    "${torch_venv}/bin/python3" "${PLUGIN_DIR}/scripts/export_anime_onnx.py" \
+        "${anime_pth}" "${anime_onnx}"
+
+    if [ -f "${anime_onnx}" ]; then
+        log_ok "Anime用ONNXへの変換が完了しました: ${anime_onnx}"
+    else
+        log_warn "Anime用ONNXへの変換に失敗しました。plugin/scripts/export_anime_onnx.py を手動実行して"
+        log_warn "エラー内容を確認してください。Photo用モデルのみでの利用は引き続き可能です。"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -637,13 +688,25 @@ step7_smoketest() {
 
     local test_png="/tmp/ai_upscale_setup_test_in.png"
     local test_out="/tmp/ai_upscale_setup_test_out.png"
-    local test_model="${MODELS_DIR}/realesrgan-x4plus.onnx"
 
-    if [ ! -f "${test_model}" ]; then
-        log_warn "モデル ${test_model} が見つからないため、スモークテストをスキップします。"
+    # Photo用モデルを優先し、無ければAnime用にフォールバックする。片方でも
+    # 存在すれば推論パイプライン全体 (upscale_cli経由) の疎通確認としては
+    # 十分なため、どちらのモデルが取得できたかに関わらずスモークテストを
+    # 実行できるようにする。
+    local test_model=""
+    if [ -f "${MODELS_DIR}/realesrgan-x4plus.onnx" ]; then
+        test_model="${MODELS_DIR}/realesrgan-x4plus.onnx"
+    elif [ -f "${MODELS_DIR}/realesrgan-x4plus-anime.onnx" ]; then
+        test_model="${MODELS_DIR}/realesrgan-x4plus-anime.onnx"
+    fi
+
+    if [ -z "${test_model}" ]; then
+        log_warn "モデル (realesrgan-x4plus.onnx / realesrgan-x4plus-anime.onnx) が" \
+                 "${MODELS_DIR} に見つからないため、スモークテストをスキップします。"
         log_warn "plugin/scripts/download_models.py を手動で実行し、モデル取得後に再実行してください。"
         return 0
     fi
+    log_info "使用するモデル: ${test_model}"
 
     log_info "テスト画像を生成します..."
     if command -v python3 >/dev/null 2>&1 && [ -f "${PLUGIN_DIR}/tests/make_test_image.py" ]; then
