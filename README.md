@@ -37,3 +37,12 @@ python3 upscale.py input.mp4 -o output.mp4 --scale 2 --mode photo
 1. `ffprobe` で入力動画のフレームレートや音声有無を取得
 2. `realesrgan-ncnn-vulkan` が利用可能な場合: フレームをPNGとして抽出 → フレームごとにAIアップスケール → 元動画の音声・fpsを保持して再結合（H.264, yuv420p, crf 18）
 3. 利用できない場合: ffmpegの `scale`（lanczos）+ `unsharp` フィルタで1パス処理
+
+## Premiere Pro / After Effects 用ネイティブプラグイン
+
+書き出し前処理としてではなく、編集ソフト内で完結させてアップスケールしたい場合は
+[`plugin/`](plugin/) に FlashBack Japan の ScaleUp と同形態のAIアップスケール・エフェクト
+プラグイン（"AI Upscale"）のソースを用意しています。Adobe SDK非依存のコア推論エンジン
+（ONNX Runtime + タイル処理）と、AE/Premiere SDK層に分離した構成で、コア層はこのリポジトリの
+Linux開発環境でもビルド・テストできます。詳細は [`plugin/README.md`](plugin/README.md) を
+参照してください。

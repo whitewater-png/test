@@ -4,3 +4,11 @@
 *.avi
 __pycache__/
 *.pyc
+
+# plugin/ build artifacts and downloaded third-party binaries/models
+# (stb_image.h / stb_image_write.h ARE committed - they are small,
+# public-domain single-header libs, not build output)
+plugin/build/
+plugin/third_party/onnxruntime*/
+plugin/models/
+*.onnx

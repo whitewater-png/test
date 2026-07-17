@@ -1,0 +1,344 @@
+// AIUpscale.cpp - "AI Upscale" After Effects / Premiere Pro effect plugin.
+//
+// See AIUpscale.h for the "not verified in this environment" caveat: this
+// file cannot be compiled without the Adobe AE SDK, which is not present
+// in this Linux dev environment. It is written to match the AE SDK
+// sample-plugin structure (PF_Cmd dispatch switch in EffectMain calling
+// one handler per command) so it should need at most small adjustments
+// once built against the real SDK headers.
+//
+// Buffer-expansion caveat (also in README.md): PF_Cmd_FRAME_SETUP below
+// grows out_data->width/height by the requested scale, the same mechanism
+// AE blur-type effects use to grow their output rect. This is the
+// standard AE pattern; Premiere Pro's support for resizing effects'
+// output this way is more limited and MUST be verified on a real
+// Premiere install before shipping (some Premiere effect hosts clip or
+// ignore output world resizing that doesn't come from a small connected
+// set of "resize"-capable effect types). If Premiere does not honor the
+// resize, the practical workaround is to keep the output world at input
+// size and letter/pillar-box or require the user to apply an explicit
+// "Scale" transform after this effect -- left as a TODO pending real
+// hardware/software testing.
+#include "AIUpscale.h"
+
+#include <algorithm>
+#include <cstring>
+#include <new>
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+int scale_choice_to_factor(PF_ParamDef* params[]) {
+    const A_long choice = params[AI_UPSCALE_SCALE_POPUP]->u.pd.value;
+    return (choice == SCALE_CHOICE_4X) ? 4 : 2;
+}
+
+const char* mode_choice_to_model_filename(A_long choice) {
+    return (choice == MODE_CHOICE_ANIME) ? MODEL_FILENAME_ANIME : MODEL_FILENAME_PHOTO;
+}
+
+// Resolves the directory the plugin binary lives in, so we can find
+// <plugin_dir>/models/*.onnx. AE SDK exposes this via
+// PF_AppSuite/PF_UtilitySuite path helpers or, more commonly, via the
+// platform APIs (GetModuleFileName on Windows, CFBundle on macOS) using
+// the module handle supplied at DllMain/bundle-load time. The exact
+// helper varies by SDK version; sketched here as a TODO seam so the
+// plugin builds link-complete once the real helper is selected.
+std::string resolve_plugin_directory() {
+    // TODO(sdk): populate via platform-specific module path lookup.
+    // Placeholder: relies on a fixed relative-to-CWD "models/" for now,
+    // which is sufficient for local testing inside a host but should be
+    // replaced with an absolute path lookup before shipping.
+    return "models";
+}
+
+std::string model_path_for(const std::string& plugin_dir, A_long mode_choice) {
+    return plugin_dir + "/" + mode_choice_to_model_filename(mode_choice);
+}
+
+// Converts a PF_EffectWorld (assumed BGRA_8u, see header caveat) into the
+// Adobe-independent upscale::ImageRGBA8 the core engine expects (which is
+// RGBA-ordered). Channel order is swapped per-pixel.
+upscale::ImageRGBA8 world_to_rgba8(const PF_EffectWorld* world) {
+    upscale::ImageRGBA8 img;
+    const int w = static_cast<int>(world->width);
+    const int h = static_cast<int>(world->height);
+    img.resize(w, h);
+
+    const PF_Pixel8* row_base = reinterpret_cast<const PF_Pixel8*>(world->data);
+    const A_long row_bytes = world->rowbytes;
+
+    for (int y = 0; y < h; ++y) {
+        const PF_Pixel8* src = reinterpret_cast<const PF_Pixel8*>(
+            reinterpret_cast<const char*>(row_base) + static_cast<size_t>(y) * row_bytes);
+        uint8_t* dst = &img.pixels[static_cast<size_t>(y) * w * 4];
+        for (int x = 0; x < w; ++x) {
+            // PF_Pixel8 is {alpha, red, green, blue} in AE's native ARGB
+            // ordering; Premiere hosts typically hand BGRA_8u (see
+            // PF_WORLD_IS_DEEP / PF_Pixel_BGRA_8u in PrSDKAESupport.h).
+            // This function assumes the BGRA_8u interpretation per the
+            // task's stated 8bpc/BGRA_8u precondition -- if compiling
+            // against classic AE ARGB worlds instead, swap the indexing
+            // below accordingly (flagged as a TODO to verify against the
+            // real world's PF_PixelFormat at PF_Cmd_RENDER time).
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(src + x);
+            dst[x * 4 + 0] = p[2]; // R  (B G R A memory order for BGRA_8u)
+            dst[x * 4 + 1] = p[1]; // G
+            dst[x * 4 + 2] = p[0]; // B
+            dst[x * 4 + 3] = p[3]; // A
+        }
+    }
+    return img;
+}
+
+void rgba8_to_world(const upscale::ImageRGBA8& img, PF_EffectWorld* world) {
+    const int w = std::min(img.width, static_cast<int>(world->width));
+    const int h = std::min(img.height, static_cast<int>(world->height));
+    const A_long row_bytes = world->rowbytes;
+
+    for (int y = 0; y < h; ++y) {
+        uint8_t* dst = reinterpret_cast<uint8_t*>(
+            reinterpret_cast<char*>(world->data) + static_cast<size_t>(y) * row_bytes);
+        const uint8_t* src = &img.pixels[static_cast<size_t>(y) * img.width * 4];
+        for (int x = 0; x < w; ++x) {
+            uint8_t* p = dst + x * 4;
+            p[0] = src[x * 4 + 2]; // B
+            p[1] = src[x * 4 + 1]; // G
+            p[2] = src[x * 4 + 0]; // R
+            p[3] = src[x * 4 + 3]; // A
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PF_Cmd handlers
+// ---------------------------------------------------------------------------
+
+PF_Err HandleAbout(PF_InData* in_data, PF_OutData* out_data) {
+    PF_SPRINTF(out_data->return_msg,
+        "%s v%d.%d\r%s\rAI super-resolution upscaling (Real-ESRGAN via ONNX Runtime).",
+        AI_UPSCALE_NAME, AI_UPSCALE_MAJOR_VERSION, AI_UPSCALE_MINOR_VERSION, AI_UPSCALE_DESCRIPTION);
+    return PF_Err_NONE;
+}
+
+PF_Err HandleGlobalSetup(PF_InData* in_data, PF_OutData* out_data) {
+    out_data->my_version = PF_VERSION(
+        AI_UPSCALE_MAJOR_VERSION, AI_UPSCALE_MINOR_VERSION, AI_UPSCALE_BUG_VERSION,
+        AI_UPSCALE_STAGE_VERSION, AI_UPSCALE_BUILD_VERSION);
+
+    // PF_OutFlag_DEEP_COLOR_AWARE intentionally NOT set: 8bpc only for
+    // now (see README "known limitations"). PF_OutFlag_SEQUENCE_DATA_NEEDS_FLATTENING
+    // omitted since our sequence data is not persisted to project files.
+    out_data->out_flags = PF_OutFlag_NON_PARAM_VARY | PF_OutFlag_I_DO_DIALOG * 0;
+    out_data->out_flags2 = PF_OutFlag2_FLOAT_COLOR_AWARE * 0 | PF_OutFlag2_SUPPORTS_SMART_RENDER * 0;
+    // NOTE: SmartFX/SmartRender support is a documented roadmap item (see
+    // README) -- left disabled here since it requires a larger rewrite
+    // (PF_Cmd_SMART_PRE_RENDER / PF_Cmd_SMART_RENDER) not implemented in
+    // this pass.
+    return PF_Err_NONE;
+}
+
+PF_Err HandleParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[]) {
+    PF_Err err = PF_Err_NONE;
+    PF_ParamDef def;
+
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUP(
+        "Scale",
+        SCALE_POPUP_NUM_CHOICES,
+        SCALE_CHOICE_2X,
+        SCALE_POPUP_CHOICES,
+        SCALE_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUP(
+        "Mode",
+        MODE_POPUP_NUM_CHOICES,
+        MODE_CHOICE_PHOTO,
+        MODE_POPUP_CHOICES,
+        MODE_DISK_ID);
+
+    out_data->num_params = AI_UPSCALE_NUM_PARAMS;
+    return err;
+}
+
+PF_Err HandleSequenceSetup(PF_InData* in_data, PF_OutData* out_data) {
+    PF_Err err = PF_Err_NONE;
+
+    // Allocate our sequence data on the heap and stash the raw pointer in
+    // a PF_Handle. This mirrors the pattern used by AE SDK samples that
+    // need non-flat (C++ object) sequence data -- e.g. wrapping the
+    // pointer in a small fixed-size handle rather than trying to make
+    // AIUpscaleSequenceData itself relocatable, since it owns a
+    // unique_ptr<OnnxUpscaler>.
+    PF_Handle seq_handle = in_data->in_data.pica_basicP->new_handle(sizeof(AIUpscaleSequenceData*));
+    if (!seq_handle) {
+        return PF_Err_OUT_OF_MEMORY;
+    }
+
+    auto** stored_ptr = reinterpret_cast<AIUpscaleSequenceData**>(
+        in_data->in_data.pica_basicP->lock_handle(seq_handle));
+    *stored_ptr = new (std::nothrow) AIUpscaleSequenceData();
+    if (!*stored_ptr) {
+        in_data->in_data.pica_basicP->unlock_handle(seq_handle);
+        in_data->in_data.pica_basicP->dispose_handle(seq_handle);
+        return PF_Err_OUT_OF_MEMORY;
+    }
+    (*stored_ptr)->plugin_dir = resolve_plugin_directory();
+    in_data->in_data.pica_basicP->unlock_handle(seq_handle);
+
+    out_data->sequence_data = seq_handle;
+    return err;
+}
+
+PF_Err HandleSequenceSetdown(PF_InData* in_data, PF_OutData* out_data) {
+    if (in_data->in_data.sequence_data) {
+        auto** stored_ptr = reinterpret_cast<AIUpscaleSequenceData**>(
+            in_data->in_data.pica_basicP->lock_handle(in_data->in_data.sequence_data));
+        if (stored_ptr && *stored_ptr) {
+            delete *stored_ptr;
+            *stored_ptr = nullptr;
+        }
+        in_data->in_data.pica_basicP->unlock_handle(in_data->in_data.sequence_data);
+        in_data->in_data.pica_basicP->dispose_handle(in_data->in_data.sequence_data);
+    }
+    out_data->sequence_data = nullptr;
+    return PF_Err_NONE;
+}
+
+AIUpscaleSequenceData* get_sequence_data(PF_InData* in_data) {
+    if (!in_data->in_data.sequence_data) return nullptr;
+    auto** stored_ptr = reinterpret_cast<AIUpscaleSequenceData**>(
+        in_data->in_data.pica_basicP->lock_handle(in_data->in_data.sequence_data));
+    AIUpscaleSequenceData* seq = stored_ptr ? *stored_ptr : nullptr;
+    in_data->in_data.pica_basicP->unlock_handle(in_data->in_data.sequence_data);
+    return seq;
+}
+
+// Ensures the correct model (per current Mode param) is loaded into the
+// cached OnnxUpscaler, reloading only when the mode actually changed.
+PF_Err ensure_model_loaded(AIUpscaleSequenceData* seq, A_long mode_choice) {
+    if (seq->upscaler && seq->loaded_mode_choice == mode_choice) {
+        return PF_Err_NONE; // already loaded, nothing to do
+    }
+
+    if (!seq->upscaler) {
+        seq->upscaler = std::make_unique<upscale::OnnxUpscaler>();
+    }
+
+    const std::string model_path = model_path_for(seq->plugin_dir, mode_choice);
+    try {
+        seq->upscaler->load(model_path, upscale::ExecutionProvider::kAuto);
+        seq->loaded_mode_choice = mode_choice;
+    } catch (const upscale::OnnxUpscalerError&) {
+        return PF_Err_INTERNAL_STRUCT_DAMAGED; // best available generic PF_Err for "bad model file"
+    }
+    return PF_Err_NONE;
+}
+
+PF_Err HandleFrameSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[]) {
+    const int scale = scale_choice_to_factor(params);
+
+    // Buffer-expansion pattern (see file-header caveat re: Premiere
+    // support): grow the output world to input-size * scale and keep the
+    // origin at (0,0) since this effect doesn't reposition content.
+    out_data->width = in_data->width * scale;
+    out_data->height = in_data->height * scale;
+    out_data->origin.h = 0;
+    out_data->origin.v = 0;
+
+    return PF_Err_NONE;
+}
+
+PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], PF_LayerDef* output) {
+    PF_Err err = PF_Err_NONE;
+
+    // 8bpc only (see README known limitations). AE signals higher bit
+    // depths via in_data->appl_id / PF_WORLD_IS_DEEP(output)-style checks
+    // depending on SDK version; bail out cleanly if not 8bpc.
+    if (PF_WORLD_IS_DEEP(output)) {
+        PF_STRCPY(out_data->return_msg, "AI Upscale currently supports 8bpc footage only.");
+        return PF_Err_INTERNAL_STRUCT_DAMAGED;
+    }
+
+    AIUpscaleSequenceData* seq = get_sequence_data(in_data);
+    if (!seq) {
+        return PF_Err_INTERNAL_STRUCT_DAMAGED;
+    }
+
+    const A_long mode_choice = params[AI_UPSCALE_MODE_POPUP]->u.pd.value;
+    err = ensure_model_loaded(seq, mode_choice);
+    if (err) return err;
+
+    const int scale = scale_choice_to_factor(params);
+    PF_EffectWorld* input_world = &params[AI_UPSCALE_INPUT]->u.ld;
+
+    upscale::ImageRGBA8 in_img = world_to_rgba8(input_world);
+
+    upscale::TileOptions tile_opts;
+    tile_opts.tile_size = 256;
+    tile_opts.overlap = 16;
+
+    upscale::ImageRGBA8 out_img;
+    try {
+        seq->upscaler->upscale(in_img, out_img, scale, tile_opts);
+    } catch (const upscale::OnnxUpscalerError&) {
+        return PF_Err_INTERNAL_STRUCT_DAMAGED;
+    }
+
+    rgba8_to_world(out_img, output);
+    return err;
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// EffectMain: single dispatch entry point, matching AE SDK convention.
+// ---------------------------------------------------------------------------
+PF_Err EffectMain(
+    PF_Cmd          cmd,
+    PF_InData*      in_data,
+    PF_OutData*     out_data,
+    PF_ParamDef*    params[],
+    PF_LayerDef*    output,
+    void*           extra) {
+    PF_Err err = PF_Err_NONE;
+
+    try {
+        switch (cmd) {
+            case PF_Cmd_ABOUT:
+                err = HandleAbout(in_data, out_data);
+                break;
+            case PF_Cmd_GLOBAL_SETUP:
+                err = HandleGlobalSetup(in_data, out_data);
+                break;
+            case PF_Cmd_PARAMS_SETUP:
+                err = HandleParamsSetup(in_data, out_data, params);
+                break;
+            case PF_Cmd_SEQUENCE_SETUP:
+            case PF_Cmd_SEQUENCE_RESETUP:
+                err = HandleSequenceSetup(in_data, out_data);
+                break;
+            case PF_Cmd_SEQUENCE_SETDOWN:
+                err = HandleSequenceSetdown(in_data, out_data);
+                break;
+            case PF_Cmd_FRAME_SETUP:
+                err = HandleFrameSetup(in_data, out_data, params);
+                break;
+            case PF_Cmd_RENDER:
+                err = HandleRender(in_data, out_data, params, output);
+                break;
+            default:
+                break;
+        }
+    } catch (...) {
+        // AE SDK convention: never let C++ exceptions cross the plugin
+        // boundary; report a generic internal error instead.
+        err = PF_Err_INTERNAL_STRUCT_DAMAGED;
+    }
+
+    return err;
+}
