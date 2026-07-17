@@ -81,18 +81,30 @@ resource 'PiPL' (16000) {
         },
 
         AE_Effect_Global_OutFlags {
-            // Must equal the out_data->out_flags bitmask HandleGlobalSetup()
-            // (AIUpscale.cpp) sets at PF_Cmd_GLOBAL_SETUP:
-            //   out_data->out_flags = PF_OutFlag_NON_PARAM_VARY | PF_OutFlag_I_DO_DIALOG * 0;
-            // The "* 0" term contributes nothing, so only
-            // PF_OutFlag_NON_PARAM_VARY is actually set. Per AE_Effect.h's
-            // PF_OutFlag enum (bit position, not the previous placeholder's
-            // 0x02000000): PF_OutFlag_NON_PARAM_VARY = 1L << 2 = 0x00000004.
-            // Recompute both this value and AIUpscale.cpp's out_flags
-            // together if either side's flag combination changes -- a
-            // mismatch here causes AE/Premiere to warn or refuse to load
-            // the effect at startup.
-            0x00000004
+            // MUST stay numerically identical to the out_data->out_flags
+            // bitmask HandleGlobalSetup() (AIUpscale.cpp) sets at
+            // PF_Cmd_GLOBAL_SETUP -- update BOTH sides together whenever
+            // either changes, and see the three static_asserts directly
+            // above HandleAbout() in AIUpscale.cpp, which fail the build
+            // if AE_Effect.h's real bit positions ever disagree with the
+            // values assumed here (this repo's dev environment has no
+            // real AE_Effect.h to check against directly):
+            //   out_data->out_flags = PF_OutFlag_NON_PARAM_VARY
+            //                        | PF_OutFlag_I_EXPAND_BUFFER
+            //                        | PF_OutFlag_DISPLAY_ERROR_MESSAGE;
+            // Per AE_Effect.h's PF_OutFlag enum (bit position):
+            //   PF_OutFlag_NON_PARAM_VARY      = 1L << 2 = 0x00000004
+            //   PF_OutFlag_DISPLAY_ERROR_MESSAGE = 1L << 8 = 0x00000100
+            //   PF_OutFlag_I_EXPAND_BUFFER     = 1L << 9 = 0x00000200
+            //   combined = 0x004 | 0x100 | 0x200 = 0x00000304 (772)
+            // PF_OutFlag_I_EXPAND_BUFFER was previously missing here (and
+            // in out_data->out_flags) even though PF_Cmd_FRAME_SETUP
+            // grows out_data->width/height -- this is believed to be a
+            // contributing cause of the real-hardware
+            // PF_Err_INTERNAL_STRUCT_DAMAGED (512) reported at render
+            // time. PF_OutFlag_DISPLAY_ERROR_MESSAGE was added so the
+            // host actually shows out_data->return_msg in its error UI.
+            0x00000304
         },
 
         AE_Effect_Global_OutFlags_2 {

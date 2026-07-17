@@ -30,6 +30,19 @@
 #include <stdexcept>
 #include <system_error>
 
+// Platform module-path lookup used by resolve_plugin_directory() below:
+// Windows resolves the .aex's own path via GetModuleHandleExA/
+// GetModuleFileNameA, everyone else (macOS -- the primary target -- and
+// any other POSIX host) uses dladdr(), which is available on both macOS
+// and Linux (the latter only matters for this repo's dladdr-based unit
+// test, since the AIUpscale target itself is never built on Linux -- see
+// plugin/CMakeLists.txt).
+#ifdef _WIN32
+#include <Windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
 #include "logger.h"
 #include "size_limits.h"
 
@@ -84,18 +97,87 @@ const char* mode_choice_to_model_filename(A_long choice) {
 }
 
 // Resolves the directory the plugin binary lives in, so we can find
-// <plugin_dir>/models/*.onnx. AE SDK exposes this via
-// PF_AppSuite/PF_UtilitySuite path helpers or, more commonly, via the
-// platform APIs (GetModuleFileName on Windows, CFBundle on macOS) using
-// the module handle supplied at DllMain/bundle-load time. The exact
-// helper varies by SDK version; sketched here as a TODO seam so the
-// plugin builds link-complete once the real helper is selected.
+// <plugin_dir>/models/*.onnx.
+//
+// THIS WAS THE ROOT CAUSE of the real-hardware PF_Err_INTERNAL_STRUCT_DAMAGED
+// (512) reported at render time: this function used to unconditionally
+// return the literal string "models", resolved by every later
+// std::filesystem call relative to the host process's current working
+// directory. Premiere Pro/After Effects do NOT run with CWD set to the
+// plugin's install directory (MediaCore or Plug-ins), so
+// model_path_for()'s fs::canonical(models_dir) lookup failed, model_path_for
+// returned "", and ensure_model_loaded() surfaced that as
+// PF_Err_INTERNAL_STRUCT_DAMAGED -- exactly the error code seen in the
+// field. Premiere reports render-time errors in aggregate at
+// PF_Cmd_FRAME_SETDOWN (selector 11), which is why the error dialog
+// pointed at teardown rather than the actual failing command.
+//
+// Fixed by resolving the plugin's own module/bundle path via the
+// platform loader APIs instead of trusting CWD:
+//   - macOS: dladdr() on this very function's address gives the absolute
+//     path of the Mach-O binary inside the bundle,
+//     .../MediaCore/AIUpscale.plugin/Contents/MacOS/AIUpscale. Four
+//     parent_path() calls walk back up to MediaCore, the directory
+//     setup_mac.sh's step6_install() installs models/ into as a sibling
+//     of AIUpscale.plugin (see MEDIACORE_DIR/dest_bundle/dest_models
+//     there) -- i.e. exactly the plugin_dir model_path_for() expects.
+//   - Windows: the plugin ships as a bare .aex (a renamed DLL) placed
+//     directly in the shared Plug-ins/MediaCore folder, with models/ as
+//     an immediate sibling (no bundle nesting like macOS), so the
+//     directory containing the .aex IS the plugin directory --
+//     GetModuleFileNameA's result needs only one parent_path().
+// Both branches fall back to the old CWD-relative "models" (with a WARN
+// log) if the platform lookup fails, so behavior degrades gracefully
+// rather than throwing/crashing.
 std::string resolve_plugin_directory() {
-    // TODO(sdk): populate via platform-specific module path lookup.
-    // Placeholder: relies on a fixed relative-to-CWD "models/" for now,
-    // which is sufficient for local testing inside a host but should be
-    // replaced with an absolute path lookup before shipping.
+#ifdef _WIN32
+    HMODULE module = nullptr;
+    if (GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(&resolve_plugin_directory),
+            &module)) {
+        char path_buf[MAX_PATH];
+        const DWORD len = GetModuleFileNameA(module, path_buf, sizeof(path_buf));
+        // GetModuleFileNameA returns 0 on failure, or a length == the
+        // buffer size (with no reliable way to distinguish "exact fit"
+        // from "truncated") on overflow -- treat both as failure rather
+        // than risk silently using a truncated path.
+        if (len > 0 && len < sizeof(path_buf)) {
+            const std::filesystem::path aex_path(std::string(path_buf, len));
+            // .../Plug-ins/Common/AIUpscale.aex -> .../Plug-ins/Common (1)
+            const std::filesystem::path plugin_dir = aex_path.parent_path();
+            if (!plugin_dir.empty()) {
+                return plugin_dir.string();
+            }
+        }
+    }
+    upscale::log_warn(
+        "resolve_plugin_directory: GetModuleHandleExA/GetModuleFileNameA failed to resolve the "
+        "plugin's own module path; falling back to CWD-relative \"models\" (this will very likely "
+        "fail to find models/ under a real Premiere/AE host -- see AIUpscale.cpp comment).");
     return "models";
+#else
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void*>(&resolve_plugin_directory), &info) && info.dli_fname &&
+        info.dli_fname[0] != '\0') {
+        const std::filesystem::path bin(info.dli_fname);
+        // .../MediaCore/AIUpscale.plugin/Contents/MacOS/AIUpscale
+        //   -> .../MediaCore/AIUpscale.plugin/Contents/MacOS   (1)
+        //   -> .../MediaCore/AIUpscale.plugin/Contents         (2)
+        //   -> .../MediaCore/AIUpscale.plugin                  (3)
+        //   -> .../MediaCore                                   (4)
+        const std::filesystem::path plugin_dir =
+            bin.parent_path().parent_path().parent_path().parent_path();
+        if (!plugin_dir.empty()) {
+            return plugin_dir.string();
+        }
+    }
+    upscale::log_warn(
+        "resolve_plugin_directory: dladdr() failed to resolve the plugin's own module path; "
+        "falling back to CWD-relative \"models\" (this will very likely fail to find models/ "
+        "under a real Premiere/AE host -- see AIUpscale.cpp comment).");
+    return "models";
+#endif
 }
 
 // Resolves and validates the on-disk path of the model for `mode_choice`,
@@ -205,6 +287,28 @@ void rgba8_to_world(const upscale::ImageRGBA8& img, PF_EffectWorld* world) {
 // PF_Cmd handlers
 // ---------------------------------------------------------------------------
 
+// AE_Effect_Global_OutFlags / _2 in AIUpscalePiPL.r MUST stay numerically
+// identical to the bitmask HandleGlobalSetup() below sets on
+// out_data->out_flags / out_flags2 -- AE/Premiere cross-checks the PiPL's
+// declared flags against what PF_Cmd_GLOBAL_SETUP actually reports and
+// will warn or refuse to load the effect on a mismatch. This repo's dev
+// environment has no real AE_Effect.h (see AIUpscale.h's "NOT VERIFIED IN
+// THIS ENVIRONMENT" caveat), so the exact bit positions below cannot be
+// checked against the real header here; these static_asserts are a
+// build-time tripwire so the first real SDK build fails loudly (instead
+// of silently loading with mismatched flags) if either assumption is
+// wrong. If any of these ever fail, or if the out_flags expression below
+// changes, recompute AIUpscalePiPL.r's AE_Effect_Global_OutFlags to match.
+static_assert(PF_OutFlag_NON_PARAM_VARY == (1L << 2),
+              "PF_OutFlag_NON_PARAM_VARY bit position changed -- update AIUpscalePiPL.r's "
+              "AE_Effect_Global_OutFlags to match out_data->out_flags");
+static_assert(PF_OutFlag_DISPLAY_ERROR_MESSAGE == (1L << 8),
+              "PF_OutFlag_DISPLAY_ERROR_MESSAGE bit position changed -- update AIUpscalePiPL.r's "
+              "AE_Effect_Global_OutFlags to match out_data->out_flags");
+static_assert(PF_OutFlag_I_EXPAND_BUFFER == (1L << 9),
+              "PF_OutFlag_I_EXPAND_BUFFER bit position changed -- update AIUpscalePiPL.r's "
+              "AE_Effect_Global_OutFlags to match out_data->out_flags");
+
 PF_Err HandleAbout(PF_InData* in_data, PF_OutData* out_data) {
     set_return_msg(out_data,
         "%s v%d.%d\r%s\rAI super-resolution upscaling (Real-ESRGAN via ONNX Runtime).",
@@ -220,7 +324,22 @@ PF_Err HandleGlobalSetup(PF_InData* in_data, PF_OutData* out_data) {
     // PF_OutFlag_DEEP_COLOR_AWARE intentionally NOT set: 8bpc only for
     // now (see README "known limitations"). PF_OutFlag_SEQUENCE_DATA_NEEDS_FLATTENING
     // omitted since our sequence data is not persisted to project files.
-    out_data->out_flags = PF_OutFlag_NON_PARAM_VARY | PF_OutFlag_I_DO_DIALOG * 0;
+    //
+    // PF_OutFlag_I_EXPAND_BUFFER: REQUIRED, and previously missing -- this
+    // is the flag that authorizes HandleFrameSetup() (PF_Cmd_FRAME_SETUP,
+    // below) to grow out_data->width/height beyond the input size. Without
+    // declaring it, a host is entitled to treat that resize as invalid
+    // plugin behavior, which is consistent with the real-hardware
+    // PF_Err_INTERNAL_STRUCT_DAMAGED (512) reported at render time.
+    // PF_OutFlag_DISPLAY_ERROR_MESSAGE: makes the host actually surface
+    // out_data->return_msg (set via set_return_msg() throughout this file)
+    // in its error dialog instead of silently swallowing it -- added so
+    // future failures are diagnosable from the host UI directly rather
+    // than only from the log file.
+    // NUMERIC MATCH REQUIRED WITH AIUpscalePiPL.r's AE_Effect_Global_OutFlags:
+    // see the static_asserts above HandleAbout() and AIUpscalePiPL.r's own
+    // comment -- update BOTH sides together if this expression changes.
+    out_data->out_flags = PF_OutFlag_NON_PARAM_VARY | PF_OutFlag_I_EXPAND_BUFFER | PF_OutFlag_DISPLAY_ERROR_MESSAGE;
     out_data->out_flags2 = PF_OutFlag2_FLOAT_COLOR_AWARE * 0 | PF_OutFlag2_SUPPORTS_SMART_RENDER * 0;
     // NOTE: SmartFX/SmartRender support is a documented roadmap item (see
     // README) -- left disabled here since it requires a larger rewrite
@@ -253,19 +372,28 @@ PF_Err HandleParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* 
     return err;
 }
 
-PF_Err HandleSequenceSetup(PF_InData* in_data, PF_OutData* out_data) {
-    PF_Err err = PF_Err_NONE;
-
-    // PF_InData has no "in_data" member -- in_data IS the PF_InData*, so
-    // members are accessed directly (in_data->pica_basicP etc.), not via a
-    // nonexistent in_data->in_data. pica_basicP is an SPBasicSuite*, which
-    // is only an AcquireSuite/ReleaseSuite bridge -- it has no
-    // new_handle/lock_handle/etc. members itself. The correct AE SDK way
-    // to get handle-manipulation functions is to acquire AEGP_HandleSuite1
-    // via AEGP_SuiteHandler (declared in AEGP_SuiteHandler.h, included by
-    // AIUpscale.h), which wraps AcquireSuite/ReleaseSuite for the common
-    // suites and can throw on a missing suite -- safe here because we're
-    // inside EffectMain's try/catch boundary.
+// Allocates and initializes a fresh AIUpscaleSequenceData, wrapped in a
+// PF_Handle the way AE/Premiere sequence data must be. Factored out of
+// HandleSequenceSetup() so the exact same initialization can also be used
+// as a same-call self-healing fallback from HandleRender()/HandleFrameSetup()
+// (see ensure_sequence_data() below) when the host hands us a render/frame
+// call without ever having delivered PF_Cmd_SEQUENCE_SETUP/_RESETUP first.
+//
+// PF_InData has no "in_data" member -- in_data IS the PF_InData*, so
+// members are accessed directly (in_data->pica_basicP etc.), not via a
+// nonexistent in_data->in_data. pica_basicP is an SPBasicSuite*, which is
+// only an AcquireSuite/ReleaseSuite bridge -- it has no
+// new_handle/lock_handle/etc. members itself. The correct AE SDK way to
+// get handle-manipulation functions is to acquire AEGP_HandleSuite1 via
+// AEGP_SuiteHandler (declared in AEGP_SuiteHandler.h, included by
+// AIUpscale.h), which wraps AcquireSuite/ReleaseSuite for the common
+// suites and can throw on a missing suite -- safe here because every
+// caller of this function is inside EffectMain's try/catch boundary.
+//
+// On success, *out_seq_handle receives the new PF_Handle and PF_Err_NONE
+// is returned. On failure, *out_seq_handle is left untouched and a
+// non-NONE PF_Err is returned.
+PF_Err CreateSequenceData(PF_InData* in_data, PF_Handle* out_seq_handle) {
     AEGP_SuiteHandler suites(in_data->pica_basicP);
 
     // Allocate our sequence data on the heap and stash the raw pointer in
@@ -290,13 +418,24 @@ PF_Err HandleSequenceSetup(PF_InData* in_data, PF_OutData* out_data) {
     (*stored_ptr)->plugin_dir = resolve_plugin_directory();
     suites.HandleSuite1()->host_unlock_handle(seq_handle);
 
+    *out_seq_handle = seq_handle;
+    return PF_Err_NONE;
+}
+
+PF_Err HandleSequenceSetup(PF_InData* in_data, PF_OutData* out_data) {
+    PF_Handle seq_handle = nullptr;
+    const PF_Err err = CreateSequenceData(in_data, &seq_handle);
+    if (err) {
+        return err;
+    }
+
     // AE SDK convention: PF_Cmd_SEQUENCE_SETUP (and _RESETUP) hand the new
     // sequence data back to the host via out_data->sequence_data; the host
     // stores it and passes it back on subsequent calls as
     // in_data->sequence_data (an in-only field on PF_InData -- there is no
     // corresponding settable field on PF_InData itself).
     out_data->sequence_data = seq_handle;
-    return err;
+    return PF_Err_NONE;
 }
 
 PF_Err HandleSequenceSetdown(PF_InData* in_data, PF_OutData* out_data) {
@@ -323,6 +462,69 @@ AIUpscaleSequenceData* get_sequence_data(PF_InData* in_data) {
     AIUpscaleSequenceData* seq = stored_ptr ? *stored_ptr : nullptr;
     suites.HandleSuite1()->host_unlock_handle(in_data->sequence_data);
     return seq;
+}
+
+// Self-healing sequence-data accessor for the render-time path
+// (HandleFrameSetup/HandleRender). AE always issues PF_Cmd_SEQUENCE_SETUP
+// (or _RESETUP) before the first PF_Cmd_FRAME_SETUP/PF_Cmd_RENDER of a
+// sequence, so get_sequence_data() returning nullptr there should never
+// happen in principle -- but this is exactly the failure that was
+// observed on real Premiere Pro hardware (in_data->sequence_data == null
+// / get_sequence_data() == nullptr at render time), reported as
+// PF_Err_INTERNAL_STRUCT_DAMAGED (512) and surfaced by Premiere's
+// aggregate error reporting at PF_Cmd_FRAME_SETDOWN (selector 11). Since
+// some hosts apparently do not guarantee AE's exact sequence-command
+// timing, prefer self-recovery over an immediate hard failure: our
+// sequence data is trivial to reconstruct (it's just a lazily-populated
+// model cache keyed off resolve_plugin_directory()), so there is nothing
+// to actually lose by creating it on the spot here.
+//
+// Every recovery is logged at WARN so a pattern of "missing sequence data
+// at render time" is visible in AIUpscale.log even though the render
+// itself now succeeds -- see plugin/README.md "安定運用ガイド".
+//
+// Returns nullptr only if self-healing itself fails (e.g. out of memory),
+// in which case callers must still surface PF_Err_INTERNAL_STRUCT_DAMAGED
+// as before.
+AIUpscaleSequenceData* ensure_sequence_data(PF_InData* in_data, PF_OutData* out_data) {
+    AIUpscaleSequenceData* seq = get_sequence_data(in_data);
+    if (seq) {
+        return seq;
+    }
+
+    upscale::log_warn(
+        "ensure_sequence_data: in_data->sequence_data missing at render/frame-setup time "
+        "(expected PF_Cmd_SEQUENCE_SETUP/_RESETUP to have run first); self-healing by creating "
+        "sequence data now instead of failing the render.");
+
+    PF_Handle seq_handle = nullptr;
+    const PF_Err err = CreateSequenceData(in_data, &seq_handle);
+    if (err || !seq_handle) {
+        upscale::log_error(
+            "ensure_sequence_data: self-recovery failed to allocate sequence data (out of memory?); "
+            "render must fail.");
+        return nullptr;
+    }
+
+    // Hand the newly-created sequence data back to the host the same way
+    // PF_Cmd_SEQUENCE_SETUP does, so that -- on hosts that do honor
+    // out_data->sequence_data when set outside of SEQUENCE_SETUP -- later
+    // calls in this sequence no longer need to self-heal.
+    out_data->sequence_data = seq_handle;
+
+    // Deliberately NOT re-read via get_sequence_data(in_data) here:
+    // in_data is this call's (const, host-owned) input, and the host has
+    // no opportunity to echo the out_data->sequence_data we just set back
+    // into in_data->sequence_data until its NEXT call into EffectMain --
+    // so in_data->sequence_data is still null right now regardless of
+    // what we just did to out_data. Read the pointer back out of
+    // seq_handle directly instead.
+    AEGP_SuiteHandler suites(in_data->pica_basicP);
+    auto** stored_ptr = reinterpret_cast<AIUpscaleSequenceData**>(
+        suites.HandleSuite1()->host_lock_handle(seq_handle));
+    AIUpscaleSequenceData* result = stored_ptr ? *stored_ptr : nullptr;
+    suites.HandleSuite1()->host_unlock_handle(seq_handle);
+    return result;
 }
 
 // Ensures the correct model (per current Mode param) is loaded into the
@@ -370,6 +572,19 @@ PF_Err HandleFrameSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* p
         return PF_Err_BAD_CALLBACK_PARAM;
     }
 
+    // Self-healing precondition (see ensure_sequence_data() above): make
+    // sure sequence data exists before doing anything else, so that by the
+    // time PF_Cmd_RENDER runs for this frame it is already present rather
+    // than needing its own recovery. FRAME_SETUP itself doesn't otherwise
+    // need the pointer, but this is the earliest render-path opportunity
+    // to detect and fix a missing-sequence-data host (the actual root
+    // cause behind the field-reported PF_Err_INTERNAL_STRUCT_DAMAGED /
+    // 512).
+    if (!ensure_sequence_data(in_data, out_data)) {
+        set_return_msg(out_data, "AI Upscale: internal error (missing sequence data, self-recovery failed).");
+        return PF_Err_INTERNAL_STRUCT_DAMAGED;
+    }
+
     const int scale = scale_choice_to_factor(params);
 
     // Validate the input size the host reports before computing the
@@ -412,9 +627,9 @@ PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* param
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
 
-    AIUpscaleSequenceData* seq = get_sequence_data(in_data);
+    AIUpscaleSequenceData* seq = ensure_sequence_data(in_data, out_data);
     if (!seq) {
-        set_return_msg(out_data, "AI Upscale: internal error (missing sequence data).");
+        set_return_msg(out_data, "AI Upscale: internal error (missing sequence data, self-recovery failed).");
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
 

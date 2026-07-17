@@ -293,7 +293,11 @@ python3 plugin/scripts/export_realesrgan_onnx.py \
 1. **ホスト側のエラーメッセージを確認**: After Effects/Premiereはエフェクト
    ダイアログや警告バナーに `out_data->return_msg`（例:
    「AI Upscale: failed to load model (...)」）を表示します。CLIは同内容を
-   stderrに出力し、非0で終了します。
+   stderrに出力し、非0で終了します。（`HandleGlobalSetup()` が
+   `PF_OutFlag_DISPLAY_ERROR_MESSAGE` を宣言しているため、ホストは
+   `return_msg` を実際にエラーダイアログへ表示します。このフラグが無いと
+   `return_msg` を設定していてもホストが無視してダイアログに何も表示しない
+   ことがあり、切り分けがログファイル頼みになってしまいます。）
 2. **ログファイルで詳細を確認**: 上記のログパスを開き、直近の `[ERROR]` 行を
    確認してください。例外内容・入力サイズ・実行プロバイダ・タイル設定が
    記録されています。
