@@ -281,11 +281,39 @@ if(DEFINED AE_SDK_PATH AND NOT "${AE_SDK_PATH}" STREQUAL "")
     endforeach()
     message(STATUS "AE SDK include directories: ${AE_SDK_INCLUDE_DIRS}")
 
+    # AEGP_SuiteHandler is declared (class + inline members) in
+    # Examples/Util/AEGP_SuiteHandler.h but its out-of-line members
+    # (constructor, destructor, and the suite accessor bodies) are only
+    # DEFINED in the SDK-provided Examples/Util/AEGP_SuiteHandler.cpp --
+    # AE SDK sample plugins all compile this .cpp directly into the plugin
+    # module rather than linking a prebuilt library for it. Without it,
+    # the link fails with undefined symbols for
+    # AEGP_SuiteHandler::AEGP_SuiteHandler / ~AEGP_SuiteHandler /
+    # MissingSuiteError (the latter also needs a plugin-supplied
+    # definition -- see AIUpscale.cpp).
+    #
+    # This existence check runs unconditionally (not gated on WIN32/APPLE),
+    # same rationale as the AE_SDK_EFFECTIVE_ROOT resolution above: it's
+    # exercisable on any platform, including this repo's Linux dev
+    # environment, even though AEGP_SUITE_HANDLER_SRC is only actually
+    # added as a source file to the AIUpscale target further below.
+    set(AEGP_SUITE_HANDLER_SRC "${AE_SDK_EFFECTIVE_ROOT}/Examples/Util/AEGP_SuiteHandler.cpp")
+    if(NOT EXISTS "${AEGP_SUITE_HANDLER_SRC}")
+        message(FATAL_ERROR
+            "AEGP_SuiteHandler.cpp not found at ${AEGP_SUITE_HANDLER_SRC}. "
+            "The AE SDK provides this file's implementation separately from "
+            "its header (Examples/Util/AEGP_SuiteHandler.h); AE SDK sample "
+            "plugins compile it directly into the plugin module. Verify the "
+            "Adobe SDK zip was fully extracted and AE_SDK_PATH/AE_SDK_EFFECTIVE_ROOT "
+            "(${AE_SDK_EFFECTIVE_ROOT}) points at a complete SDK checkout.")
+    endif()
+
     if(WIN32 OR APPLE)
         message(STATUS "AE_SDK_PATH set (${AE_SDK_PATH}); configuring AIUpscale plugin target.")
 
         add_library(AIUpscale MODULE
             src/plugin/AIUpscale.cpp
+            ${AEGP_SUITE_HANDLER_SRC}
         )
 
         target_include_directories(AIUpscale PRIVATE

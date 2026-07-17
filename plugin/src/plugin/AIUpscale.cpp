@@ -27,10 +27,27 @@
 #include <cstring>
 #include <filesystem>
 #include <new>
+#include <stdexcept>
 #include <system_error>
 
 #include "logger.h"
 #include "size_limits.h"
+
+// ---------------------------------------------------------------------------
+// AEGP_SuiteHandler::MissingSuiteError()
+//
+// AE SDK規約: Examples/Util/AEGP_SuiteHandler.cpp (SDK同梱、plugin/CMakeLists.txt
+// が AIUpscale ターゲットのソースに追加する) は AEGP_SuiteHandler の
+// コンストラクタ/デストラクタ/各 *Suite*() アクセサを定義するが、
+// MissingSuiteError() だけは意図的に未実装のまま提供されており、各プラグイン
+// が自前で定義する規約になっている（呼び出し元のエラー通知方法がホストAPIの
+// 種類ごとに異なるため）。ここでは例外を投げる実装とし、EffectMain (下記) の
+// try/catch 例外境界で捕捉されて PF_Err_INTERNAL_STRUCT_DAMAGED 相当の
+// PF_Err に変換される設計とする。クラス外定義のため、名前空間で囲わず
+// グローバルスコープに置く。
+void AEGP_SuiteHandler::MissingSuiteError() const {
+    throw std::runtime_error("AIUpscale: required AE suite is missing");
+}
 
 namespace {
 
