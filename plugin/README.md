@@ -82,6 +82,12 @@ python3 plugin/scripts/make_test_model.py plugin/build/test_model_4x.onnx
 python3 plugin/tests/make_test_image.py /tmp/in.png 64 64
 ./plugin/build/upscale_cli plugin/build/test_model_4x.onnx /tmp/in.png /tmp/out.png
 python3 plugin/tests/check_png_size.py /tmp/out.png --expect 256 256
+
+# 並列タイル処理 (--jobs) の指定例。0 (既定) は自動
+# (hardware_concurrency)、1 は直列実行。--tile を省略すると
+# choose_tile_size() が実行プロバイダに応じて自動選択します。
+./plugin/build/upscale_cli plugin/build/test_model_4x.onnx /tmp/in.png /tmp/out_par.png \
+  --tile 128 --jobs 4
 ```
 
 ### Windows (.aex, AE SDKあり)
@@ -113,6 +119,37 @@ macOS版はバンドル (`AIUpscale.plugin`) として出力されます。PiPL�
 Rezでコンパイルしてバンドルに埋め込む必要があります（SDK付属の
 `Examples/Skeleton` Xcodeプロジェクトのビルドフェーズを参照）。
 `src/plugin/Info.plist.in` はバンドルの `Info.plist` テンプレートです。
+
+### macOS (Apple Silicon / M4 Max) 向け推奨設定
+
+このプラグインは MacBook Pro M4 Max (36GB ユニファイドメモリ) を主要ターゲットとして
+最適化されています。実機でビルド・実行する際は以下を推奨します。
+
+- **onnxruntime**: 公式の `onnxruntime-osx-arm64-<version>.tgz`（CoreML EP同梱版）を
+  使用してください。x86_64版やuniversal2版のRosetta経由実行は避けてください
+  （ネイティブarm64の方が明確に高速です）。
+- **CMakeアーキテクチャ**: `CMakeLists.txt` はmacOS上で `CMAKE_OSX_ARCHITECTURES=arm64`
+  をデフォルトで設定します（明示指定は不要）。x86_64スライスを含むユニバーサル
+  バイナリが必要な場合のみ `-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"` を上書きしてください
+  （ただしx86_64側はCoreML EPを使わずCPU実行のみになります）。
+- **実行プロバイダ**: `UPSCALE_WITH_COREML` はmacOSでデフォルトON（CMakeLists.txt参照）。
+  `OnnxUpscaler::load()` はCoreML EPを `ModelFormat=MLProgram` /
+  `MLComputeUnits=ALL` で優先的に試行し（ANE/GPU/CPUをCoreML自身にスケジューリング
+  させる設定）、失敗時は自動的にCPU実行にフォールダックしてログとホストメッセージで
+  通知します（詳細は本ファイル「安定運用ガイド」参照）。
+- **タイルサイズ**: `TileOptions::tile_size` を `0`（自動）のままにしておくと、
+  `choose_tile_size()` がCoreML有効時は既定512px、CPU実行時は既定256pxを目安に、
+  36GBユニファイドメモリを前提とした見積もりメモリ予算内で自動選択します。
+  4K以上の映像を頻繁に扱う場合、CoreML EPが安定して使えることを確認した上で
+  タイルサイズを明示的に大きくする（例: `--tile 512` on CLI）ことも可能です。
+- **並列度**: `--jobs`（CLI）/ `TileOptions::num_workers` は `0`（自動 =
+  `std::thread::hardware_concurrency()`、M4 Max なら性能コア+効率コア合計の
+  論理コア数）が既定です。CPU実行プロバイダ時はタイル単位でONNX Runtimeの
+  `Run()` を並列実行し（`Ort::Session::Run()` は同一セッションに対して
+  スレッドセーフと公式に規定されているため、セッションを共有して並列呼び出し
+  可能）、CoreML実行プロバイダ時は推論呼び出し自体を直列化しつつ、前処理
+  （NCHW変換）・後処理（アルファ合成・クランプ・書き戻し）のみ並列化します
+  （`src/core/onnx_upscaler.cpp` の `infer_mutex_` 周辺コメント参照）。
 
 ### Linux
 
@@ -172,6 +209,89 @@ https://github.com/xinntao/Real-ESRGAN/releases) からエクスポートでき�
 配置してください（`AIUpscale.cpp` の `resolve_plugin_directory()` が
 プラグインディレクトリ配下の `models/` を参照します）。
 
+## 安定運用ガイド
+
+このプラグイン/CLIで問題が起きた場合の切り分け手順です。
+
+### ログの場所
+
+構造化ログ（`src/core/logger.h`）は以下に出力されます。1行ごとに
+`<タイムスタンプ> [INFO|WARN|ERROR] [tid=<スレッドID>] <メッセージ>` の形式です。
+5MBを超えると `AIUpscale.log.old` にローテーションされます（既存の`.old`は上書き）。
+
+| プラットフォーム | ログパス |
+|---|---|
+| macOS | `~/Library/Logs/AIUpscale/AIUpscale.log` |
+| Windows | `%TEMP%\AIUpscale\AIUpscale.log` |
+| Linux / その他 (CLI開発用) | `$TMPDIR/AIUpscale/AIUpscale.log`（`$TMPDIR`未設定時は`/tmp/AIUpscale/AIUpscale.log`） |
+
+### エラー発生時の切り分け手順
+
+1. **ホスト側のエラーメッセージを確認**: After Effects/Premiereはエフェクト
+   ダイアログや警告バナーに `out_data->return_msg`（例:
+   「AI Upscale: failed to load model (...)」）を表示します。CLIは同内容を
+   stderrに出力し、非0で終了します。
+2. **ログファイルで詳細を確認**: 上記のログパスを開き、直近の `[ERROR]` 行を
+   確認してください。例外内容・入力サイズ・実行プロバイダ・タイル設定が
+   記録されています。
+3. **CPUフォールバックの確認**: ログに
+   `"falling back to CPUExecutionProvider"` がある場合、CoreML初期化に
+   失敗しCPU実行になっています（動作はしますが大幅に遅くなります）。
+   onnxruntimeがCoreML EP同梱のmacOS(arm64)ビルドか、`UPSCALE_WITH_COREML`
+   が有効か([CMake出力](#macos-apple-silicon--m4-max-向け推奨設定)参照)を確認してください。
+4. **メモリ不足（OOM）の確認**: ログに
+   `"out of memory at tile_size=..."` がある場合、自動的にタイルサイズを
+   半分にして1回だけ再試行します。それでも失敗する場合はさらに小さい
+   `--tile` を明示指定するか、他のメモリ使用量の多いアプリを閉じてください。
+5. **異常サイズ入力の確認**: ログに `"exceeds maximum supported dimension"`
+   や `"exceeds safety limit"` がある場合、入力フレームが安全上限
+   （既定: 一辺8192px、出力2億ピクセル、単一バッファ4GiB）を超えています。
+   意図的なUHD/8K以上のワークロードであれば `src/core/size_limits.h` の
+   定数を見直してください。
+
+### 推奨設定（まとめ）
+
+- macOS/M4 Max: CoreML EP（既定でON）+ タイルサイズ自動選択（既定512px）+
+  `--jobs 0`（自動並列）。
+- 汎用/低メモリ機: `--tile 128`〜`256` を明示指定し、`--jobs` は物理コア数
+  以下に抑える。
+- 常時: `plugin/models/` 配下のモデルファイルの出所を確認する
+  （次節「セキュリティ」参照）。
+
+## セキュリティ
+
+- **モデルパスの検証**: AE/Premiereプラグイン層 (`AIUpscale.cpp` の
+  `model_path_for()`) は、モデルを必ず `<プラグインディレクトリ>/models/`
+  配下からのみロードします。`std::filesystem::canonical()` でシンボリック
+  リンクを解決した上で、解決後のパスが `models/` ディレクトリの子孫である
+  ことを文字列プレフィックス比較で検証し、範囲外であれば空文字列を返して
+  ロードを拒否します（パストラバーサル・シンボリックリンク経由の
+  ディレクトリエスケープ対策）。
+- **`download_models.py`**: HTTPS以外のURLはリクエスト前に拒否します
+  (`require_https()`)。ダウンロード後はSHA-256チェックサムを検証します
+  （既知ハッシュは `KNOWN_SHA256` 定数に保持）。ハッシュが未登録のURLは
+  「検証をスキップした」旨を明示的な警告として出力します（サイレントに
+  信頼済み扱いはしません）。ダウンロードは `.part` 一時ファイルへ書き込み、
+  完了後にのみ最終ファイル名へアトミックにリネームするため、失敗/中断時に
+  部分ダウンロードが最終パスに残ることはありません。
+- **画像デコードの検証**: `upscale_cli` は `STBI_MAX_DIMENSIONS` で
+  stb_image自体のデコード上限を制限した上、デコード後も
+  `validate_input_dims()`（`src/core/size_limits.h`）で寸法・チャンネル数を
+  再検証します。
+- **整数オーバーフロー対策**: 幅・高さ・チャンネル数からのバッファサイズ
+  計算はすべて `size_limits.h` の `checked_mul_i64()` / `safe_buffer_bytes()`
+  経由で行われ、乗算前にオーバーフローと安全上限（既定: 出力2億ピクセル、
+  単一バッファ4GiB）を必ずチェックします。
+- **プラグインAPI境界での例外捕捉**: `EffectMain`（`AIUpscale.cpp`）は
+  すべてのコマンドディスパッチを try/catch で包み、いかなる例外もホストへ
+  伝播させません（未捕捉の例外がC言語リンケージ境界を越えるとホスト
+  クラッシュにつながるため）。各 `Handle*()` 関数内でもより詳細な
+  `PF_Err` / `return_msg` を設定した上でエラーを捕捉しています。
+- **ログへの機微情報の非記載**: ログにはモデル/入力ファイルのパス、画像
+  寸法、実行プロバイダ、タイル/スレッド設定、例外メッセージのみを記録し、
+  環境変数・認証情報・ユーザー名単体・画像/モデルの中身は記録しません
+  （`src/core/logger.h` 冒頭のコメント参照）。
+
 ## 既知の制約
 
 - **8bpc（8bit）カラーのみ対応。** 16bpc / 32bpc(float) プロジェクトでは動作しません
@@ -183,11 +303,14 @@ https://github.com/xinntao/Real-ESRGAN/releases) からエクスポートでき�
   （AEでは確立されたパターンですが、PremiereのエフェクトホストはAEほど
   柔軟に出力サイズ変更を扱わない場合があります）。
 - **リアルタイム再生は不可**、レンダリング/書き出し用途を想定しています
-  （CPU推論はもちろん、GPU推論であっても4Kフレームの超解像はフレームあたり
+  （CPU推論はもちろん、GPU/ANE推論であっても4Kフレームの超解像はフレームあたり
   数百ms〜数秒かかるため）。
-- GPU推奨。この実装のCPUパスは動作確認用であり、実運用には
-  CUDA/DirectML/CoreMLいずれかの実行プロバイダが有効なonnxruntimeビルドを
-  推奨します。
+- **CoreML EP (macOS) はこの環境では実機未検証です。** `UPSCALE_WITH_COREML`
+  はコンパイル時に有効化され、`AppendExecutionProvider("CoreML", ...)` の
+  呼び出しコード自体はこのLinux環境でもコンパイル対象になりますが
+  （`#ifdef __APPLE__` の外側のロジックはビルドされます）、実際にCoreML EPが
+  ロードされ推論が成功するかはM4 Max実機での検証が必要です。失敗時は
+  自動的にCPUへフォールバックする設計です（安定運用ガイド参照）。
 - SmartFX（`PF_Cmd_SMART_PRE_RENDER` / `PF_Cmd_SMART_RENDER`）には未対応です。
   現状は旧来のバッファ拡張レンダリングパスのみ実装しています。
 
@@ -196,7 +319,8 @@ https://github.com/xinntao/Real-ESRGAN/releases) からエクスポートでき�
 - SmartFX対応（`PF_Cmd_SMART_PRE_RENDER` / `PF_Cmd_SMART_RENDER`）によるRAM
   プレビュー・キャッシュとの統合改善
 - 16bpc / 32bpc(float) 対応
-- DirectML (Windows) / CoreML (macOS) 実行プロバイダの動作検証・既定有効化
+- DirectML (Windows) 実行プロバイダの動作検証・既定有効化（CoreMLはmacOSで
+  既定有効化済み。実機検証は引き続き必要 -- 上記「既知の制約」参照）
 - フレーム間の時間的一貫性（temporal consistency）を考慮した処理
   （現状はフレーム単位で独立に推論するため、動画では微小なちらつきが
   出る可能性があります）
@@ -211,4 +335,30 @@ https://github.com/xinntao/Real-ESRGAN/releases) からエクスポートでき�
 2. `src/plugin`（Adobe SDK層）はこの環境ではコンパイルできないため、
    AE SDKの実際のAPIシグネチャに忠実に書く一方、コンパイルエラーの
    機械的な検証はできていません。Adobe SDK入手後、最初のビルドで
-   ヘッダパスやAPI詳細の細かな調整が必要になる可能性があります。
+   ヘッダパスやAPI詳細の細かな調整が必要になる可能性があります。CoreML EP
+   自体（`AppendExecutionProvider("CoreML", ...)` の実際の初期化成否）も
+   同様にM4 Max実機での検証が必要です。
+
+### タイル並列化の検証結果（このLinux/CPU環境、4コア）
+
+`upscale_tiled()`（`src/core/tile.cpp`）の並列化について、テスト用モデル
+（`make_test_model.py` が生成する軽量Resizeモデル）を使い、直列
+(`--jobs 1`) と並列 (`--jobs N`) の出力一致・所要時間を確認しました。
+
+| 入力サイズ | tile | jobs | Elapsed (upscale部分) | 出力バイト完全一致 |
+|---|---|---|---|---|
+| 1024x1024 | 128 | 1 | 2.360s | 基準 |
+| 1024x1024 | 128 | 4 | 2.466s | `cmp` で一致 |
+| 1024x1024 | 128 | 8 | 2.094s | `cmp` で一致 |
+| 2048x2048 | 128 | 1 | 11.286s | 基準 |
+| 2048x2048 | 128 | 4 | 3.311s (**約3.4倍高速**) | `cmp` で一致 |
+
+出力は `cmp`（バイト完全一致）で検証しており、これは意図的な設計です
+（`upscale_tiled()` はタイルの推論・前処理・後処理を並列実行しつつ、
+出力バッファへの合成（ブレンド）は常に固定順序で単一スレッド実行するため、
+`num_workers` の値によらず出力がビット完全に一致します -- `tile.h` / `tile.cpp`
+のコメント参照）。1024x1024/tile=128のような画像1枚あたりのタイル数が
+少ないケースではスレッド起動オーバーヘッドが並列化の利得を相殺気味ですが、
+2048x2048（タイル数361個）のように並列化できる作業量が十分にある場合は
+明確な高速化が確認できました。M4 Max実機（CoreML EP、より多いコア数）では
+さらに大きな高速化が期待されます。

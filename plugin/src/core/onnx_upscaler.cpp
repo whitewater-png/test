@@ -6,8 +6,16 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <numeric>
+#include <new>
+#include <sstream>
+#include <thread>
+#include <unordered_map>
 #include <vector>
+
+#include "size_limits.h"
+#include "logger.h"
 
 namespace upscale {
 
@@ -75,12 +83,31 @@ std::string append_providers(Ort::SessionOptions& options, ExecutionProvider pre
     };
 
     auto try_coreml = [&]() -> bool {
-#ifdef UPSCALE_WITH_COREML
+#if defined(UPSCALE_WITH_COREML) && defined(__APPLE__)
         try {
-            options.AppendExecutionProvider("CoreML", {});
+            // CoreML EP options (onnxruntime >= 1.17 generic provider-options
+            // map interface). Tuned for the M4 Max target machine:
+            //   - ModelFormat=MLProgram: required for full ANE (Apple Neural
+            //     Engine) eligibility on recent Apple Silicon; the older
+            //     NeuralNetwork format is CPU/GPU-only for many ops.
+            //   - MLComputeUnits=ALL: lets CoreML schedule ops across the
+            //     ANE, GPU, and CPU as it sees fit -- generally the best
+            //     throughput on Apple Silicon, since CoreML's own scheduler
+            //     knows the per-op tradeoffs better than a fixed choice.
+            //   - RequireStaticInputShapes=0: our tiles vary in size at the
+            //     image border (last row/column of tiles), so dynamic
+            //     input shapes must remain supported.
+            std::unordered_map<std::string, std::string> coreml_opts = {
+                {"ModelFormat", "MLProgram"},
+                {"MLComputeUnits", "ALL"},
+                {"RequireStaticInputShapes", "0"},
+                {"EnableOnSubgraphs", "0"},
+            };
+            options.AppendExecutionProvider("CoreML", coreml_opts);
             chosen = "CoreMLExecutionProvider";
             return true;
-        } catch (const Ort::Exception&) {
+        } catch (const Ort::Exception& ex) {
+            log_warn(std::string("CoreML execution provider unavailable, will fall back: ") + ex.what());
             return false;
         }
 #else
@@ -118,12 +145,52 @@ std::string append_providers(Ort::SessionOptions& options, ExecutionProvider pre
 } // namespace
 
 void OnnxUpscaler::load(const std::string& model_path, ExecutionProvider provider_preference) {
+    // Fail fast with a clear message rather than letting onnxruntime throw
+    // an opaque error deep inside session construction -- this also keeps
+    // the "model not found" case distinguishable from "model is corrupt"
+    // in logs.
+    {
+        std::ifstream probe(model_path, std::ios::binary);
+        if (!probe.good()) {
+            const std::string msg = "Model file not found or unreadable: '" + model_path + "'";
+            log_error(msg);
+            throw OnnxUpscalerError(msg);
+        }
+    }
+
     try {
         Ort::SessionOptions options;
+        // Intra-op threads deliberately left at 1: tile-level parallelism
+        // (see tile.cpp) already saturates available cores by running
+        // multiple Run() calls concurrently on the CPU EP (documented
+        // thread-safe for a shared session) or by parallelizing pre/post
+        // processing around a serialized Run() on accelerated EPs (see
+        // infer_mutex_ below). Letting onnxruntime ALSO spin up its own
+        // intra-op thread pool per Run() call would oversubscribe cores
+        // (num_tile_workers * intra_op_threads >> hardware_concurrency),
+        // which the task explicitly calls out to avoid.
         options.SetIntraOpNumThreads(1);
         options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
+        // Only an EXPLICIT accelerated-provider request (kCoreML/kCUDA/
+        // kDirectML) that ends up on CPU counts as a "fallback" worth
+        // warning about. kAuto trying accelerated providers and settling
+        // on CPU (e.g. this repo's Linux CPU-only dev environment) is
+        // expected, ordinary behavior, not a failure -- warning about it
+        // every run would be noise.
+        const bool explicitly_wanted_acceleration =
+            provider_preference == ExecutionProvider::kCoreML ||
+            provider_preference == ExecutionProvider::kCUDA ||
+            provider_preference == ExecutionProvider::kDirectML;
         active_provider_name_ = append_providers(options, provider_preference);
+        serialize_inference_ = (active_provider_name_ != "CPUExecutionProvider");
+        fell_back_to_cpu_ = explicitly_wanted_acceleration && (active_provider_name_ == "CPUExecutionProvider");
+
+        if (fell_back_to_cpu_) {
+            log_warn("Requested an accelerated execution provider but none initialized successfully; "
+                     "falling back to CPUExecutionProvider. Performance will be significantly lower.");
+        }
+        log_info("Loading model '" + model_path + "' with execution provider: " + active_provider_name_);
 
 #ifdef _WIN32
         std::wstring wpath(model_path.begin(), model_path.end());
@@ -141,7 +208,25 @@ void OnnxUpscaler::load(const std::string& model_path, ExecutionProvider provide
         session_ = impl_->session.get();
         native_scale_ = 0; // re-probe on first inference of the new model
     } catch (const Ort::Exception& ex) {
-        throw OnnxUpscalerError(std::string("Failed to load ONNX model '") + model_path + "': " + ex.what());
+        const std::string msg = std::string("Failed to load ONNX model '") + model_path + "': " + ex.what();
+        log_error(msg);
+
+        // If the failure happened while trying an accelerated provider,
+        // attempt one automatic CPU fallback load rather than failing the
+        // whole operation outright (per the "モデルロード失敗・CoreML初期化
+        // 失敗時はCPUへフォールバック" requirement).
+        if (provider_preference != ExecutionProvider::kCPU) {
+            log_warn("Retrying model load on CPUExecutionProvider after accelerated-provider load failure.");
+            try {
+                load(model_path, ExecutionProvider::kCPU);
+                fell_back_to_cpu_ = true;
+                return;
+            } catch (const OnnxUpscalerError& retry_ex) {
+                log_error(std::string("CPU fallback load also failed: ") + retry_ex.what());
+                throw;
+            }
+        }
+        throw OnnxUpscalerError(msg);
     }
 }
 
@@ -267,11 +352,17 @@ void OnnxUpscaler::infer(const ImageRGBA8& in, ImageRGBA8& out) {
     if (!is_loaded()) {
         throw OnnxUpscalerError("infer() called before load()");
     }
-    if (in.width <= 0 || in.height <= 0) {
-        throw OnnxUpscalerError("infer() called with an empty image");
-    }
+    // NULL/zero/negative-size + oversized-input rejection (see limits.h).
+    // Tiles are already bounded by TileOptions::tile_size, but infer() can
+    // also be called directly (e.g. probe_native_scale()), so validate
+    // here too rather than trusting callers.
+    validate_input_dims(in.width, in.height, 4);
 
     try {
+        // Pre-processing (NCHW packing) is NOT covered by infer_mutex_ --
+        // it only touches this call's own local buffers, so it runs fully
+        // concurrently across tile worker threads regardless of execution
+        // provider.
         std::vector<float> input_data = to_nchw_float(in);
         std::array<int64_t, 4> input_shape{1, 3, in.height, in.width};
 
@@ -282,8 +373,21 @@ void OnnxUpscaler::infer(const ImageRGBA8& in, ImageRGBA8& out) {
         const char* input_names[] = {impl_->input_name.c_str()};
         const char* output_names[] = {impl_->output_name.c_str()};
 
-        auto output_tensors = impl_->session->Run(
-            Ort::RunOptions{nullptr}, input_names, &input_tensor, 1, output_names, 1);
+        std::vector<Ort::Value> output_tensors;
+        {
+            // The actual inference call. On the CPU execution provider we
+            // deliberately do NOT lock here: onnxruntime documents
+            // Ort::Session::Run() as safe to call concurrently on the same
+            // session, and tile.cpp relies on that for CPU-path tile
+            // parallelism. On non-CPU providers (CoreML, etc.) we
+            // serialize this call per the task's design -- pre/post
+            // processing above/below stays parallel, only the Run() call
+            // itself is exclusive.
+            std::unique_lock<std::mutex> lock(infer_mutex_, std::defer_lock);
+            if (serialize_inference_) lock.lock();
+            output_tensors = impl_->session->Run(
+                Ort::RunOptions{nullptr}, input_names, &input_tensor, 1, output_names, 1);
+        }
 
         Ort::Value& output_tensor = output_tensors.front();
         auto out_info = output_tensor.GetTensorTypeAndShapeInfo();
@@ -293,11 +397,20 @@ void OnnxUpscaler::infer(const ImageRGBA8& in, ImageRGBA8& out) {
         }
         const int out_h = static_cast<int>(out_shape[2]);
         const int out_w = static_cast<int>(out_shape[3]);
+        // Validate the model-reported output size too -- a malicious or
+        // corrupt model could claim an enormous output shape.
+        validate_input_dims(out_w, out_h, 4);
 
         std::vector<uint8_t> alpha = resize_alpha_bilinear(in, out_w, out_h);
         from_nchw_float(output_tensor.GetTensorData<float>(), out_w, out_h, alpha, out);
     } catch (const Ort::Exception& ex) {
-        throw OnnxUpscalerError(std::string("ONNX inference failed: ") + ex.what());
+        const std::string msg = std::string("ONNX inference failed: ") + ex.what();
+        log_error(msg);
+        throw OnnxUpscalerError(msg);
+    } catch (const std::bad_alloc&) {
+        const std::string msg = "ONNX inference failed: out of memory";
+        log_error(msg);
+        throw OnnxUpscalerError(msg);
     }
 }
 
@@ -330,17 +443,63 @@ void OnnxUpscaler::upscale(const ImageRGBA8& in, ImageRGBA8& out, int requested_
     if (!is_loaded()) {
         throw OnnxUpscalerError("upscale() called before load()");
     }
+    // Reject NULL/empty/oversized input before any allocation (see
+    // limits.h; also covers the "0x0 input" abnormal-input test case).
+    validate_input_dims(in.width, in.height, 4);
+
     if (native_scale_ == 0) {
         probe_native_scale();
     }
 
     TileOptions opts = tile_opts;
     opts.scale = native_scale_;
+    if (opts.tile_size <= 0) {
+        // Auto-select a tile size based on the active execution provider
+        // and target geometry (see tile.h / choose_tile_size()).
+        TileSizingParams sizing;
+        sizing.input_width = in.width;
+        sizing.input_height = in.height;
+        sizing.scale = native_scale_;
+        sizing.accelerated = (active_provider_name_ != "CPUExecutionProvider");
+        opts.tile_size = choose_tile_size(sizing);
+        log_info("Auto-selected tile size " + std::to_string(opts.tile_size) +
+                  "px (provider=" + active_provider_name_ + ")");
+    }
+
+    // Overall output-size safety check up front (also re-checked inside
+    // upscale_tiled(), but doing it here gives a clearer error before any
+    // tiling work starts).
+    safe_buffer_bytes(static_cast<int64_t>(in.width) * native_scale_,
+                       static_cast<int64_t>(in.height) * native_scale_, 4, 1);
 
     ImageRGBA8 native_out;
-    upscale_tiled(in, native_out, opts, [this](const ImageRGBA8& tile_in, ImageRGBA8& tile_out) {
-        infer(tile_in, tile_out);
-    });
+    auto run_tiled = [&](TileOptions attempt_opts) {
+        upscale_tiled(in, native_out, attempt_opts, [this](const ImageRGBA8& tile_in, ImageRGBA8& tile_out) {
+            infer(tile_in, tile_out);
+        });
+    };
+
+    try {
+        run_tiled(opts);
+    } catch (const std::bad_alloc&) {
+        // Memory-pressure retry policy: halve the tile size exactly once
+        // and try again; if that also fails, give up and let the
+        // exception propagate (host layer turns this into a user-visible
+        // error + log entry).
+        const int retry_tile = std::max(32, opts.tile_size / 2);
+        log_warn("upscale(): out of memory at tile_size=" + std::to_string(opts.tile_size) +
+                  ", retrying once at tile_size=" + std::to_string(retry_tile));
+        TileOptions retry_opts = opts;
+        retry_opts.tile_size = retry_tile;
+        try {
+            run_tiled(retry_opts);
+        } catch (const std::bad_alloc&) {
+            log_error("upscale(): out of memory even at reduced tile_size=" + std::to_string(retry_tile) +
+                       "; aborting.");
+            throw OnnxUpscalerError("Out of memory during upscaling, even after reducing tile size to " +
+                                     std::to_string(retry_tile) + "px. Try a smaller input or lower scale.");
+        }
+    }
 
     if (requested_scale <= 0 || requested_scale == native_scale_) {
         out = std::move(native_out);

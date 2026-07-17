@@ -23,7 +23,12 @@
 
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <new>
+#include <system_error>
+
+#include "logger.h"
+#include "size_limits.h"
 
 namespace {
 
@@ -55,8 +60,53 @@ std::string resolve_plugin_directory() {
     return "models";
 }
 
+// Resolves and validates the on-disk path of the model for `mode_choice`,
+// enforcing that it lives inside <plugin_dir>/models/ -- defense against
+// path traversal (e.g. a tampered/malicious plugin_dir value, or a future
+// code path that lets mode_choice-derived strings contain "../") even
+// though today's mode_choice_to_model_filename() only ever returns one of
+// two fixed constants. Symlinks are resolved (std::filesystem::canonical)
+// before the containment check, so a symlink planted inside models/ that
+// points outside the directory is also rejected.
+//
+// Returns the empty string if the resolved path is missing or escapes
+// <plugin_dir>/models/; callers must treat that as a load failure.
 std::string model_path_for(const std::string& plugin_dir, A_long mode_choice) {
-    return plugin_dir + "/" + mode_choice_to_model_filename(mode_choice);
+    namespace fs = std::filesystem;
+    std::error_code ec;
+
+    const fs::path models_dir = fs::path(plugin_dir) / "models";
+    const fs::path candidate = models_dir / mode_choice_to_model_filename(mode_choice);
+
+    const fs::path canonical_models_dir = fs::canonical(models_dir, ec);
+    if (ec) {
+        upscale::log_error("model_path_for: models/ directory not found or unreadable: " + models_dir.string() +
+                            " (" + ec.message() + ")");
+        return "";
+    }
+    const fs::path canonical_candidate = fs::canonical(candidate, ec);
+    if (ec) {
+        upscale::log_error("model_path_for: model file not found or unreadable: " + candidate.string() +
+                            " (" + ec.message() + ")");
+        return "";
+    }
+
+    // Containment check: canonical_candidate must be canonical_models_dir
+    // itself or a descendant of it (string-prefix check on the canonical,
+    // symlink-resolved paths -- this is what defeats both "../.." style
+    // traversal AND a symlink planted inside models/ pointing elsewhere).
+    const std::string dir_str = canonical_models_dir.string();
+    const std::string file_str = canonical_candidate.string();
+    const bool contained = file_str.size() > dir_str.size() &&
+        file_str.compare(0, dir_str.size(), dir_str) == 0 &&
+        (file_str[dir_str.size()] == fs::path::preferred_separator);
+    if (!contained) {
+        upscale::log_error("model_path_for: resolved model path escapes plugin models/ directory, rejecting: " +
+                            file_str);
+        return "";
+    }
+
+    return canonical_candidate.string();
 }
 
 // Converts a PF_EffectWorld (assumed BGRA_8u, see header caveat) into the
@@ -220,7 +270,12 @@ AIUpscaleSequenceData* get_sequence_data(PF_InData* in_data) {
 
 // Ensures the correct model (per current Mode param) is loaded into the
 // cached OnnxUpscaler, reloading only when the mode actually changed.
-PF_Err ensure_model_loaded(AIUpscaleSequenceData* seq, A_long mode_choice) {
+// Prefers CoreML on macOS (see OnnxUpscaler::load()'s append_providers()
+// for the actual EP selection/fallback logic); any load failure --
+// including a rejected/missing model path -- is surfaced to the host via
+// both PF_Err and out_data->return_msg, and logged with the attempted
+// path for offline diagnosis (see plugin/README.md "安定運用ガイド").
+PF_Err ensure_model_loaded(AIUpscaleSequenceData* seq, A_long mode_choice, PF_OutData* out_data) {
     if (seq->upscaler && seq->loaded_mode_choice == mode_choice) {
         return PF_Err_NONE; // already loaded, nothing to do
     }
@@ -230,17 +285,49 @@ PF_Err ensure_model_loaded(AIUpscaleSequenceData* seq, A_long mode_choice) {
     }
 
     const std::string model_path = model_path_for(seq->plugin_dir, mode_choice);
+    if (model_path.empty()) {
+        // model_path_for() already logged the specific reason (missing /
+        // path-traversal / symlink-escape).
+        PF_STRCPY(out_data->return_msg,
+                  "AI Upscale: model file not found or invalid. Reinstall models/ next to the plugin.");
+        return PF_Err_INTERNAL_STRUCT_DAMAGED;
+    }
+
     try {
         seq->upscaler->load(model_path, upscale::ExecutionProvider::kAuto);
         seq->loaded_mode_choice = mode_choice;
-    } catch (const upscale::OnnxUpscalerError&) {
+        if (seq->upscaler->fell_back_to_cpu()) {
+            PF_STRCPY(out_data->return_msg,
+                      "AI Upscale: accelerated execution provider unavailable; running on CPU (slower). See log.");
+        }
+    } catch (const upscale::OnnxUpscalerError& ex) {
+        upscale::log_error(std::string("ensure_model_loaded: failed to load '") + model_path + "': " + ex.what());
+        PF_SPRINTF(out_data->return_msg, "AI Upscale: failed to load model (%s).", ex.what());
         return PF_Err_INTERNAL_STRUCT_DAMAGED; // best available generic PF_Err for "bad model file"
     }
     return PF_Err_NONE;
 }
 
 PF_Err HandleFrameSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[]) {
+    if (!in_data || !out_data || !params) {
+        return PF_Err_BAD_CALLBACK_PARAM;
+    }
+
     const int scale = scale_choice_to_factor(params);
+
+    // Validate the input size the host reports before computing the
+    // expanded output size, and validate the resulting output size too
+    // (see size_limits.h) -- catches a corrupt/hostile in_data->width or
+    // height before any buffer-sized computation happens.
+    try {
+        upscale::validate_input_dims(in_data->width, in_data->height, 4);
+        upscale::safe_buffer_bytes(static_cast<int64_t>(in_data->width) * scale,
+                                    static_cast<int64_t>(in_data->height) * scale, 4, 1);
+    } catch (const upscale::SizeLimitError& ex) {
+        upscale::log_error(std::string("HandleFrameSetup: rejecting frame size: ") + ex.what());
+        PF_SPRINTF(out_data->return_msg, "AI Upscale: unsupported frame size (%s).", ex.what());
+        return PF_Err_INTERNAL_STRUCT_DAMAGED;
+    }
 
     // Buffer-expansion pattern (see file-header caveat re: Premiere
     // support): grow the output world to input-size * scale and keep the
@@ -256,6 +343,10 @@ PF_Err HandleFrameSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* p
 PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], PF_LayerDef* output) {
     PF_Err err = PF_Err_NONE;
 
+    if (!in_data || !out_data || !params || !output) {
+        return PF_Err_BAD_CALLBACK_PARAM;
+    }
+
     // 8bpc only (see README known limitations). AE signals higher bit
     // depths via in_data->appl_id / PF_WORLD_IS_DEEP(output)-style checks
     // depending on SDK version; bail out cleanly if not 8bpc.
@@ -266,26 +357,55 @@ PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* param
 
     AIUpscaleSequenceData* seq = get_sequence_data(in_data);
     if (!seq) {
+        PF_STRCPY(out_data->return_msg, "AI Upscale: internal error (missing sequence data).");
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
 
     const A_long mode_choice = params[AI_UPSCALE_MODE_POPUP]->u.pd.value;
-    err = ensure_model_loaded(seq, mode_choice);
+    err = ensure_model_loaded(seq, mode_choice, out_data);
     if (err) return err;
 
     const int scale = scale_choice_to_factor(params);
     PF_EffectWorld* input_world = &params[AI_UPSCALE_INPUT]->u.ld;
 
+    // NULL / zero-size input world checks -- a well-behaved host should
+    // never hand us this, but the plugin API boundary must never trust
+    // that assumption (see plugin/README.md "セキュリティ").
+    if (!input_world || !input_world->data || input_world->width <= 0 || input_world->height <= 0) {
+        upscale::log_error("HandleRender: rejecting null/empty input world");
+        PF_STRCPY(out_data->return_msg, "AI Upscale: invalid or empty input frame.");
+        return PF_Err_INTERNAL_STRUCT_DAMAGED;
+    }
+
+    try {
+        upscale::validate_input_dims(input_world->width, input_world->height, 4);
+    } catch (const upscale::SizeLimitError& ex) {
+        upscale::log_error(std::string("HandleRender: rejecting input world size: ") + ex.what());
+        PF_SPRINTF(out_data->return_msg, "AI Upscale: unsupported frame size (%s).", ex.what());
+        return PF_Err_INTERNAL_STRUCT_DAMAGED;
+    }
+
     upscale::ImageRGBA8 in_img = world_to_rgba8(input_world);
 
     upscale::TileOptions tile_opts;
-    tile_opts.tile_size = 256;
+    tile_opts.tile_size = 0; // auto-select based on active execution provider (see choose_tile_size())
     tile_opts.overlap = 16;
+    // Auto worker count (hardware_concurrency, capped to tile count by
+    // tile.cpp); AE/Premiere host processes are typically already busy
+    // with UI/other render threads, so we don't try to be cleverer than
+    // "use what's available" here.
+    tile_opts.num_workers = 0;
 
     upscale::ImageRGBA8 out_img;
     try {
         seq->upscaler->upscale(in_img, out_img, scale, tile_opts);
-    } catch (const upscale::OnnxUpscalerError&) {
+    } catch (const upscale::OnnxUpscalerError& ex) {
+        upscale::log_error(std::string("HandleRender: upscale failed: ") + ex.what());
+        PF_SPRINTF(out_data->return_msg, "AI Upscale: render failed (%s).", ex.what());
+        return PF_Err_INTERNAL_STRUCT_DAMAGED;
+    } catch (const upscale::SizeLimitError& ex) {
+        upscale::log_error(std::string("HandleRender: upscale rejected by size limit: ") + ex.what());
+        PF_SPRINTF(out_data->return_msg, "AI Upscale: frame too large (%s).", ex.what());
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
 
@@ -307,7 +427,21 @@ PF_Err EffectMain(
     void*           extra) {
     PF_Err err = PF_Err_NONE;
 
+    // Safety-critical invariant: EffectMain is the ENTIRE plugin API
+    // boundary with the host. Every path below must return a PF_Err, and
+    // NO C++ exception may ever cross back into the host -- an uncaught
+    // exception unwinding into Adobe's C-linkage dispatcher is undefined
+    // behavior and will crash the host application (After Effects /
+    // Premiere Pro), taking the user's project down with it. Hence the
+    // broad catch(...) below in addition to the narrower catches inside
+    // each Handle*() function: those provide a good out_data->return_msg,
+    // this one is the last-resort backstop that guarantees the invariant
+    // even for exception types/call sites we didn't anticipate.
     try {
+        if (!in_data || !out_data) {
+            return PF_Err_BAD_CALLBACK_PARAM;
+        }
+
         switch (cmd) {
             case PF_Cmd_ABOUT:
                 err = HandleAbout(in_data, out_data);
@@ -334,9 +468,21 @@ PF_Err EffectMain(
             default:
                 break;
         }
+    } catch (const std::exception& ex) {
+        upscale::log_error(std::string("EffectMain: uncaught exception for cmd=") + std::to_string(static_cast<int>(cmd)) +
+                            ": " + ex.what());
+        if (out_data) {
+            PF_SPRINTF(out_data->return_msg, "AI Upscale: internal error (%s).", ex.what());
+        }
+        err = PF_Err_INTERNAL_STRUCT_DAMAGED;
     } catch (...) {
-        // AE SDK convention: never let C++ exceptions cross the plugin
-        // boundary; report a generic internal error instead.
+        // Non-std::exception throw (or a type we don't specifically
+        // recognize) -- AE SDK convention: never let C++ exceptions cross
+        // the plugin boundary; report a generic internal error instead.
+        upscale::log_error("EffectMain: uncaught non-std::exception for cmd=" + std::to_string(static_cast<int>(cmd)));
+        if (out_data) {
+            PF_STRCPY(out_data->return_msg, "AI Upscale: unknown internal error.");
+        }
         err = PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
 

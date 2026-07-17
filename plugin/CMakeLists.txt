@@ -31,6 +31,40 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # ---------------------------------------------------------------------------
+# Apple Silicon (M4 Max) target configuration.
+#
+# CMAKE_OSX_ARCHITECTURES must be set BEFORE the first project()/enable_language
+# call to take effect, but this file is included after `project(... CXX)`
+# above only sets the language; on macOS this is still early enough for
+# CMake to honor it for compiler invocation as long as it's set before any
+# target is created below (which it is). If invoking cmake configure a
+# second time on an existing build dir with a different architecture,
+# delete the build dir first (CMake does not re-detect toolchain arch
+# changes for an existing cache).
+# ---------------------------------------------------------------------------
+if(APPLE)
+    if(NOT CMAKE_OSX_ARCHITECTURES)
+        set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING
+            "Target architecture(s) for macOS builds; arm64-only by default for native M4 Max builds (no x86_64 slice, no Rosetta translation overhead)." FORCE)
+    endif()
+    if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+        set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING
+            "Minimum macOS version; 13.0+ has the CoreML EP's MLProgram/ANE support this plugin relies on." FORCE)
+    endif()
+endif()
+
+# Release-mode optimization flags. -O3 plus target-native tuning on
+# non-Apple platforms (Apple Silicon already gets -O3 -mcpu=apple-m1-ish
+# defaults from AppleClang for -O3; explicit -mcpu flags for Apple chips
+# are handled by Xcode's toolchain based on CMAKE_OSX_ARCHITECTURES rather
+# than -march, so nothing additional is needed here for macOS).
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT APPLE)
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND APPLE)
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+endif()
+
+# ---------------------------------------------------------------------------
 # onnxruntime
 # ---------------------------------------------------------------------------
 if(NOT DEFINED ONNXRUNTIME_ROOT)
@@ -58,6 +92,8 @@ endif()
 # ---------------------------------------------------------------------------
 # upscale_core (Adobe-independent)
 # ---------------------------------------------------------------------------
+find_package(Threads REQUIRED)
+
 add_library(upscale_core STATIC
     src/core/onnx_upscaler.cpp
     src/core/tile.cpp
@@ -68,15 +104,26 @@ target_include_directories(upscale_core
     PRIVATE
         ${ONNXRUNTIME_ROOT}/include
 )
-target_link_libraries(upscale_core PUBLIC ${ONNXRUNTIME_LIB})
+# Threads::Threads links -pthread (required for std::thread on
+# Linux/glibc); harmless no-op flag-wise on macOS/Windows.
+target_link_libraries(upscale_core PUBLIC ${ONNXRUNTIME_LIB} Threads::Threads)
 
 # Execution-provider feature flags: define these when the corresponding
 # onnxruntime EP libraries are present in ONNXRUNTIME_ROOT/lib, so
-# onnx_upscaler.cpp can compile in (and try) that provider. All default
-# off; this repo's Linux dev environment only ever exercises CPU.
+# onnx_upscaler.cpp can compile in (and try) that provider.
+# UPSCALE_WITH_COREML defaults ON on macOS (the primary target platform
+# for this plugin, M4 Max) since onnxruntime's official macOS release
+# packages include the CoreML EP built-in; the try/catch fallback in
+# onnx_upscaler.cpp's append_providers() means this is safe to leave on
+# even if a particular onnxruntime build lacks it. CUDA/DirectML remain
+# opt-in since they require non-default onnxruntime builds.
 option(UPSCALE_WITH_CUDA "Enable CUDA execution provider (requires CUDA-enabled onnxruntime build)" OFF)
 option(UPSCALE_WITH_DIRECTML "Enable DirectML execution provider (Windows only)" OFF)
-option(UPSCALE_WITH_COREML "Enable CoreML execution provider (macOS only)" OFF)
+if(APPLE)
+    option(UPSCALE_WITH_COREML "Enable CoreML execution provider (macOS only)" ON)
+else()
+    option(UPSCALE_WITH_COREML "Enable CoreML execution provider (macOS only)" OFF)
+endif()
 
 if(UPSCALE_WITH_CUDA)
     target_compile_definitions(upscale_core PRIVATE UPSCALE_WITH_CUDA)
@@ -139,7 +186,7 @@ if(DEFINED AE_SDK_PATH)
             ${AE_SDK_PATH}/Examples/Resources
             ${ONNXRUNTIME_ROOT}/include
         )
-        target_link_libraries(AIUpscale PRIVATE upscale_core)
+        target_link_libraries(AIUpscale PRIVATE upscale_core Threads::Threads)
 
         if(WIN32)
             # After Effects/Premiere plugins on Windows are DLLs renamed to

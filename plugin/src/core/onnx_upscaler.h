@@ -10,6 +10,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -76,6 +77,15 @@ public:
     // smaller than requested, we upscale to native scale and then use the
     // model's own output as the base without further upsampling attempts
     // (a mismatch here generally indicates the wrong model was loaded).
+    // If tile_opts.tile_size <= 0, a tile size is auto-selected via
+    // choose_tile_size() based on the active execution provider and
+    // input/output geometry (see tile.h). Otherwise tile_opts.tile_size is
+    // used as given, EXCEPT: if the initial attempt fails specifically
+    // with a memory-allocation-shaped failure (std::bad_alloc, or an
+    // OnnxUpscalerError wrapping an onnxruntime OOM), upscale() halves the
+    // tile size once and retries a single time before giving up -- see
+    // the "自動リトライ" note in plugin/README.md's stable-operation
+    // section.
     void upscale(const ImageRGBA8& in,
                  ImageRGBA8& out,
                  int requested_scale,
@@ -91,6 +101,14 @@ public:
     // resolved fallbacks (e.g. "CPUExecutionProvider").
     const std::string& active_provider() const { return active_provider_name_; }
 
+    // True when load() was asked for an accelerated provider (CoreML/
+    // CUDA/DirectML) but it was unavailable/failed to initialize and
+    // silently fell back to CPU. Callers (AE plugin layer, CLI) should
+    // surface this to the user/log -- a silent CPU fallback on what the
+    // user believes is a GPU/ANE-accelerated run is a common source of
+    // "why is this so slow" confusion.
+    bool fell_back_to_cpu() const { return fell_back_to_cpu_; }
+
 private:
     void probe_native_scale();
 
@@ -103,6 +121,28 @@ private:
 
     int native_scale_ = 0;
     std::string active_provider_name_;
+    bool fell_back_to_cpu_ = false;
+
+    // Guards the actual Ort::Session::Run() call when the active provider
+    // is not CPU. Design rationale (see tile.h / tile.cpp for the
+    // parallel tiling side of this):
+    //   - Ort::Session::Run() on the SAME session IS documented as
+    //     thread-safe by onnxruntime, so for the CPU execution provider we
+    //     deliberately do NOT serialize here -- tiles run their Run() call
+    //     concurrently across worker threads, sharing this one session.
+    //     To avoid oversubscribing CPU cores (parallel tiles each also
+    //     spinning up intra-op threads), load() sets intra_op_num_threads
+    //     to 1 whenever tile-level parallelism is in play; see load().
+    //   - For CoreML (and, if ever enabled, CUDA/DirectML) we still only
+    //     ever attach one session, but the task's design explicitly calls
+    //     for serializing the inference call itself on those providers
+    //     (ANE/GPU contention, and to keep behavior conservative pending
+    //     real hardware validation) while still parallelizing the
+    //     surrounding pre/post-processing (NCHW packing, alpha resize,
+    //     clamping) across tile worker threads. infer_mutex_ implements
+    //     that serialization.
+    std::mutex infer_mutex_;
+    bool serialize_inference_ = false;
 };
 
 } // namespace upscale
