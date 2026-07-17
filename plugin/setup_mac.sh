@@ -543,6 +543,33 @@ step4_build() {
         exit 1
     fi
     log_ok "AIUpscale.plugin をビルドしました: ${bundle_path}"
+
+    # PiPLリソース (Contents/Resources/AIUpscale.rsrc) の存在確認。
+    #
+    # これが無いバンドルは有効なMach-Oモジュールとしてビルド・インストール
+    # までは成功するが、Premiere Pro/After EffectsのプラグインスキャナはPiPL
+    # リソース無しのバンドルを黙って無視するため、エフェクト一覧に
+    #「AI Upscale」が一切表示されないという実機で確認された症状につながる。
+    # plugin/CMakeLists.txt側でRezによるPiPLコンパイル工程
+    # (AIUpscale_PiPL_Preprocess + AIUpscaleターゲットのPOST_BUILD) を追加済み
+    # だが、Rezが見つからない等の理由でcmake configure自体が失敗するケースに
+    # 加え、POST_BUILDコマンドが何らかの理由で成果物を生成しなかった場合も
+    # ここで検出し、原因不明のままインストールに進んでしまうことを防ぐ。
+    local rsrc_path="${bundle_path}/Contents/Resources/AIUpscale.rsrc"
+    if [ ! -f "${rsrc_path}" ]; then
+        log_error "PiPLリソースが見つかりません: ${rsrc_path}"
+        log_error "PiPLコンパイル失敗: バンドル自体はビルドされましたが、Rezによる"
+        log_error "AIUpscale.rsrc生成がスキップされたか失敗した可能性があります。"
+        log_error "このままインストールしても、Premiere Pro/After Effectsのエフェクト"
+        log_error "一覧に「AI Upscale」が表示されません。"
+        log_error "対処: 上記ビルドログ中の \"Preprocessing AIUpscalePiPL.r\" /"
+        log_error "\"Compiling AIUpscalePiPL.rr with Rez\" 行でのエラーを確認してください。"
+        log_error "Rezが見つからない場合は Xcode Command Line Tools "
+        log_error "(xcode-select --install) を確認してください。"
+        exit 1
+    fi
+    log_ok "PiPLリソースを確認しました: ${rsrc_path}"
+
     plugin_bundle_path_result="${bundle_path}"
 }
 plugin_bundle_path_result=""

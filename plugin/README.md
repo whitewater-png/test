@@ -139,10 +139,18 @@ cmake -S plugin -B plugin/build -G Xcode \
 cmake --build plugin/build --config Release
 ```
 
-macOS版はバンドル (`AIUpscale.plugin`) として出力されます。PiPLリソースは
-Rezでコンパイルしてバンドルに埋め込む必要があります（SDK付属の
-`Examples/Skeleton` Xcodeプロジェクトのビルドフェーズを参照）。
-`src/plugin/Info.plist.in` はバンドルの `Info.plist` テンプレートです。
+macOS版はバンドル (`AIUpscale.plugin`) として出力されます。PiPLリソース
+(`AIUpscalePiPL.r`) は `plugin/CMakeLists.txt` が自動でコンパイルします
+（SDK付属の `Examples/Skeleton` Xcodeプロジェクトの「Compile PiPL」ビルド
+フェーズと同じ2段階を、`cc -E -P` によるプリプロセスと `Rez`
+（`xcrun -f Rez` で解決、Xcode Command Line Toolsに含まれる）による
+コンパイルとして、`AIUpscale`ターゲットのビルド後処理に組み込んでいます）。
+生成物は `AIUpscale.plugin/Contents/Resources/AIUpscale.rsrc` に配置され、
+これが無いとバンドル自体は正常にビルド・インストールされても
+Premiere Pro/After Effectsのエフェクト一覧に「AI Upscale」が表示されません
+（実機で確認された症状）。`Rez` が見つからない場合、cmake configure時に
+FATAL_ERRORで中断し対処法を表示します。`src/plugin/Info.plist.in` は
+バンドルの `Info.plist` テンプレートです。
 
 ### macOS (Apple Silicon / M4 Max) 向け推奨設定
 

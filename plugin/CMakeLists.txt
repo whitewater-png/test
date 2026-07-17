@@ -335,14 +335,138 @@ if(DEFINED AE_SDK_PATH AND NOT "${AE_SDK_PATH}" STREQUAL "")
             # AE/Premiere plugins on macOS are bundles with a .plugin
             # extension containing the PiPL resource compiled via Rez and
             # embedded per the SDK's bundle template (Info.plist, PkgInfo).
-            # This sets up the bundle shape; populating Info.plist/PkgInfo
-            # from the SDK's template is left to the real build (see
-            # plugin/README.md for the manual steps).
+            # This sets up the bundle shape; Info.plist comes from
+            # src/plugin/Info.plist.in below. The PiPL resource itself is
+            # compiled and embedded by the custom commands further below.
             set_target_properties(AIUpscale PROPERTIES
                 BUNDLE TRUE
                 BUNDLE_EXTENSION "plugin"
                 OUTPUT_NAME "AIUpscale"
                 MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/Info.plist.in"
+            )
+
+            # -----------------------------------------------------------
+            # PiPL (Plug-in Property List) resource compilation.
+            #
+            # This is the step that was previously missing entirely: AE SDK
+            # plugins are only recognized by After Effects/Premiere Pro if
+            # a compiled PiPL resource is present at
+            # Contents/Resources/<executable-name>.rsrc inside the bundle.
+            # A bundle without it builds, installs, and even loads as a
+            # valid Mach-O module, but the host's plugin scanner silently
+            # skips it -- it never appears in the Effects panel. This
+            # reproduces the two-step "Compile PiPL" build phase used by
+            # the AE SDK's own Xcode sample projects (e.g.
+            # Examples/Skeleton):
+            #   1. Preprocess AIUpscalePiPL.r with the C preprocessor (it
+            #      uses #include/#ifdef against AEConfig.h,
+            #      AE_EffectVers.h, AE_General.r) into a plain .rr file
+            #      Rez can consume directly.
+            #   2. Compile that .rr with Rez into Contents/Resources/
+            #      <executable-name>.rsrc -- the AE/Premiere plugin loader
+            #      looks for a resource file whose name matches the
+            #      executable (OUTPUT_NAME "AIUpscale" above), hence
+            #      AIUpscale.rsrc.
+            #
+            # Rez ships with Xcode (Contents/Developer/Tools) and, on some
+            # Xcode/CLT versions, with the standalone Command Line Tools
+            # package too. It is intentionally NOT required for the
+            # upscale_core/upscale_cli targets or for Linux configure --
+            # this whole block only runs once cmake has already decided to
+            # build the macOS AIUpscale bundle target above.
+            find_program(REZ_EXECUTABLE NAMES Rez
+                PATHS
+                    /Applications/Xcode.app/Contents/Developer/Tools
+                    /Library/Developer/CommandLineTools/usr/bin
+            )
+            if(NOT REZ_EXECUTABLE)
+                # Rez is frequently not on PATH even when installed; xcrun
+                # knows how to resolve tools bundled with the active
+                # Xcode/Command Line Tools selection (xcode-select -p).
+                execute_process(
+                    COMMAND xcrun -f Rez
+                    OUTPUT_VARIABLE REZ_EXECUTABLE_XCRUN
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET
+                    RESULT_VARIABLE REZ_XCRUN_RESULT
+                )
+                if(REZ_XCRUN_RESULT EQUAL 0 AND EXISTS "${REZ_EXECUTABLE_XCRUN}")
+                    set(REZ_EXECUTABLE "${REZ_EXECUTABLE_XCRUN}" CACHE FILEPATH "Path to Rez" FORCE)
+                endif()
+            endif()
+            if(NOT REZ_EXECUTABLE)
+                message(FATAL_ERROR
+                    "Rez (the classic Mac OS resource compiler, required to "
+                    "compile AIUpscalePiPL.r into the plugin bundle's PiPL "
+                    "resource) was not found via PATH, the usual Xcode/CLT "
+                    "install locations, or `xcrun -f Rez`. Without it the "
+                    "AIUpscale.plugin bundle will build successfully but "
+                    "After Effects/Premiere Pro will NOT show the 'AI "
+                    "Upscale' effect at all (this is the exact symptom "
+                    "reported after a build lacking this step). To fix: "
+                    "install Xcode and/or run `xcode-select --install`, "
+                    "make sure a full Xcode.app is the active developer "
+                    "directory if the standalone Command Line Tools "
+                    "package doesn't include Rez on this macOS/Xcode "
+                    "version (`xcode-select -s "
+                    "/Applications/Xcode.app/Contents/Developer`), then "
+                    "re-run cmake configure.")
+            endif()
+            message(STATUS "Rez found for PiPL compilation: ${REZ_EXECUTABLE}")
+
+            set(AIUPSCALE_PIPL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/AIUpscalePiPL.r")
+            set(AIUPSCALE_PIPL_PREPROCESSED "${CMAKE_CURRENT_BINARY_DIR}/AIUpscalePiPL.rr")
+
+            # -E -P: run the preprocessor only and suppress '# <n> "file"'
+            # line-marker directives (Rez's resource-script parser doesn't
+            # understand them). -x c forces C-preprocessor handling
+            # regardless of the .r extension, matching the AE SDK sample
+            # projects' build phase. Deliberately CMAKE_CXX_COMPILER, not
+            # CMAKE_C_COMPILER: this project only calls project(... CXX) --
+            # no C language is enabled -- so CMAKE_C_COMPILER is never
+            # detected/set and would silently expand to an empty string
+            # here (verified: doing so makes the COMMAND's first token be
+            # "-E" itself, which gmake reports as "E: No such file or
+            # directory" -- caught by simulating this exact custom command
+            # on Linux with APPLE forced on and a stub Rez on PATH).
+            # CMAKE_CXX_COMPILER's underlying clang++/g++ driver accepts
+            # -x c to switch to C-preprocessor rules for this invocation,
+            # so it works as a drop-in preprocessor without requiring
+            # enable_language(C).
+            add_custom_command(
+                OUTPUT "${AIUPSCALE_PIPL_PREPROCESSED}"
+                COMMAND ${CMAKE_CXX_COMPILER} -E -P -x c
+                        -I "${AE_SDK_EFFECTIVE_ROOT}/Examples/Headers"
+                        -I "${AE_SDK_EFFECTIVE_ROOT}/Examples/Resources"
+                        "${AIUPSCALE_PIPL_SRC}"
+                        -o "${AIUPSCALE_PIPL_PREPROCESSED}"
+                DEPENDS "${AIUPSCALE_PIPL_SRC}"
+                COMMENT "Preprocessing AIUpscalePiPL.r -> AIUpscalePiPL.rr"
+                VERBATIM
+            )
+            add_custom_target(AIUpscale_PiPL_Preprocess
+                DEPENDS "${AIUPSCALE_PIPL_PREPROCESSED}"
+            )
+            add_dependencies(AIUpscale AIUpscale_PiPL_Preprocess)
+
+            # POST_BUILD so $<TARGET_BUNDLE_CONTENT_DIR:AIUpscale> resolves
+            # to an already-created Contents/ directory (CMake lays out the
+            # bundle skeleton as part of linking the MODULE BUNDLE target).
+            # -useDF tells Rez to write resources into the resource fork's
+            # data-fork-based ('.rsrc' as a plain data file) representation,
+            # the form modern PiPL-consuming AE/Premiere hosts expect
+            # rather than a legacy HFS+ resource fork.
+            add_custom_command(TARGET AIUpscale POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory
+                        "$<TARGET_BUNDLE_CONTENT_DIR:AIUpscale>/Resources"
+                COMMAND "${REZ_EXECUTABLE}"
+                        -o "$<TARGET_BUNDLE_CONTENT_DIR:AIUpscale>/Resources/$<TARGET_FILE_BASE_NAME:AIUpscale>.rsrc"
+                        -useDF
+                        "${AIUPSCALE_PIPL_PREPROCESSED}"
+                        -i "${AE_SDK_EFFECTIVE_ROOT}/Examples/Headers"
+                        -i "${AE_SDK_EFFECTIVE_ROOT}/Examples/Resources"
+                COMMENT "Compiling AIUpscalePiPL.rr with Rez -> Contents/Resources/AIUpscale.rsrc"
+                VERBATIM
             )
         endif()
     else()
