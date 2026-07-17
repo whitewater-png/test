@@ -23,10 +23,13 @@
 
 #include <algorithm>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <new>
+#include <sstream>
 #include <stdexcept>
 #include <system_error>
 
@@ -262,6 +265,87 @@ upscale::ImageRGBA8 world_to_rgba8(const PF_EffectWorld* world) {
         }
     }
     return img;
+}
+
+// ---------------------------------------------------------------------------
+// Render-time diagnostic logging (throttled).
+//
+// Field hardware showed the render failure "output pixel count 641204224
+// exceeds safety limit of 200000000" coming from many concurrent render
+// threads for a 4K clip on a 4K sequence -- a ~4.8x-too-large figure versus
+// the expected UHD 4x (132,710,400 px), pointing at a host/plugin
+// disagreement about frame sizes rather than a genuinely oversized request.
+// Logging every size on every frame/tile-thread would be spam (the report
+// showed many threads logging per frame); this cache logs only when the
+// (input size, output size, downsample, scale) combination actually
+// changes, so a size-mismatch pattern is visible in AIUpscale.log without
+// drowning it in repeats.
+// ---------------------------------------------------------------------------
+struct RenderDiagCache {
+    std::mutex mutex;
+    int64_t last_in_w = -1, last_in_h = -1;
+    int64_t last_out_w = -1, last_out_h = -1;
+    int64_t last_full_w = -1, last_full_h = -1;
+    int64_t last_dsx_num = -1, last_dsx_den = -1;
+    int64_t last_dsy_num = -1, last_dsy_den = -1;
+    int last_scale = -1;
+};
+RenderDiagCache g_render_diag_cache;
+
+// Classifies whether the host honored the FRAME_SETUP buffer-expansion
+// request: "expanded" (output world == input world * scale, the ideal
+// I_EXPAND_BUFFER-respecting case that lets a later Transform/Motion scale
+// in the host's effects chain sample from a genuinely higher-resolution
+// buffer), "not-expanded" (output world == input world, the graceful
+// fallback / detail-regeneration-only case), or "custom" (anything else --
+// e.g. a host-imposed size unrelated to either, which is the shape of
+// mismatch that produced the field-reported render failure this fix
+// targets). Single word by design so it's easy to grep/scan in
+// AIUpscale.log across a user's next report.
+const char* classify_expand_status(int64_t in_w, int64_t in_h, int64_t out_w, int64_t out_h, int scale) {
+    if (out_w == in_w * scale && out_h == in_h * scale) {
+        return "expanded";
+    }
+    if (out_w == in_w && out_h == in_h) {
+        return "not-expanded";
+    }
+    return "custom";
+}
+
+void log_render_diag_if_changed(PF_InData* in_data, const PF_EffectWorld* input_world,
+                                 const PF_LayerDef* output, int scale) {
+    const int64_t in_w = input_world->width, in_h = input_world->height;
+    const int64_t out_w = output->width, out_h = output->height;
+    const int64_t full_w = in_data->width, full_h = in_data->height;
+    const int64_t dsx_num = in_data->downsample_x.num, dsx_den = in_data->downsample_x.den;
+    const int64_t dsy_num = in_data->downsample_y.num, dsy_den = in_data->downsample_y.den;
+
+    std::lock_guard<std::mutex> lock(g_render_diag_cache.mutex);
+    RenderDiagCache& c = g_render_diag_cache;
+    if (in_w == c.last_in_w && in_h == c.last_in_h && out_w == c.last_out_w && out_h == c.last_out_h &&
+        full_w == c.last_full_w && full_h == c.last_full_h && dsx_num == c.last_dsx_num &&
+        dsx_den == c.last_dsx_den && dsy_num == c.last_dsy_num && dsy_den == c.last_dsy_den &&
+        scale == c.last_scale) {
+        return; // identical to last-logged combination, skip (avoid per-frame/per-thread spam)
+    }
+    c.last_in_w = in_w; c.last_in_h = in_h;
+    c.last_out_w = out_w; c.last_out_h = out_h;
+    c.last_full_w = full_w; c.last_full_h = full_h;
+    c.last_dsx_num = dsx_num; c.last_dsx_den = dsx_den;
+    c.last_dsy_num = dsy_num; c.last_dsy_den = dsy_den;
+    c.last_scale = scale;
+
+    const char* expand_status = classify_expand_status(in_w, in_h, out_w, out_h, scale);
+
+    std::ostringstream oss;
+    oss << "HandleRender: size combo changed - input_world=" << in_w << "x" << in_h
+        << " output_world=" << out_w << "x" << out_h
+        << " in_data(full-res)=" << full_w << "x" << full_h
+        << " downsample_x=" << dsx_num << "/" << dsx_den
+        << " downsample_y=" << dsy_num << "/" << dsy_den
+        << " scale_param=" << scale
+        << " expand_status=" << expand_status;
+    upscale::log_info(oss.str());
 }
 
 void rgba8_to_world(const upscale::ImageRGBA8& img, PF_EffectWorld* world) {
@@ -587,25 +671,72 @@ PF_Err HandleFrameSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* p
 
     const int scale = scale_choice_to_factor(params);
 
-    // Validate the input size the host reports before computing the
-    // expanded output size, and validate the resulting output size too
-    // (see size_limits.h) -- catches a corrupt/hostile in_data->width or
+    // Validate the input size the host reports before computing anything
+    // downstream of it -- catches a corrupt/hostile in_data->width or
     // height before any buffer-sized computation happens.
     try {
         upscale::validate_input_dims(in_data->width, in_data->height, 4);
-        upscale::safe_buffer_bytes(static_cast<int64_t>(in_data->width) * scale,
-                                    static_cast<int64_t>(in_data->height) * scale, 4, 1);
     } catch (const upscale::SizeLimitError& ex) {
         upscale::log_error(std::string("HandleFrameSetup: rejecting frame size: ") + ex.what());
         set_return_msg(out_data, "AI Upscale: unsupported frame size (%s).", ex.what());
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
 
+    // Effective (downsample-adjusted) input pixel dimensions -- the actual
+    // pixel size of the world the host will render/allocate for THIS pass
+    // at the current render quality/downsample setting. downsample_x/y is
+    // a PF_RationalScale (num/den, AE SDK convention; 1/1 at Full quality,
+    // e.g. 1/2 at Half) on PF_InData. in_data->width/height, by contrast,
+    // are always the FULL-resolution layer dimensions regardless of
+    // downsample -- which is why out_data->width/height below is still
+    // computed from in_data->width/height directly (the documented AE
+    // convention for I_EXPAND_BUFFER-style effects: expanded output size is
+    // declared in full-res coordinates, same as the SDK's own resizer-style
+    // samples). The effective size is used ONLY for the size-limit check
+    // below, since that check needs to reason about the pixel count the
+    // host will actually end up allocating/rendering, not the nominal
+    // full-res layer size.
+    int64_t effective_w = in_data->width;
+    int64_t effective_h = in_data->height;
+    if (in_data->downsample_x.num > 0 && in_data->downsample_x.den > 0) {
+        effective_w = (effective_w * in_data->downsample_x.num) / in_data->downsample_x.den;
+    }
+    if (in_data->downsample_y.num > 0 && in_data->downsample_y.den > 0) {
+        effective_h = (effective_h * in_data->downsample_y.num) / in_data->downsample_y.den;
+    }
+    if (effective_w <= 0) effective_w = in_data->width;
+    if (effective_h <= 0) effective_h = in_data->height;
+
     // Buffer-expansion pattern (see file-header caveat re: Premiere
     // support): grow the output world to input-size * scale and keep the
-    // origin at (0,0) since this effect doesn't reposition content.
-    out_data->width = in_data->width * scale;
-    out_data->height = in_data->height * scale;
+    // origin at (0,0) since this effect doesn't reposition content -- but
+    // only when the expanded size stays within the safety limits (see
+    // size_limits.h). If the expanded size would be rejected later anyway
+    // (e.g. an unusually large source combined with 4x), degrade
+    // gracefully to a same-size "detail regeneration" pass instead of
+    // failing the whole render: HandleRender always writes into whatever
+    // size the host actually allocated for `output`, so this is a safe
+    // fallback rather than a correctness issue (see HandleRender).
+    bool expand = true;
+    try {
+        upscale::safe_buffer_bytes(effective_w * scale, effective_h * scale, 4, 1);
+    } catch (const upscale::SizeLimitError& ex) {
+        upscale::log_warn(
+            "HandleFrameSetup: requested " + std::to_string(scale) + "x expansion of effective size " +
+            std::to_string(effective_w) + "x" + std::to_string(effective_h) +
+            " would exceed safety limits (" + ex.what() +
+            "); keeping output at input size and relying on detail-regeneration-only mode for this frame "
+            "instead of failing the render.");
+        expand = false;
+    }
+
+    if (expand) {
+        out_data->width = in_data->width * scale;
+        out_data->height = in_data->height * scale;
+    } else {
+        out_data->width = in_data->width;
+        out_data->height = in_data->height;
+    }
     out_data->origin.h = 0;
     out_data->origin.v = 0;
 
@@ -648,6 +779,14 @@ PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* param
         set_return_msg(out_data, "AI Upscale: invalid or empty input frame.");
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
+    // Likewise for the output world -- HandleRender below trusts
+    // output->width/height as the ground truth for what to write, so a
+    // null/zero-size output must be rejected up front too.
+    if (output->width <= 0 || output->height <= 0) {
+        upscale::log_error("HandleRender: rejecting null/empty output world");
+        set_return_msg(out_data, "AI Upscale: invalid output frame.");
+        return PF_Err_INTERNAL_STRUCT_DAMAGED;
+    }
 
     try {
         upscale::validate_input_dims(input_world->width, input_world->height, 4);
@@ -656,6 +795,25 @@ PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* param
         set_return_msg(out_data, "AI Upscale: unsupported frame size (%s).", ex.what());
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
+    // Output world size, in contrast, can legitimately be much larger than
+    // input (up to UHD 4x and a safety margin beyond -- see size_limits.h),
+    // so it's checked with the output-oriented safe_buffer_bytes() rather
+    // than the input-oriented (8192px/side) validate_input_dims(). This
+    // also guards the allocation resize_rgba_bilinear() below would
+    // otherwise perform against a corrupt/hostile output->width/height.
+    try {
+        upscale::safe_buffer_bytes(output->width, output->height, 4, 1);
+    } catch (const upscale::SizeLimitError& ex) {
+        upscale::log_error(std::string("HandleRender: rejecting output world size: ") + ex.what());
+        set_return_msg(out_data, "AI Upscale: unsupported output frame size (%s).", ex.what());
+        return PF_Err_INTERNAL_STRUCT_DAMAGED;
+    }
+
+    // Diagnostic logging (throttled to size-combination changes -- see
+    // log_render_diag_if_changed() above) so a host/plugin size mismatch
+    // like the one that caused the field-reported render failure is
+    // immediately visible in AIUpscale.log on the next report.
+    log_render_diag_if_changed(in_data, input_world, output, scale);
 
     upscale::ImageRGBA8 in_img = world_to_rgba8(input_world);
 
@@ -668,9 +826,21 @@ PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* param
     // "use what's available" here.
     tile_opts.num_workers = 0;
 
-    upscale::ImageRGBA8 out_img;
+    // Always take the model's NATIVE-scale result here (requested_scale <=
+    // 0 short-circuits OnnxUpscaler::upscale()'s internal box-downsample
+    // step and returns the raw model output) rather than asking the core
+    // to reconcile with the UI's "Scale" popup or with any assumption
+    // about input*scale. The exact output size the host actually allocated
+    // (output->width/height) is reconciled separately below via a
+    // dedicated resample step. This decouples "what the model produces"
+    // from "what size buffer the host handed us", which is the core of
+    // this fix -- see file-header comment and size_limits.h for the field
+    // failure this targets (a real Premiere host handing HandleRender an
+    // input/output world size relationship that didn't match what
+    // HandleFrameSetup assumed).
+    upscale::ImageRGBA8 native_out;
     try {
-        seq->upscaler->upscale(in_img, out_img, scale, tile_opts);
+        seq->upscaler->upscale(in_img, native_out, /*requested_scale=*/0, tile_opts);
     } catch (const upscale::OnnxUpscalerError& ex) {
         upscale::log_error(std::string("HandleRender: upscale failed: ") + ex.what());
         set_return_msg(out_data, "AI Upscale: render failed (%s).", ex.what());
@@ -681,7 +851,34 @@ PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* param
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
 
-    rgba8_to_world(out_img, output);
+    const int out_target_w = static_cast<int>(output->width);
+    const int out_target_h = static_cast<int>(output->height);
+
+    if (native_out.width == out_target_w && native_out.height == out_target_h) {
+        // Common case when the host honored FRAME_SETUP's expansion
+        // request (or when scale==native model scale and the host left the
+        // buffer at input size in "detail regeneration" fallback mode):
+        // sizes already match exactly, nothing to resample.
+        rgba8_to_world(native_out, output);
+    } else {
+        // Sizes differ -- either the requested "Scale" (2x) is smaller
+        // than the model's native scale (typically 4x) and needs stepping
+        // down, or the host's output world doesn't match input*scale for
+        // some other reason (downsample, host-specific buffer sizing,
+        // etc.). Either way, resample the model's native output to
+        // whatever size the host actually gave us instead of assuming a
+        // relationship between input and output sizes (see comment above
+        // upscale() call). Bilinear, not a high quality filter -- see
+        // resize_rgba_bilinear()'s own doc comment in tile.h.
+        upscale::log_info(
+            "HandleRender: model native output " + std::to_string(native_out.width) + "x" +
+            std::to_string(native_out.height) + " != output world " + std::to_string(out_target_w) + "x" +
+            std::to_string(out_target_h) + "; resampling (bilinear) to match.");
+        upscale::ImageRGBA8 resized;
+        upscale::resize_rgba_bilinear(native_out, resized, out_target_w, out_target_h);
+        rgba8_to_world(resized, output);
+    }
+
     return err;
 }
 

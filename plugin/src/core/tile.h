@@ -98,6 +98,26 @@ struct TileSizingParams {
     size_t memory_budget_bytes = 0;      // 0 => auto (see choose_tile_size())
 };
 
+// Resamples `in` to an arbitrary (out_w, out_h) using bilinear
+// interpolation over all 4 channels (RGB and alpha alike). NOT a high
+// quality resampling filter (no Lanczos/sinc, just bilinear) -- adequate
+// for the common case this exists to serve: adapting the super-resolution
+// model's native-scale output to whatever exact output-buffer size the AE/
+// Premiere host actually allocated (see plugin/src/plugin/AIUpscale.cpp
+// HandleRender), which does not always equal input-size * requested-scale
+// (a real-Premiere-hardware render failure was traced to exactly that
+// mismatched assumption). If `in` and the requested size already match,
+// callers should skip calling this entirely (it still works correctly if
+// called anyway -- it's a plain identity copy in that case -- but the
+// caller-side check avoids the resample cost). `out` is resized to
+// (out_w, out_h) x 4 channels regardless of `in`'s size; out_w/out_h must
+// be positive (undefined-but-harmless -- results in a 0-pixel image -- if
+// not, since this function does no throwing size-limit validation itself;
+// callers that accept host/external sizes must validate with
+// safe_buffer_bytes() before calling, same as any other allocation in this
+// codebase -- see size_limits.h).
+void resize_rgba_bilinear(const ImageRGBA8& in, ImageRGBA8& out, int out_w, int out_h);
+
 // Picks a default tile edge length (pixels, input space) sized for the
 // target machine's memory budget. This is a heuristic estimate, not an
 // exact accounting of onnxruntime's internal activation memory -- it

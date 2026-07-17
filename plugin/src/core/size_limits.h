@@ -28,8 +28,19 @@ constexpr int64_t kMaxInputDim = 8192;    // input width/height, per side
 constexpr int64_t kMaxOutputDim = 32768;  // output width/height, per side (safety valve; UHD 4x = 15360 fits easily)
 
 // Total output pixel count limit. UHD (3840x2160) at 4x = 15360x8640 =
-// 132,710,400 pixels, so this is set comfortably above that.
-constexpr int64_t kMaxOutputPixels = 200'000'000LL;
+// 132,710,400 pixels. Set to 256 MiPixels (268,435,456), roughly a 2x
+// safety margin above that -- raised from the previous 200,000,000 after a
+// real-Premiere-hardware render failure (PF_Err_INTERNAL_STRUCT_DAMAGED /
+// 512, "output pixel count 641204224 exceeds safety limit of
+// 200000000") surfaced this limit as too tight for legitimate UHD 4x
+// workloads once host/plugin frame-size handling (see
+// plugin/src/plugin/AIUpscale.cpp HandleRender/HandleFrameSetup) was made
+// to trust the host's actual buffer sizes instead of an assumed
+// input*scale relationship. This margin is deliberately generous rather
+// than exactly 132,710,400 so that legitimate non-UHD-4x combinations
+// (e.g. a host handing back a slightly larger-than-expected buffer due to
+// rounding/alignment) aren't rejected at the boundary.
+constexpr int64_t kMaxOutputPixels = 268'435'456LL; // 256 * 1024 * 1024
 
 // Single-buffer byte size limit (applies to any one contiguous allocation
 // such as an output RGBA8 image or an NCHW float tensor). UHD 4x RGBA8 is

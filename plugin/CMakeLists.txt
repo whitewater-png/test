@@ -191,6 +191,24 @@ if(ONNXRUNTIME_SHARED_LIBS)
 endif()
 
 # ---------------------------------------------------------------------------
+# test_resample (upscale_core unit test, Linux/CI-runnable)
+#
+# Standalone smoke test for upscale::resize_rgba_bilinear() (src/core/tile.cpp),
+# added alongside the fix that makes HandleRender (src/plugin/AIUpscale.cpp)
+# resample the model's native-scale output to whatever exact size the AE/
+# Premiere host actually allocated for the output world, instead of assuming
+# output size == input size * scale. upscale_core has no Adobe SDK
+# dependency, so this is buildable/runnable on this Linux dev environment
+# without AE_SDK_PATH -- see tests/test_resample.cpp.
+# ---------------------------------------------------------------------------
+enable_testing()
+add_executable(test_resample
+    tests/test_resample.cpp
+)
+target_link_libraries(test_resample PRIVATE upscale_core)
+add_test(NAME test_resample COMMAND test_resample)
+
+# ---------------------------------------------------------------------------
 # AIUpscale (Adobe After Effects / Premiere Pro plugin)
 # ---------------------------------------------------------------------------
 if(DEFINED AE_SDK_PATH AND NOT "${AE_SDK_PATH}" STREQUAL "")

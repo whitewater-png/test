@@ -212,6 +212,51 @@ void upscale_tiled(const ImageRGBA8& input,
     }
 }
 
+void resize_rgba_bilinear(const ImageRGBA8& in, ImageRGBA8& out, int out_w, int out_h) {
+    if (out_w <= 0 || out_h <= 0) {
+        out.resize(std::max(0, out_w), std::max(0, out_h));
+        return;
+    }
+    if (in.width <= 0 || in.height <= 0) {
+        out.resize(out_w, out_h); // zero-filled by ImageRGBA8::resize()
+        return;
+    }
+    if (in.width == out_w && in.height == out_h) {
+        out = in; // identity: exact size match, no resample needed
+        return;
+    }
+
+    out.resize(out_w, out_h);
+    const float sx = static_cast<float>(in.width) / out_w;
+    const float sy = static_cast<float>(in.height) / out_h;
+    for (int y = 0; y < out_h; ++y) {
+        float fy = (y + 0.5f) * sy - 0.5f;
+        fy = std::clamp(fy, 0.0f, static_cast<float>(in.height - 1));
+        const int y0 = static_cast<int>(fy);
+        const int y1 = std::min(y0 + 1, in.height - 1);
+        const float wy = fy - y0;
+        for (int x = 0; x < out_w; ++x) {
+            float fx = (x + 0.5f) * sx - 0.5f;
+            fx = std::clamp(fx, 0.0f, static_cast<float>(in.width - 1));
+            const int x0 = static_cast<int>(fx);
+            const int x1 = std::min(x0 + 1, in.width - 1);
+            const float wx = fx - x0;
+
+            const size_t i00 = (static_cast<size_t>(y0) * in.width + x0) * 4;
+            const size_t i10 = (static_cast<size_t>(y0) * in.width + x1) * 4;
+            const size_t i01 = (static_cast<size_t>(y1) * in.width + x0) * 4;
+            const size_t i11 = (static_cast<size_t>(y1) * in.width + x1) * 4;
+            const size_t dst = (static_cast<size_t>(y) * out_w + x) * 4;
+            for (int c = 0; c < 4; ++c) {
+                const float top = in.pixels[i00 + c] * (1 - wx) + in.pixels[i10 + c] * wx;
+                const float bot = in.pixels[i01 + c] * (1 - wx) + in.pixels[i11 + c] * wx;
+                const float v = top * (1 - wy) + bot * wy;
+                out.pixels[dst + c] = static_cast<uint8_t>(std::lround(std::clamp(v, 0.0f, 255.0f)));
+            }
+        }
+    }
+}
+
 int choose_tile_size(const TileSizingParams& params) {
     static const int kCandidates[] = {768, 512, 384, 256, 192, 128, 64};
     const int preferred_default = params.accelerated ? 512 : 256;
