@@ -22,6 +22,8 @@
 #include "AIUpscale.h"
 
 #include <algorithm>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <new>
@@ -35,6 +37,25 @@ namespace {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// The AE SDK's PF_STRCPY/PF_SPRINTF macros (AE_EffectCB.h) expand to code
+// that implicitly references a variable named `in_data` in the caller's
+// scope (e.g. `(*in_data->utils->ansi.strcpy)(...)`), which breaks in any
+// function that doesn't happen to have an in_data parameter with that exact
+// name (see ensure_model_loaded() below). PF_SPRINTF is also effectively an
+// unbounded sprintf into out_data->return_msg (char[PF_MAX_EFFECT_MSG_LEN +
+// 1]). To avoid depending on a spelling-sensitive macro and to get a
+// length-bounded, NUL-terminated write, every return_msg assignment in this
+// file goes through this helper instead.
+#if defined(__GNUC__) || defined(__clang__)
+void set_return_msg(PF_OutData* out_data, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
+#endif
+void set_return_msg(PF_OutData* out_data, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(out_data->return_msg, sizeof(out_data->return_msg), fmt, args);
+    va_end(args);
+}
 
 int scale_choice_to_factor(PF_ParamDef* params[]) {
     const A_long choice = params[AI_UPSCALE_SCALE_POPUP]->u.pd.value;
@@ -168,7 +189,7 @@ void rgba8_to_world(const upscale::ImageRGBA8& img, PF_EffectWorld* world) {
 // ---------------------------------------------------------------------------
 
 PF_Err HandleAbout(PF_InData* in_data, PF_OutData* out_data) {
-    PF_SPRINTF(out_data->return_msg,
+    set_return_msg(out_data,
         "%s v%d.%d\r%s\rAI super-resolution upscaling (Real-ESRGAN via ONNX Runtime).",
         AI_UPSCALE_NAME, AI_UPSCALE_MAJOR_VERSION, AI_UPSCALE_MINOR_VERSION, AI_UPSCALE_DESCRIPTION);
     return PF_Err_NONE;
@@ -307,7 +328,7 @@ PF_Err ensure_model_loaded(AIUpscaleSequenceData* seq, A_long mode_choice, PF_Ou
     if (model_path.empty()) {
         // model_path_for() already logged the specific reason (missing /
         // path-traversal / symlink-escape).
-        PF_STRCPY(out_data->return_msg,
+        set_return_msg(out_data,
                   "AI Upscale: model file not found or invalid. Reinstall models/ next to the plugin.");
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
@@ -316,12 +337,12 @@ PF_Err ensure_model_loaded(AIUpscaleSequenceData* seq, A_long mode_choice, PF_Ou
         seq->upscaler->load(model_path, upscale::ExecutionProvider::kAuto);
         seq->loaded_mode_choice = mode_choice;
         if (seq->upscaler->fell_back_to_cpu()) {
-            PF_STRCPY(out_data->return_msg,
+            set_return_msg(out_data,
                       "AI Upscale: accelerated execution provider unavailable; running on CPU (slower). See log.");
         }
     } catch (const upscale::OnnxUpscalerError& ex) {
         upscale::log_error(std::string("ensure_model_loaded: failed to load '") + model_path + "': " + ex.what());
-        PF_SPRINTF(out_data->return_msg, "AI Upscale: failed to load model (%s).", ex.what());
+        set_return_msg(out_data, "AI Upscale: failed to load model (%s).", ex.what());
         return PF_Err_INTERNAL_STRUCT_DAMAGED; // best available generic PF_Err for "bad model file"
     }
     return PF_Err_NONE;
@@ -344,7 +365,7 @@ PF_Err HandleFrameSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* p
                                     static_cast<int64_t>(in_data->height) * scale, 4, 1);
     } catch (const upscale::SizeLimitError& ex) {
         upscale::log_error(std::string("HandleFrameSetup: rejecting frame size: ") + ex.what());
-        PF_SPRINTF(out_data->return_msg, "AI Upscale: unsupported frame size (%s).", ex.what());
+        set_return_msg(out_data, "AI Upscale: unsupported frame size (%s).", ex.what());
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
 
@@ -370,13 +391,13 @@ PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* param
     // depths via in_data->appl_id / PF_WORLD_IS_DEEP(output)-style checks
     // depending on SDK version; bail out cleanly if not 8bpc.
     if (PF_WORLD_IS_DEEP(output)) {
-        PF_STRCPY(out_data->return_msg, "AI Upscale currently supports 8bpc footage only.");
+        set_return_msg(out_data, "AI Upscale currently supports 8bpc footage only.");
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
 
     AIUpscaleSequenceData* seq = get_sequence_data(in_data);
     if (!seq) {
-        PF_STRCPY(out_data->return_msg, "AI Upscale: internal error (missing sequence data).");
+        set_return_msg(out_data, "AI Upscale: internal error (missing sequence data).");
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
 
@@ -392,7 +413,7 @@ PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* param
     // that assumption (see plugin/README.md "セキュリティ").
     if (!input_world || !input_world->data || input_world->width <= 0 || input_world->height <= 0) {
         upscale::log_error("HandleRender: rejecting null/empty input world");
-        PF_STRCPY(out_data->return_msg, "AI Upscale: invalid or empty input frame.");
+        set_return_msg(out_data, "AI Upscale: invalid or empty input frame.");
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
 
@@ -400,7 +421,7 @@ PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* param
         upscale::validate_input_dims(input_world->width, input_world->height, 4);
     } catch (const upscale::SizeLimitError& ex) {
         upscale::log_error(std::string("HandleRender: rejecting input world size: ") + ex.what());
-        PF_SPRINTF(out_data->return_msg, "AI Upscale: unsupported frame size (%s).", ex.what());
+        set_return_msg(out_data, "AI Upscale: unsupported frame size (%s).", ex.what());
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
 
@@ -420,11 +441,11 @@ PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* param
         seq->upscaler->upscale(in_img, out_img, scale, tile_opts);
     } catch (const upscale::OnnxUpscalerError& ex) {
         upscale::log_error(std::string("HandleRender: upscale failed: ") + ex.what());
-        PF_SPRINTF(out_data->return_msg, "AI Upscale: render failed (%s).", ex.what());
+        set_return_msg(out_data, "AI Upscale: render failed (%s).", ex.what());
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     } catch (const upscale::SizeLimitError& ex) {
         upscale::log_error(std::string("HandleRender: upscale rejected by size limit: ") + ex.what());
-        PF_SPRINTF(out_data->return_msg, "AI Upscale: frame too large (%s).", ex.what());
+        set_return_msg(out_data, "AI Upscale: frame too large (%s).", ex.what());
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
 
@@ -491,7 +512,7 @@ PF_Err EffectMain(
         upscale::log_error(std::string("EffectMain: uncaught exception for cmd=") + std::to_string(static_cast<int>(cmd)) +
                             ": " + ex.what());
         if (out_data) {
-            PF_SPRINTF(out_data->return_msg, "AI Upscale: internal error (%s).", ex.what());
+            set_return_msg(out_data, "AI Upscale: internal error (%s).", ex.what());
         }
         err = PF_Err_INTERNAL_STRUCT_DAMAGED;
     } catch (...) {
@@ -500,7 +521,7 @@ PF_Err EffectMain(
         // the plugin boundary; report a generic internal error instead.
         upscale::log_error("EffectMain: uncaught non-std::exception for cmd=" + std::to_string(static_cast<int>(cmd)));
         if (out_data) {
-            PF_STRCPY(out_data->return_msg, "AI Upscale: unknown internal error.");
+            set_return_msg(out_data, "AI Upscale: unknown internal error.");
         }
         err = PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
