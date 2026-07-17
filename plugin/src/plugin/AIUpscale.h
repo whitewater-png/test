@@ -27,9 +27,13 @@
 #include "AE_EffectCBSuites.h"
 #include "String_Utils.h"
 #include "AE_GeneralPlug.h"
-#include "AEFX_ChannelDepthTpl.h"
-#include "AEGP_SuiteHandler.h"
-#include "PrSDKAESupport.h" // Premiere Pro interop (BGRA_8u world assumptions, PiPL AE_Effect kind)
+#include "AEGP_SuiteHandler.h" // AEGP_SuiteHandler(in_data->pica_basicP) -> HandleSuite1() used for sequence-data handle ops
+// NOTE: AEFX_ChannelDepthTpl.h and PrSDKAESupport.h were previously included
+// here but are unused -- this plugin is 8bpc-only (see README "known
+// limitations") and never invokes the ChannelDepth iteration macros
+// (which require PF_TABLE_BITS to be defined by the includer) or the
+// Premiere-specific interop helpers. Dropped rather than defining
+// PF_TABLE_BITS to placate an include we don't need.
 
 #ifdef AE_OS_WIN
     #include <Windows.h>
@@ -101,12 +105,11 @@ struct AIUpscaleSequenceData {
 
     // The Adobe-independent inference engine. Heap-allocated behind a
     // unique_ptr so this struct stays POD-ish/handle-friendly; AE/Premiere
-    // sequence data is a flat handle, so in the real implementation this
-    // pointer must be stored via suites->HandleSuite1()->host_new_handle()
-    // and the OnnxUpscaler constructed with placement-new (or, more
-    // simply, heap-allocate AIUpscaleSequenceData itself via new/delete
-    // and store only the raw pointer in the PF_Handle -- the approach
-    // taken here). See AIUpscale.cpp SequenceSetup/SequenceSetdown.
+    // sequence data is a flat PF_Handle, so this struct is heap-allocated
+    // via plain new/delete and only the raw AIUpscaleSequenceData* is
+    // stored inside a small (sizeof(void*)) PF_Handle obtained from
+    // AEGP_SuiteHandler(in_data->pica_basicP).HandleSuite1(). See
+    // AIUpscale.cpp HandleSequenceSetup/HandleSequenceSetdown.
     std::unique_ptr<upscale::OnnxUpscaler> upscaler;
 
     std::string plugin_dir; // resolved once, used to find models/

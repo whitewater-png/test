@@ -218,53 +218,72 @@ PF_Err HandleParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* 
 PF_Err HandleSequenceSetup(PF_InData* in_data, PF_OutData* out_data) {
     PF_Err err = PF_Err_NONE;
 
+    // PF_InData has no "in_data" member -- in_data IS the PF_InData*, so
+    // members are accessed directly (in_data->pica_basicP etc.), not via a
+    // nonexistent in_data->in_data. pica_basicP is an SPBasicSuite*, which
+    // is only an AcquireSuite/ReleaseSuite bridge -- it has no
+    // new_handle/lock_handle/etc. members itself. The correct AE SDK way
+    // to get handle-manipulation functions is to acquire AEGP_HandleSuite1
+    // via AEGP_SuiteHandler (declared in AEGP_SuiteHandler.h, included by
+    // AIUpscale.h), which wraps AcquireSuite/ReleaseSuite for the common
+    // suites and can throw on a missing suite -- safe here because we're
+    // inside EffectMain's try/catch boundary.
+    AEGP_SuiteHandler suites(in_data->pica_basicP);
+
     // Allocate our sequence data on the heap and stash the raw pointer in
     // a PF_Handle. This mirrors the pattern used by AE SDK samples that
     // need non-flat (C++ object) sequence data -- e.g. wrapping the
     // pointer in a small fixed-size handle rather than trying to make
     // AIUpscaleSequenceData itself relocatable, since it owns a
     // unique_ptr<OnnxUpscaler>.
-    PF_Handle seq_handle = in_data->in_data.pica_basicP->new_handle(sizeof(AIUpscaleSequenceData*));
+    PF_Handle seq_handle = suites.HandleSuite1()->host_new_handle(sizeof(AIUpscaleSequenceData*));
     if (!seq_handle) {
         return PF_Err_OUT_OF_MEMORY;
     }
 
     auto** stored_ptr = reinterpret_cast<AIUpscaleSequenceData**>(
-        in_data->in_data.pica_basicP->lock_handle(seq_handle));
+        suites.HandleSuite1()->host_lock_handle(seq_handle));
     *stored_ptr = new (std::nothrow) AIUpscaleSequenceData();
     if (!*stored_ptr) {
-        in_data->in_data.pica_basicP->unlock_handle(seq_handle);
-        in_data->in_data.pica_basicP->dispose_handle(seq_handle);
+        suites.HandleSuite1()->host_unlock_handle(seq_handle);
+        suites.HandleSuite1()->host_dispose_handle(seq_handle);
         return PF_Err_OUT_OF_MEMORY;
     }
     (*stored_ptr)->plugin_dir = resolve_plugin_directory();
-    in_data->in_data.pica_basicP->unlock_handle(seq_handle);
+    suites.HandleSuite1()->host_unlock_handle(seq_handle);
 
+    // AE SDK convention: PF_Cmd_SEQUENCE_SETUP (and _RESETUP) hand the new
+    // sequence data back to the host via out_data->sequence_data; the host
+    // stores it and passes it back on subsequent calls as
+    // in_data->sequence_data (an in-only field on PF_InData -- there is no
+    // corresponding settable field on PF_InData itself).
     out_data->sequence_data = seq_handle;
     return err;
 }
 
 PF_Err HandleSequenceSetdown(PF_InData* in_data, PF_OutData* out_data) {
-    if (in_data->in_data.sequence_data) {
+    if (in_data->sequence_data) {
+        AEGP_SuiteHandler suites(in_data->pica_basicP);
         auto** stored_ptr = reinterpret_cast<AIUpscaleSequenceData**>(
-            in_data->in_data.pica_basicP->lock_handle(in_data->in_data.sequence_data));
+            suites.HandleSuite1()->host_lock_handle(in_data->sequence_data));
         if (stored_ptr && *stored_ptr) {
             delete *stored_ptr;
             *stored_ptr = nullptr;
         }
-        in_data->in_data.pica_basicP->unlock_handle(in_data->in_data.sequence_data);
-        in_data->in_data.pica_basicP->dispose_handle(in_data->in_data.sequence_data);
+        suites.HandleSuite1()->host_unlock_handle(in_data->sequence_data);
+        suites.HandleSuite1()->host_dispose_handle(in_data->sequence_data);
     }
     out_data->sequence_data = nullptr;
     return PF_Err_NONE;
 }
 
 AIUpscaleSequenceData* get_sequence_data(PF_InData* in_data) {
-    if (!in_data->in_data.sequence_data) return nullptr;
+    if (!in_data->sequence_data) return nullptr;
+    AEGP_SuiteHandler suites(in_data->pica_basicP);
     auto** stored_ptr = reinterpret_cast<AIUpscaleSequenceData**>(
-        in_data->in_data.pica_basicP->lock_handle(in_data->in_data.sequence_data));
+        suites.HandleSuite1()->host_lock_handle(in_data->sequence_data));
     AIUpscaleSequenceData* seq = stored_ptr ? *stored_ptr : nullptr;
-    in_data->in_data.pica_basicP->unlock_handle(in_data->in_data.sequence_data);
+    suites.HandleSuite1()->host_unlock_handle(in_data->sequence_data);
     return seq;
 }
 
