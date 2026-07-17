@@ -338,6 +338,49 @@ ${sdk_path}/Examples/Headers/SDK/AE_Effect.h
     find "${sdk_path}" -maxdepth 8 -name 'AE_Effect.h' -print -quit 2>/dev/null || true
 }
 
+# find_ae_effect_header() が返す絶対パスは、探索の起点として渡した
+# ae_sdk_path_result (例: ダウンロードzipのトップディレクトリ ~/AdobeSDK) の
+# 直下ではなく、実際にはさらにネストしたディレクトリ (例:
+# ~/AdobeSDK/AfterEffectsSDK_25.6_61_mac/ae25.6_61.64bit.AfterEffectsSDK/)
+# 配下に見つかることがある。CMakeLists.txt側は
+# ${AE_SDK_PATH}/Examples/Headers/... という固定相対パスでヘッダを探すため、
+# ae_sdk_path_result をそのまま -DAE_SDK_PATH として渡すと (このケースのように)
+# AEConfig.h 等が見つからずビルドが失敗する。
+#
+# そこで、見つかったヘッダの絶対パスから「SDK実体のルート」(そこを起点に
+# Examples/Headers/AE_Effect.h が実在するディレクトリ) を逆算する。
+# find_ae_effect_header() が返し得るパスの形は次の2通り (固定候補ヒット時)、
+# もしくはそれ以外の深さ (findによるフォールバック探索時) があるため、
+# パス末尾のパターンで判定し、文字列除去で実体ルートを得る。
+# 結果はグローバル変数 ae_sdk_effective_root_result にセットする。
+ae_sdk_effective_root_result=""
+
+derive_ae_sdk_effective_root() {
+    local header_found="$1"
+    ae_sdk_effective_root_result=""
+
+    case "${header_found}" in
+        */Examples/Headers/SDK/AE_Effect.h)
+            ae_sdk_effective_root_result="${header_found%/Examples/Headers/SDK/AE_Effect.h}"
+            ;;
+        */Examples/Headers/AE_Effect.h)
+            ae_sdk_effective_root_result="${header_found%/Examples/Headers/AE_Effect.h}"
+            ;;
+        *)
+            # findによるフォールバック探索でヒットした場合など、上記2パターン
+            # に一致しない深さで見つかることがある。この場合は
+            # 「.../Examples/Headers/AE_Effect.h」という一般的なSDKレイアウトを
+            # 前提に、ヘッダファイルから3階層上 (AE_Effect.h -> Headers ->
+            # Examples -> 実体ルート) をベストエフォートで採用する。
+            local d
+            d="$(dirname "${header_found}")"   # .../Examples/Headers (or deeper nest)
+            d="$(dirname "${d}")"               # .../Examples
+            d="$(dirname "${d}")"               # 実体ルート (ベストエフォート)
+            ae_sdk_effective_root_result="${d}"
+            ;;
+    esac
+}
+
 # ダウンロードしたAdobe SDK zipの中身が二重圧縮アーカイブ
 # (*.tar.zstd.zip) のまま未展開の状態で提供されるケースに対応する。
 # $1: 本体アーカイブ (*.tar.zstd.zip) の絶対パス
@@ -445,6 +488,19 @@ step3_ae_sdk() {
         exit 1
     fi
     log_ok "AE_Effect.h を確認しました: ${header_found}"
+
+    # ae_sdk_path_result (検出/指定されたSDKディレクトリ) がSDK実体のルートと
+    # 一致するとは限らない (ダウンロードzipのトップディレクトリがそのまま
+    # AE_SDK_PATHになっているケースでは、実体はさらに1〜2階層ネストした場所に
+    # ある)。CMakeLists.txt は ${AE_SDK_PATH}/Examples/Headers/... という
+    # 固定相対パスでヘッダを探すため、cmakeに渡すAE_SDK_PATHはヘッダから逆算
+    # した実体ルートでなければならない。
+    derive_ae_sdk_effective_root "${header_found}"
+    if [ "${ae_sdk_effective_root_result}" != "${ae_sdk_path_result}" ]; then
+        log_warn "AE_SDK_PATH (${ae_sdk_path_result}) はSDK実体のルートと異なります。"
+        log_warn "cmakeへは実体ルートを渡します: ${ae_sdk_effective_root_result}"
+    fi
+    log_ok "SDK実体ルート (cmakeの -DAE_SDK_PATH に使用): ${ae_sdk_effective_root_result}"
 }
 
 # ---------------------------------------------------------------------------
@@ -456,13 +512,13 @@ step4_build() {
     local ncpu
     ncpu="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 
-    log_info "cmake configure: -DONNXRUNTIME_ROOT=${brew_prefix_cache} -DONNXRUNTIME_INCLUDE_DIR=${onnxruntime_include_dir_result} -DAE_SDK_PATH=${ae_sdk_path_result}"
+    log_info "cmake configure: -DONNXRUNTIME_ROOT=${brew_prefix_cache} -DONNXRUNTIME_INCLUDE_DIR=${onnxruntime_include_dir_result} -DAE_SDK_PATH=${ae_sdk_effective_root_result}"
     cmake -S "${PLUGIN_DIR}" -B "${BUILD_DIR}" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_OSX_ARCHITECTURES=arm64 \
         -DONNXRUNTIME_ROOT="${brew_prefix_cache}" \
         -DONNXRUNTIME_INCLUDE_DIR="${onnxruntime_include_dir_result}" \
-        -DAE_SDK_PATH="${ae_sdk_path_result}"
+        -DAE_SDK_PATH="${ae_sdk_effective_root_result}"
 
     log_info "cmake --build (並列度 ${ncpu})"
     cmake --build "${BUILD_DIR}" --config Release -j"${ncpu}"

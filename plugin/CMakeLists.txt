@@ -193,7 +193,94 @@ endif()
 # ---------------------------------------------------------------------------
 # AIUpscale (Adobe After Effects / Premiere Pro plugin)
 # ---------------------------------------------------------------------------
-if(DEFINED AE_SDK_PATH)
+if(DEFINED AE_SDK_PATH AND NOT "${AE_SDK_PATH}" STREQUAL "")
+    # ---------------------------------------------------------------------
+    # Resolve the *effective* SDK root under AE_SDK_PATH.
+    #
+    # AE_SDK_PATH, as detected/supplied by plugin/setup_mac.sh or passed
+    # manually by a user, may point either directly at the SDK root
+    # (containing Examples/Headers/AEConfig.h etc.) or at a top-level
+    # directory that nests the actual SDK one or more levels deeper -- e.g.
+    # Adobe's distribution zip for AE 25.6 unpacks to
+    #   <AE_SDK_PATH>/AfterEffectsSDK_25.6_61_mac/ae25.6_61.64bit.AfterEffectsSDK/Examples/Headers/...
+    # rather than <AE_SDK_PATH>/Examples/Headers/... directly. Blindly using
+    # AE_SDK_PATH as the include root in that case fails to find AEConfig.h
+    # even though the SDK is present and fully extracted.
+    #
+    # This resolution runs unconditionally (not gated on WIN32/APPLE) so it
+    # is exercised and verifiable on any platform, including Linux CI, even
+    # though the AIUpscale target itself is only added on Windows/macOS
+    # below. This is a safety net for users invoking cmake directly with
+    # -DAE_SDK_PATH=... instead of via plugin/setup_mac.sh (which already
+    # derives and passes the effective root itself).
+    set(AE_SDK_EFFECTIVE_ROOT "")
+
+    if(EXISTS "${AE_SDK_PATH}/Examples/Headers/AEConfig.h")
+        set(AE_SDK_EFFECTIVE_ROOT "${AE_SDK_PATH}")
+    else()
+        file(GLOB_RECURSE AE_SDK_CONFIG_HEADER_MATCHES "${AE_SDK_PATH}/AEConfig.h")
+        list(LENGTH AE_SDK_CONFIG_HEADER_MATCHES AE_SDK_CONFIG_HEADER_MATCH_COUNT)
+        if(AE_SDK_CONFIG_HEADER_MATCH_COUNT GREATER 0)
+            list(GET AE_SDK_CONFIG_HEADER_MATCHES 0 AE_SDK_CONFIG_HEADER_FOUND)
+            message(STATUS "AEConfig.h not found directly under ${AE_SDK_PATH}/Examples/Headers; "
+                "located it via recursive search: ${AE_SDK_CONFIG_HEADER_FOUND}")
+
+            # AE_SDK_CONFIG_HEADER_FOUND looks like
+            # <root>/Examples/Headers/AEConfig.h in the common layout, or
+            # <root>/Examples/Headers/SDK/AEConfig.h in some SDK versions.
+            # Walk up from the header's directory: if it's named "Headers",
+            # its grandparent is <root>; if it's nested one level deeper
+            # (e.g. "SDK"), its great-grandparent is <root>. Any other
+            # nesting falls back to a best-effort 3-levels-up guess matching
+            # the common <root>/Examples/Headers/AEConfig.h shape.
+            get_filename_component(AE_SDK_HEADER_DIR "${AE_SDK_CONFIG_HEADER_FOUND}" DIRECTORY)
+            get_filename_component(AE_SDK_HEADER_DIR_NAME "${AE_SDK_HEADER_DIR}" NAME)
+            if(AE_SDK_HEADER_DIR_NAME STREQUAL "Headers")
+                get_filename_component(AE_SDK_EXAMPLES_DIR "${AE_SDK_HEADER_DIR}" DIRECTORY)
+                get_filename_component(AE_SDK_EFFECTIVE_ROOT "${AE_SDK_EXAMPLES_DIR}" DIRECTORY)
+            else()
+                get_filename_component(AE_SDK_HEADERS_DIR "${AE_SDK_HEADER_DIR}" DIRECTORY)
+                get_filename_component(AE_SDK_EXAMPLES_DIR "${AE_SDK_HEADERS_DIR}" DIRECTORY)
+                get_filename_component(AE_SDK_EFFECTIVE_ROOT "${AE_SDK_EXAMPLES_DIR}" DIRECTORY)
+            endif()
+        endif()
+    endif()
+
+    if("${AE_SDK_EFFECTIVE_ROOT}" STREQUAL "")
+        message(FATAL_ERROR
+            "AE_SDK_PATH was set to '${AE_SDK_PATH}' but AEConfig.h could not be "
+            "located anywhere under it (checked ${AE_SDK_PATH}/Examples/Headers/AEConfig.h "
+            "directly, then searched recursively under ${AE_SDK_PATH}). Verify the "
+            "Adobe SDK zip was fully extracted (see plugin/README.md and the SDK's "
+            "own README-HowToBuild-*.txt) and that AE_SDK_PATH points at the SDK's "
+            "top-level directory, or a directory containing it.")
+    endif()
+
+    if(NOT "${AE_SDK_EFFECTIVE_ROOT}" STREQUAL "${AE_SDK_PATH}")
+        message(STATUS "AE_SDK_PATH (${AE_SDK_PATH}) is not itself the SDK root; "
+            "using derived effective root instead: ${AE_SDK_EFFECTIVE_ROOT}")
+    endif()
+    message(STATUS "AE SDK effective root: ${AE_SDK_EFFECTIVE_ROOT}")
+
+    # AE SDK sample plugins conventionally pull headers from
+    # Examples/Headers (and, in some SDK versions, nested Examples/Headers/SDK
+    # or Examples/Headers/SP subdirectories), Examples/Util, and
+    # Examples/Resources (for the .r PiPL). Only add subdirectories that
+    # actually exist in this SDK layout.
+    set(AE_SDK_INCLUDE_DIRS "")
+    foreach(_ae_sdk_subdir
+        Examples/Headers
+        Examples/Headers/SDK
+        Examples/Headers/SP
+        Examples/Util
+        Examples/Resources
+    )
+        if(EXISTS "${AE_SDK_EFFECTIVE_ROOT}/${_ae_sdk_subdir}")
+            list(APPEND AE_SDK_INCLUDE_DIRS "${AE_SDK_EFFECTIVE_ROOT}/${_ae_sdk_subdir}")
+        endif()
+    endforeach()
+    message(STATUS "AE SDK include directories: ${AE_SDK_INCLUDE_DIRS}")
+
     if(WIN32 OR APPLE)
         message(STATUS "AE_SDK_PATH set (${AE_SDK_PATH}); configuring AIUpscale plugin target.")
 
@@ -201,14 +288,8 @@ if(DEFINED AE_SDK_PATH)
             src/plugin/AIUpscale.cpp
         )
 
-        # AE SDK sample plugins conventionally pull headers from
-        # Examples/Headers, Examples/Util, and Examples/Resources (for the
-        # .r PiPL). Adjust these subpaths if a different SDK layout is used.
         target_include_directories(AIUpscale PRIVATE
-            ${AE_SDK_PATH}/Examples/Headers
-            ${AE_SDK_PATH}/Examples/Headers/SP
-            ${AE_SDK_PATH}/Examples/Util
-            ${AE_SDK_PATH}/Examples/Resources
+            ${AE_SDK_INCLUDE_DIRS}
             ${ONNXRUNTIME_INCLUDE_DIR}
         )
         target_link_libraries(AIUpscale PRIVATE upscale_core Threads::Threads)
