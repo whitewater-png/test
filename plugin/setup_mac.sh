@@ -318,6 +318,86 @@ find_ae_sdk() {
     return 1
 }
 
+# AE_Effect.h の探索。SDKバージョンによりパスが多少異なるため固定候補を
+# 先にチェックし、見つからなければfindでフォールバック探索する。
+# 展開後はネスト階層が深くなる可能性があるため maxdepth は8とする。
+# 見つかったパスをechoで返す (見つからない場合は空文字)。
+find_ae_effect_header() {
+    local sdk_path="$1"
+    local header_candidates="
+${sdk_path}/Examples/Headers/AE_Effect.h
+${sdk_path}/Examples/Headers/SDK/AE_Effect.h
+"
+    local h
+    for h in ${header_candidates}; do
+        if [ -f "${h}" ]; then
+            echo "${h}"
+            return 0
+        fi
+    done
+    find "${sdk_path}" -maxdepth 8 -name 'AE_Effect.h' -print -quit 2>/dev/null || true
+}
+
+# ダウンロードしたAdobe SDK zipの中身が二重圧縮アーカイブ
+# (*.tar.zstd.zip) のまま未展開の状態で提供されるケースに対応する。
+# $1: 本体アーカイブ (*.tar.zstd.zip) の絶対パス
+# アーカイブと同じディレクトリ内に展開する。中間ファイル(.tar)は
+# 展開成功後に削除するが、元の .tar.zstd.zip は残す。
+extract_ae_sdk_archive() {
+    local archive="$1"
+    local archive_dir
+    archive_dir="$(cd "$(dirname "${archive}")" && pwd)"
+    local archive_base
+    archive_base="$(basename "${archive}")"
+    local tar_zstd_name="${archive_base%.zip}"
+    local tar_name="${tar_zstd_name%.zstd}"
+
+    log_info "unzip -o ${archive_base} (${archive_dir})"
+    ( cd "${archive_dir}" && unzip -o "${archive_base}" >/dev/null )
+
+    if [ ! -f "${archive_dir}/${tar_zstd_name}" ]; then
+        log_error "unzip後に ${tar_zstd_name} が見つかりません。zipの内容が想定と異なる可能性があります。"
+        return 1
+    fi
+
+    # zstd実行コマンドの決定: PATH上のzstd -> SDK同梱の./zstd -> brew install zstd
+    local zstd_cmd=""
+    if command -v zstd >/dev/null 2>&1; then
+        zstd_cmd="zstd"
+    elif [ -f "${archive_dir}/zstd" ]; then
+        chmod +x "${archive_dir}/zstd" || true
+        xattr -d com.apple.quarantine "${archive_dir}/zstd" 2>/dev/null || true
+        if "${archive_dir}/zstd" --version >/dev/null 2>&1; then
+            zstd_cmd="${archive_dir}/zstd"
+        fi
+    fi
+    if [ -z "${zstd_cmd}" ]; then
+        log_warn "zstdコマンドが見つからないため brew install zstd を実行します..."
+        brew install zstd
+        if command -v zstd >/dev/null 2>&1; then
+            zstd_cmd="zstd"
+        fi
+    fi
+    if [ -z "${zstd_cmd}" ]; then
+        log_error "zstdコマンドが利用できません。展開を中止します。"
+        return 1
+    fi
+
+    log_info "${zstd_cmd} -d -f ${tar_zstd_name}"
+    ( cd "${archive_dir}" && "${zstd_cmd}" -d -f "${tar_zstd_name}" )
+
+    if [ ! -f "${archive_dir}/${tar_name}" ]; then
+        log_error "zstd展開後に ${tar_name} が見つかりません。"
+        return 1
+    fi
+
+    log_info "tar -xf ${tar_name} (${archive_dir})"
+    ( cd "${archive_dir}" && tar -xf "${tar_name}" )
+    rm -f "${archive_dir}/${tar_name}"
+    log_ok "SDKアーカイブを展開しました: ${archive_dir}"
+    return 0
+}
+
 step3_ae_sdk() {
     log_step 3 "Adobe After Effects SDK検出"
 
@@ -339,27 +419,29 @@ step3_ae_sdk() {
     fi
 
     # ヘッダの存在検証 (SDKバージョンによりパスが多少異なるため複数箇所を探索)
-    local header_candidates="
-${ae_sdk_path_result}/Examples/Headers/AE_Effect.h
-${ae_sdk_path_result}/Examples/Headers/SDK/AE_Effect.h
-"
     local header_found=""
-    local h
-    for h in ${header_candidates}; do
-        if [ -f "${h}" ]; then
-            header_found="${h}"
-            break
-        fi
-    done
-    # 上記の固定候補で見つからない場合はfindでフォールバック探索
+    header_found="$(find_ae_effect_header "${ae_sdk_path_result}")"
+
+    # ヘッダが見つからない場合、Adobe配布zip特有の未展開状態
+    # (*.tar.zstd.zip / extractzstd.sh / zstd / README-HowToBuild-Mac.txt が
+    # 展開されないまま置かれている状態) の可能性があるため、本体アーカイブを
+    # 探索し、見つかれば自動展開を試みてから再度ヘッダを探索する。
     if [ -z "${header_found}" ]; then
-        header_found="$(find "${ae_sdk_path_result}" -maxdepth 6 -name 'AE_Effect.h' -print -quit 2>/dev/null || true)"
+        local sdk_archive
+        sdk_archive="$(find "${ae_sdk_path_result}" -maxdepth 3 -name '*.tar.zstd.zip' -print -quit 2>/dev/null || true)"
+        if [ -n "${sdk_archive}" ]; then
+            log_warn "SDKが未展開のため自動展開します: ${sdk_archive}"
+            if extract_ae_sdk_archive "${sdk_archive}"; then
+                header_found="$(find_ae_effect_header "${ae_sdk_path_result}")"
+            fi
+        fi
     fi
 
     if [ -z "${header_found}" ]; then
         log_error "SDKディレクトリ (${ae_sdk_path_result}) 内に AE_Effect.h が見つかりません。"
         log_error "SDKの展開が不完全か、想定と異なるバージョン/レイアウトの可能性があります。"
         log_error "plugin/README.md の「前提条件」節を参照し、正しいSDKを再ダウンロードしてください。"
+        log_error "SDK内の README-HowToBuild-Mac.txt の手順で手動展開してから再実行してください。"
         exit 1
     fi
     log_ok "AE_Effect.h を確認しました: ${header_found}"
