@@ -114,6 +114,28 @@ python3 plugin/tests/check_png_size.py /tmp/out.png --expect 256 256
   --tile 128 --jobs 4
 ```
 
+### 単体テスト（開発者向け、既定では無効）
+
+`test_resample` / `test_tile_output_scale` / `test_concurrency_gate` /
+`test_onnx_upscaler_sharing` の4つの単体テスト（および
+`test_onnx_upscaler_sharing` 用のテストモデル生成
+`generate_test_model_4x`）は既定のビルドには含まれません
+（`AIUPSCALE_BUILD_TESTS` オプションが既定でOFF）。これは、エンドユーザー
+向けの `setup_mac.sh` のビルド（onnx未導入が前提）がテストモデル生成の
+Pythonスクリプト（`onnx` パッケージが必要）に失敗してビルド全体が止まる
+のを防ぐためです。テストを有効にしてビルド・実行する場合は
+`-DAIUPSCALE_BUILD_TESTS=ON` を明示的に指定してください。
+
+```bash
+pip3 install onnx numpy   # test_onnx_upscaler_sharing のモデル生成に必要
+cmake -S plugin -B plugin/build \
+  -DONNXRUNTIME_ROOT=/path/to/onnxruntime-linux-x64-<version> \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DAIUPSCALE_BUILD_TESTS=ON
+cmake --build plugin/build -j
+ctest --test-dir plugin/build --output-on-failure
+```
+
 ### Windows (.aex, AE SDKあり)
 
 ```powershell

@@ -192,6 +192,31 @@ if(ONNXRUNTIME_SHARED_LIBS)
 endif()
 
 # ---------------------------------------------------------------------------
+# Unit tests (opt-in, OFF by default).
+#
+# AIUPSCALE_BUILD_TESTS gates all of test_resample, test_tile_output_scale,
+# test_concurrency_gate, and test_onnx_upscaler_sharing (plus the latter's
+# generate_test_model_4x test-model-generation step) behind a single switch,
+# left OFF by default so a plain `cmake --build .` -- e.g. the one driven by
+# plugin/setup_mac.sh for end users installing the plugin -- builds only
+# upscale_core, upscale_cli, and (when AE_SDK_PATH is set) AIUpscale.
+#
+# Without this guard, generate_test_model_4x's custom command ran
+# unconditionally at build time via a system `python3` that, on a fresh
+# end-user machine, typically lacks the `onnx` pip package. That made the
+# *entire* build (including AIUpscale, which had already built successfully)
+# fail with `ModuleNotFoundError: No module named 'onnx'` before the
+# user-facing install step ever ran, even though onnx is only ever needed to
+# regenerate a fixture for one developer-facing unit test.
+#
+# Developers who want to build and run the tests should configure with
+# -DAIUPSCALE_BUILD_TESTS=ON (see plugin/README.md).
+# ---------------------------------------------------------------------------
+option(AIUPSCALE_BUILD_TESTS "Build unit tests (test_resample, test_tile_output_scale, test_concurrency_gate, test_onnx_upscaler_sharing)" OFF)
+
+if(AIUPSCALE_BUILD_TESTS)
+
+# ---------------------------------------------------------------------------
 # test_resample (upscale_core unit test, Linux/CI-runnable)
 #
 # Standalone smoke test for upscale::resize_rgba_bilinear() (src/core/tile.cpp),
@@ -260,6 +285,13 @@ add_test(NAME test_concurrency_gate COMMAND test_concurrency_gate)
 # available, the generated model file won't exist and the test itself
 # detects that at runtime and skips (exits 0) rather than failing the
 # build or ctest run over a missing optional dev dependency.
+#
+# generate_test_model_4x is intentionally NOT added to the default ALL
+# target (add_custom_target with no ALL keyword): it is only ever pulled in
+# as a build dependency of test_onnx_upscaler_sharing itself, below. This
+# whole block is also only reached when AIUPSCALE_BUILD_TESTS=ON, so on a
+# default configure/build neither the model generation nor this test is
+# built at all.
 # ---------------------------------------------------------------------------
 find_program(PYTHON3_EXECUTABLE NAMES python3)
 set(TEST_MODEL_4X_PATH "${CMAKE_CURRENT_BINARY_DIR}/test_model_4x.onnx")
@@ -286,6 +318,8 @@ if(PYTHON3_EXECUTABLE)
     add_dependencies(test_onnx_upscaler_sharing generate_test_model_4x)
 endif()
 add_test(NAME test_onnx_upscaler_sharing COMMAND test_onnx_upscaler_sharing)
+
+endif() # AIUPSCALE_BUILD_TESTS
 
 # ---------------------------------------------------------------------------
 # AIUpscale (Adobe After Effects / Premiere Pro plugin)
