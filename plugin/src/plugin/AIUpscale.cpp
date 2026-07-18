@@ -7,18 +7,33 @@
 // one handler per command) so it should need at most small adjustments
 // once built against the real SDK headers.
 //
-// Buffer-expansion caveat (also in README.md): PF_Cmd_FRAME_SETUP below
-// grows out_data->width/height by the requested scale, the same mechanism
-// AE blur-type effects use to grow their output rect. This is the
-// standard AE pattern; Premiere Pro's support for resizing effects'
-// output this way is more limited and MUST be verified on a real
-// Premiere install before shipping (some Premiere effect hosts clip or
-// ignore output world resizing that doesn't come from a small connected
-// set of "resize"-capable effect types). If Premiere does not honor the
-// resize, the practical workaround is to keep the output world at input
-// size and letter/pillar-box or require the user to apply an explicit
-// "Scale" transform after this effect -- left as a TODO pending real
-// hardware/software testing.
+// Buffer-expansion RETRACTED (third real-Premiere-hardware render-failure
+// fix; see README.md "既知の制約" for the user-facing writeup): earlier
+// revisions of this file had PF_Cmd_FRAME_SETUP grow out_data->width/height
+// by the requested scale via PF_OutFlag_I_EXPAND_BUFFER, the same mechanism
+// AE blur-type effects use to grow their output rect. Real Premiere Pro
+// hardware logs proved this actively harmful rather than merely
+// unsupported: Premiere handed HandleRender an input world (params[...]->
+// u.ld) that was ALREADY larger than the layer's nominal full-res size
+// (e.g. input_world=4892x8192 against in_data(full-res)=3840x2160) --
+// i.e. Premiere had already grown the buffer once in response to the
+// expansion request from a previous pass -- and then this plugin's model
+// applied its OWN native 4x on top of that already-expanded input,
+// producing a 19568x32768 (641,204,224px) intermediate that blew through
+// every size-safety margin (see size_limits.h) and crashed the render
+// with PF_Err_INTERNAL_STRUCT_DAMAGED (512). Since a standard AE/Premiere
+// filter effect cannot legitimately hand a higher-resolution buffer
+// downstream to a later Transform/Motion scale in the effects chain (host
+// constraint, not a bug in this plugin), and I_EXPAND_BUFFER does not
+// behave reliably here, this effect now ALWAYS keeps the output world at
+// input size and works as a same-resolution AI detail-regeneration /
+// sharpening filter instead: apply it, then scale up afterward (Transform/
+// Motion) for a punched-in look -- the AI-regenerated detail holds up
+// better under that later scale than plain bilinear/bicubic interpolation
+// of the untouched source would. See README.md for the full user-facing
+// workflow writeup, including the honest caveat that this does NOT
+// increase the layer's actual pixel resolution, and the alternative
+// upscale_cli-based pre-processing workflow for users who need that.
 #include "AIUpscale.h"
 
 #include <algorithm>
@@ -292,22 +307,21 @@ struct RenderDiagCache {
 };
 RenderDiagCache g_render_diag_cache;
 
-// Classifies whether the host honored the FRAME_SETUP buffer-expansion
-// request: "expanded" (output world == input world * scale, the ideal
-// I_EXPAND_BUFFER-respecting case that lets a later Transform/Motion scale
-// in the host's effects chain sample from a genuinely higher-resolution
-// buffer), "not-expanded" (output world == input world, the graceful
-// fallback / detail-regeneration-only case), or "custom" (anything else --
-// e.g. a host-imposed size unrelated to either, which is the shape of
-// mismatch that produced the field-reported render failure this fix
-// targets). Single word by design so it's easy to grep/scan in
-// AIUpscale.log across a user's next report.
-const char* classify_expand_status(int64_t in_w, int64_t in_h, int64_t out_w, int64_t out_h, int scale) {
-    if (out_w == in_w * scale && out_h == in_h * scale) {
-        return "expanded";
-    }
+// Classifies the input/output world size relationship now that
+// PF_OutFlag_I_EXPAND_BUFFER has been retracted (see the file-header
+// comment): "detail-regen" is the expected/healthy case (output world ==
+// input world -- this effect never asks the host to grow the buffer
+// anymore), "custom" is anything else (e.g. a host-imposed tile/band size
+// difference some hosts use internally), which HandleRender already
+// handles correctly via its own resample-to-match-output-world-size step
+// below but which is still worth surfacing in the log as a distinct case.
+// Single word by design so it's easy to grep/scan in AIUpscale.log across a
+// user's next report. (This used to also classify an "expanded" case for
+// the retracted I_EXPAND_BUFFER behavior; that case is no longer possible
+// since HandleFrameSetup never requests expansion.)
+const char* classify_expand_status(int64_t in_w, int64_t in_h, int64_t out_w, int64_t out_h, int /*scale*/) {
     if (out_w == in_w && out_h == in_h) {
-        return "not-expanded";
+        return "detail-regen";
     }
     return "custom";
 }
@@ -389,9 +403,10 @@ static_assert(PF_OutFlag_NON_PARAM_VARY == (1L << 2),
 static_assert(PF_OutFlag_DISPLAY_ERROR_MESSAGE == (1L << 8),
               "PF_OutFlag_DISPLAY_ERROR_MESSAGE bit position changed -- update AIUpscalePiPL.r's "
               "AE_Effect_Global_OutFlags to match out_data->out_flags");
-static_assert(PF_OutFlag_I_EXPAND_BUFFER == (1L << 9),
-              "PF_OutFlag_I_EXPAND_BUFFER bit position changed -- update AIUpscalePiPL.r's "
-              "AE_Effect_Global_OutFlags to match out_data->out_flags");
+// PF_OutFlag_I_EXPAND_BUFFER is intentionally NOT set on out_data->out_flags
+// (see the buffer-expansion-retraction comment at the top of this file) and
+// so has no static_assert here -- there is nothing on the PiPL side left to
+// keep numerically in sync for it.
 
 PF_Err HandleAbout(PF_InData* in_data, PF_OutData* out_data) {
     set_return_msg(out_data,
@@ -409,12 +424,19 @@ PF_Err HandleGlobalSetup(PF_InData* in_data, PF_OutData* out_data) {
     // now (see README "known limitations"). PF_OutFlag_SEQUENCE_DATA_NEEDS_FLATTENING
     // omitted since our sequence data is not persisted to project files.
     //
-    // PF_OutFlag_I_EXPAND_BUFFER: REQUIRED, and previously missing -- this
-    // is the flag that authorizes HandleFrameSetup() (PF_Cmd_FRAME_SETUP,
-    // below) to grow out_data->width/height beyond the input size. Without
-    // declaring it, a host is entitled to treat that resize as invalid
-    // plugin behavior, which is consistent with the real-hardware
-    // PF_Err_INTERNAL_STRUCT_DAMAGED (512) reported at render time.
+    // PF_OutFlag_I_EXPAND_BUFFER: DELIBERATELY NOT SET (retracted -- see
+    // the large comment at the top of this file). It used to be declared
+    // here to authorize HandleFrameSetup() growing out_data->width/height
+    // beyond the input size, on the theory that a missing declaration was
+    // the cause of a real-hardware PF_Err_INTERNAL_STRUCT_DAMAGED (512).
+    // That theory was wrong: real Premiere Pro hardware logs from a
+    // subsequent attempt (with the flag correctly declared) showed
+    // Premiere DID honor/propagate the expansion request across passes,
+    // compounding with this plugin's own native upscale into a
+    // 641,204,224px intermediate that blew every size safety margin. This
+    // effect now always keeps the output world at input size (same-
+    // resolution AI detail regeneration), so there is no expansion left to
+    // authorize.
     // PF_OutFlag_DISPLAY_ERROR_MESSAGE: makes the host actually surface
     // out_data->return_msg (set via set_return_msg() throughout this file)
     // in its error dialog instead of silently swallowing it -- added so
@@ -423,7 +445,7 @@ PF_Err HandleGlobalSetup(PF_InData* in_data, PF_OutData* out_data) {
     // NUMERIC MATCH REQUIRED WITH AIUpscalePiPL.r's AE_Effect_Global_OutFlags:
     // see the static_asserts above HandleAbout() and AIUpscalePiPL.r's own
     // comment -- update BOTH sides together if this expression changes.
-    out_data->out_flags = PF_OutFlag_NON_PARAM_VARY | PF_OutFlag_I_EXPAND_BUFFER | PF_OutFlag_DISPLAY_ERROR_MESSAGE;
+    out_data->out_flags = PF_OutFlag_NON_PARAM_VARY | PF_OutFlag_DISPLAY_ERROR_MESSAGE;
     out_data->out_flags2 = PF_OutFlag2_FLOAT_COLOR_AWARE * 0 | PF_OutFlag2_SUPPORTS_SMART_RENDER * 0;
     // NOTE: SmartFX/SmartRender support is a documented roadmap item (see
     // README) -- left disabled here since it requires a larger rewrite
@@ -669,8 +691,6 @@ PF_Err HandleFrameSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* p
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
 
-    const int scale = scale_choice_to_factor(params);
-
     // Validate the input size the host reports before computing anything
     // downstream of it -- catches a corrupt/hostile in_data->width or
     // height before any buffer-sized computation happens.
@@ -682,61 +702,18 @@ PF_Err HandleFrameSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* p
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
 
-    // Effective (downsample-adjusted) input pixel dimensions -- the actual
-    // pixel size of the world the host will render/allocate for THIS pass
-    // at the current render quality/downsample setting. downsample_x/y is
-    // a PF_RationalScale (num/den, AE SDK convention; 1/1 at Full quality,
-    // e.g. 1/2 at Half) on PF_InData. in_data->width/height, by contrast,
-    // are always the FULL-resolution layer dimensions regardless of
-    // downsample -- which is why out_data->width/height below is still
-    // computed from in_data->width/height directly (the documented AE
-    // convention for I_EXPAND_BUFFER-style effects: expanded output size is
-    // declared in full-res coordinates, same as the SDK's own resizer-style
-    // samples). The effective size is used ONLY for the size-limit check
-    // below, since that check needs to reason about the pixel count the
-    // host will actually end up allocating/rendering, not the nominal
-    // full-res layer size.
-    int64_t effective_w = in_data->width;
-    int64_t effective_h = in_data->height;
-    if (in_data->downsample_x.num > 0 && in_data->downsample_x.den > 0) {
-        effective_w = (effective_w * in_data->downsample_x.num) / in_data->downsample_x.den;
-    }
-    if (in_data->downsample_y.num > 0 && in_data->downsample_y.den > 0) {
-        effective_h = (effective_h * in_data->downsample_y.num) / in_data->downsample_y.den;
-    }
-    if (effective_w <= 0) effective_w = in_data->width;
-    if (effective_h <= 0) effective_h = in_data->height;
-
-    // Buffer-expansion pattern (see file-header caveat re: Premiere
-    // support): grow the output world to input-size * scale and keep the
-    // origin at (0,0) since this effect doesn't reposition content -- but
-    // only when the expanded size stays within the safety limits (see
-    // size_limits.h). If the expanded size would be rejected later anyway
-    // (e.g. an unusually large source combined with 4x), degrade
-    // gracefully to a same-size "detail regeneration" pass instead of
-    // failing the whole render: HandleRender always writes into whatever
-    // size the host actually allocated for `output`, so this is a safe
-    // fallback rather than a correctness issue (see HandleRender).
-    bool expand = true;
-    try {
-        upscale::safe_buffer_bytes(effective_w * scale, effective_h * scale, 4, 1);
-    } catch (const upscale::SizeLimitError& ex) {
-        upscale::log_warn(
-            "HandleFrameSetup: requested " + std::to_string(scale) + "x expansion of effective size " +
-            std::to_string(effective_w) + "x" + std::to_string(effective_h) +
-            " would exceed safety limits (" + ex.what() +
-            "); keeping output at input size and relying on detail-regeneration-only mode for this frame "
-            "instead of failing the render.");
-        expand = false;
-    }
-
-    if (expand) {
-        out_data->width = in_data->width * scale;
-        out_data->height = in_data->height * scale;
-    } else {
-        out_data->width = in_data->width;
-        out_data->height = in_data->height;
-    }
+    // Output world stays at input size (see the buffer-expansion-retraction
+    // comment at the top of this file): this effect no longer requests
+    // PF_OutFlag_I_EXPAND_BUFFER, so out_data->width/height/origin must
+    // simply describe "same size, no reposition" -- growing them here would
+    // be inconsistent with the flags declared in HandleGlobalSetup() and is
+    // exactly the host/plugin disagreement that caused the real-hardware
+    // render failure this fix targets. The "Scale" param no longer changes
+    // the output buffer's size; HandleRender uses it to control how much
+    // internal AI detail-regeneration strength is applied while writing
+    // back to this same-size buffer.
+    out_data->width = in_data->width;
+    out_data->height = in_data->height;
     out_data->origin.h = 0;
     out_data->origin.v = 0;
 
@@ -768,6 +745,12 @@ PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* param
     err = ensure_model_loaded(seq, mode_choice, out_data);
     if (err) return err;
 
+    // `scale` (2x/4x from the "Scale" UI popup) no longer selects an output
+    // buffer size (see file-header comment) -- kept here only for the
+    // diagnostic log below and as a TODO hook for a future detail-
+    // regeneration-strength knob; it does not change what gets requested
+    // from seq->upscaler->upscale() further down (always requested_scale=1,
+    // same resolution).
     const int scale = scale_choice_to_factor(params);
     PF_EffectWorld* input_world = &params[AI_UPSCALE_INPUT]->u.ld;
 
@@ -795,12 +778,16 @@ PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* param
         set_return_msg(out_data, "AI Upscale: unsupported frame size (%s).", ex.what());
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
-    // Output world size, in contrast, can legitimately be much larger than
-    // input (up to UHD 4x and a safety margin beyond -- see size_limits.h),
-    // so it's checked with the output-oriented safe_buffer_bytes() rather
-    // than the input-oriented (8192px/side) validate_input_dims(). This
-    // also guards the allocation resize_rgba_bilinear() below would
-    // otherwise perform against a corrupt/hostile output->width/height.
+    // Output world size is expected to equal input world size now that
+    // PF_OutFlag_I_EXPAND_BUFFER is retracted (see file-header comment),
+    // but is still checked independently with the output-oriented
+    // safe_buffer_bytes() (rather than assuming it matches input) in case
+    // a host hands back a different size for its own internal reasons
+    // (tiling/banding) -- see the resample-to-match step below, which
+    // handles that case gracefully instead of assuming a fixed
+    // input/output relationship. This also guards the allocation
+    // resize_rgba_bilinear() below would otherwise perform against a
+    // corrupt/hostile output->width/height.
     try {
         upscale::safe_buffer_bytes(output->width, output->height, 4, 1);
     } catch (const upscale::SizeLimitError& ex) {
@@ -826,21 +813,29 @@ PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* param
     // "use what's available" here.
     tile_opts.num_workers = 0;
 
-    // Always take the model's NATIVE-scale result here (requested_scale <=
-    // 0 short-circuits OnnxUpscaler::upscale()'s internal box-downsample
-    // step and returns the raw model output) rather than asking the core
-    // to reconcile with the UI's "Scale" popup or with any assumption
-    // about input*scale. The exact output size the host actually allocated
-    // (output->width/height) is reconciled separately below via a
-    // dedicated resample step. This decouples "what the model produces"
-    // from "what size buffer the host handed us", which is the core of
-    // this fix -- see file-header comment and size_limits.h for the field
-    // failure this targets (a real Premiere host handing HandleRender an
-    // input/output world size relationship that didn't match what
-    // HandleFrameSetup assumed).
-    upscale::ImageRGBA8 native_out;
+    // Request SAME-RESOLUTION output (requested_scale=1) rather than the
+    // model's raw native-scale result: this is the core of the buffer-
+    // expansion retraction (see file-header comment). Passing 1 here tells
+    // OnnxUpscaler::upscale() to set TileOptions::output_scale=1 (see
+    // tile.h/tile.cpp and onnx_upscaler.cpp), which downsizes EACH TILE's
+    // native-scale (typically 4x) result back down immediately after
+    // inference, before compositing -- so at no point does a buffer sized
+    // input_world*4 for the WHOLE frame ever get allocated, regardless of
+    // how large input_world is (this is what let a host-handed input world
+    // far bigger than the nominal source resolution -- e.g.
+    // 4892x8192 -- blow up to a 641,204,224px intermediate and crash the
+    // render in the previous, non-tiled-downsize version of this fix).
+    // Peak memory per tile job is bounded to (tile_size*native_scale)^2,
+    // not (input_world*native_scale)^2.
+    //
+    // The "Scale" UI popup (2x/4x) no longer controls output buffer size
+    // (there's only one output size now: input_world's own size) -- it's
+    // reserved for a future internal detail-regeneration-strength knob
+    // (TODO, see README.md); both choices currently take the same
+    // same-resolution code path here.
+    upscale::ImageRGBA8 same_res_out;
     try {
-        seq->upscaler->upscale(in_img, native_out, /*requested_scale=*/0, tile_opts);
+        seq->upscaler->upscale(in_img, same_res_out, /*requested_scale=*/1, tile_opts);
     } catch (const upscale::OnnxUpscalerError& ex) {
         upscale::log_error(std::string("HandleRender: upscale failed: ") + ex.what());
         set_return_msg(out_data, "AI Upscale: render failed (%s).", ex.what());
@@ -854,28 +849,26 @@ PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* param
     const int out_target_w = static_cast<int>(output->width);
     const int out_target_h = static_cast<int>(output->height);
 
-    if (native_out.width == out_target_w && native_out.height == out_target_h) {
-        // Common case when the host honored FRAME_SETUP's expansion
-        // request (or when scale==native model scale and the host left the
-        // buffer at input size in "detail regeneration" fallback mode):
-        // sizes already match exactly, nothing to resample.
-        rgba8_to_world(native_out, output);
+    if (same_res_out.width == out_target_w && same_res_out.height == out_target_h) {
+        // Expected case: same_res_out is input_world-sized (requested_scale
+        // =1), and output world is also input_world-sized now that
+        // I_EXPAND_BUFFER is retracted -- sizes already match, nothing to
+        // resample.
+        rgba8_to_world(same_res_out, output);
     } else {
-        // Sizes differ -- either the requested "Scale" (2x) is smaller
-        // than the model's native scale (typically 4x) and needs stepping
-        // down, or the host's output world doesn't match input*scale for
-        // some other reason (downsample, host-specific buffer sizing,
-        // etc.). Either way, resample the model's native output to
-        // whatever size the host actually gave us instead of assuming a
-        // relationship between input and output sizes (see comment above
-        // upscale() call). Bilinear, not a high quality filter -- see
-        // resize_rgba_bilinear()'s own doc comment in tile.h.
+        // Sizes differ -- the host handed a different output world size
+        // than input_world for some reason of its own (tiling/banding,
+        // etc). Resample to whatever size the host actually gave us
+        // instead of assuming a fixed relationship. Bilinear, not a high
+        // quality filter -- see resize_rgba_bilinear()'s own doc comment
+        // in tile.h. This is now a rare fallback path, not the primary
+        // scale-reconciliation mechanism it used to be.
         upscale::log_info(
-            "HandleRender: model native output " + std::to_string(native_out.width) + "x" +
-            std::to_string(native_out.height) + " != output world " + std::to_string(out_target_w) + "x" +
+            "HandleRender: detail-regen output " + std::to_string(same_res_out.width) + "x" +
+            std::to_string(same_res_out.height) + " != output world " + std::to_string(out_target_w) + "x" +
             std::to_string(out_target_h) + "; resampling (bilinear) to match.");
         upscale::ImageRGBA8 resized;
-        upscale::resize_rgba_bilinear(native_out, resized, out_target_w, out_target_h);
+        upscale::resize_rgba_bilinear(same_res_out, resized, out_target_w, out_target_h);
         rgba8_to_world(resized, output);
     }
 

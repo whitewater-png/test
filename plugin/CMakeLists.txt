@@ -209,6 +209,23 @@ target_link_libraries(test_resample PRIVATE upscale_core)
 add_test(NAME test_resample COMMAND test_resample)
 
 # ---------------------------------------------------------------------------
+# test_tile_output_scale (upscale_core unit test, Linux/CI-runnable)
+#
+# Regression test for TileOptions::output_scale (src/core/tile.h/.cpp),
+# added while fixing the third real-Premiere-hardware render failure: a
+# host-handed input world far larger than the nominal source resolution
+# (4892x8192 vs 3840x2160) combined with this plugin's own native 4x model
+# upscale produced a 641,204,224px intermediate that blew every size safety
+# margin. See tests/test_tile_output_scale.cpp for the full scenario this
+# exercises, including the exact field-reported dimensions.
+# ---------------------------------------------------------------------------
+add_executable(test_tile_output_scale
+    tests/test_tile_output_scale.cpp
+)
+target_link_libraries(test_tile_output_scale PRIVATE upscale_core)
+add_test(NAME test_tile_output_scale COMMAND test_tile_output_scale)
+
+# ---------------------------------------------------------------------------
 # AIUpscale (Adobe After Effects / Premiere Pro plugin)
 # ---------------------------------------------------------------------------
 if(DEFINED AE_SDK_PATH AND NOT "${AE_SDK_PATH}" STREQUAL "")

@@ -84,27 +84,38 @@ resource 'PiPL' (16000) {
             // MUST stay numerically identical to the out_data->out_flags
             // bitmask HandleGlobalSetup() (AIUpscale.cpp) sets at
             // PF_Cmd_GLOBAL_SETUP -- update BOTH sides together whenever
-            // either changes, and see the three static_asserts directly
+            // either changes, and see the two static_asserts directly
             // above HandleAbout() in AIUpscale.cpp, which fail the build
             // if AE_Effect.h's real bit positions ever disagree with the
             // values assumed here (this repo's dev environment has no
             // real AE_Effect.h to check against directly):
             //   out_data->out_flags = PF_OutFlag_NON_PARAM_VARY
-            //                        | PF_OutFlag_I_EXPAND_BUFFER
             //                        | PF_OutFlag_DISPLAY_ERROR_MESSAGE;
             // Per AE_Effect.h's PF_OutFlag enum (bit position):
             //   PF_OutFlag_NON_PARAM_VARY      = 1L << 2 = 0x00000004
             //   PF_OutFlag_DISPLAY_ERROR_MESSAGE = 1L << 8 = 0x00000100
-            //   PF_OutFlag_I_EXPAND_BUFFER     = 1L << 9 = 0x00000200
-            //   combined = 0x004 | 0x100 | 0x200 = 0x00000304 (772)
-            // PF_OutFlag_I_EXPAND_BUFFER was previously missing here (and
-            // in out_data->out_flags) even though PF_Cmd_FRAME_SETUP
-            // grows out_data->width/height -- this is believed to be a
-            // contributing cause of the real-hardware
-            // PF_Err_INTERNAL_STRUCT_DAMAGED (512) reported at render
-            // time. PF_OutFlag_DISPLAY_ERROR_MESSAGE was added so the
-            // host actually shows out_data->return_msg in its error UI.
-            0x00000304
+            //   combined = 0x004 | 0x100 = 0x00000104 (260)
+            // PF_OutFlag_I_EXPAND_BUFFER (0x00000200) was tried here in a
+            // previous revision of this fix -- both here and in
+            // out_data->out_flags -- to authorize PF_Cmd_FRAME_SETUP
+            // growing out_data->width/height for an AI-upscaled (larger)
+            // output. Real Premiere Pro hardware logs proved this
+            // unreliable rather than merely unsupported: with the flag
+            // declared, Premiere handed HandleRender an input world
+            // (params[...]->u.ld) that was ALREADY larger than the
+            // layer's nominal full-resolution size, and this plugin's own
+            // native model upscale on top of THAT produced a
+            // 641,204,224px intermediate that blew through every size
+            // safety margin and crashed the render with
+            // PF_Err_INTERNAL_STRUCT_DAMAGED (512). I_EXPAND_BUFFER is
+            // retracted entirely as of this revision -- see the
+            // file-header comment in AIUpscale.cpp and plugin/README.md's
+            // "既知の制約" for the full writeup, including why a
+            // same-resolution AI detail-regeneration filter is this
+            // effect's only robust mode against real Premiere hosts.
+            // PF_OutFlag_DISPLAY_ERROR_MESSAGE was added so the host
+            // actually shows out_data->return_msg in its error UI.
+            0x00000104
         },
 
         AE_Effect_Global_OutFlags_2 {

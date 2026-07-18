@@ -55,7 +55,34 @@ using TileUpscaleFn = std::function<void(const ImageRGBA8& tile_in, ImageRGBA8& 
 struct TileOptions {
     int tile_size = 256;   // edge length of each (square) input tile, in pixels
     int overlap = 16;      // overlap between adjacent tiles, in pixels
-    int scale = 4;         // output/input scale factor applied by upscale_fn
+    int scale = 4;         // output/input scale factor applied by upscale_fn (the model's native scale)
+
+    // Final blend-target scale, relative to `input`, i.e. the size
+    // `output` actually ends up (input.width*output_scale x
+    // input.height*output_scale) -- NOT necessarily equal to `scale`.
+    //
+    //   <= 0 (default) => output_scale defaults to `scale` (the original
+    //        behavior: output is the model-native-scale size, no
+    //        downsizing).
+    //   >  0 and != scale => each tile's model-native-scale result is
+    //        immediately resampled down to
+    //        (tile_w*output_scale x tile_h*output_scale) BEFORE it is
+    //        accumulated into the shared blend buffer, and the blend
+    //        buffer/final `output` are sized at input*output_scale rather
+    //        than input*scale.
+    //
+    // This exists so a caller that wants a same-resolution (or otherwise
+    // smaller-than-native) result never has to materialize a full-frame
+    // buffer at the model's native scale -- only one tile's native-scale
+    // result exists in memory at a time (freed as soon as it's resampled
+    // down and blended). This matters when `input` itself is already
+    // large (e.g. a host-provided buffer far bigger than the nominal
+    // source resolution): without this, upscale_tiled() would still try to
+    // allocate an `input.width*scale x input.height*scale` accumulation
+    // buffer even though tile *compute* is chunked, which is exactly the
+    // size-explosion failure this option was added to avoid -- see
+    // plugin/src/plugin/AIUpscale.cpp HandleRender / HandleFrameSetup.
+    int output_scale = -1;
 
     // Number of worker threads used to compute tiles concurrently.
     //   0 => auto: std::thread::hardware_concurrency(), capped to the
@@ -69,9 +96,12 @@ struct TileOptions {
 };
 
 // Runs `upscale_fn` over tiles of `input` and composites the results into
-// `output` (which is resized to input.width*scale x input.height*scale).
-// If the image is smaller than a single tile, this degenerates to a single
-// full-image call with no blending overhead.
+// `output` (which is resized to input.width*output_scale x
+// input.height*output_scale -- see TileOptions::output_scale; this equals
+// input.width*scale x input.height*scale when output_scale is left at its
+// default). If the image is smaller than a single tile, this degenerates to
+// a single full-image call (still followed by a resize-down when
+// output_scale != scale) with no blending overhead.
 //
 // Throws whatever upscale_fn throws (e.g. upscale::OnnxUpscalerError) --
 // if any worker's call to upscale_fn throws, all other in-flight/pending

@@ -53,10 +53,21 @@ void upscale_tiled(const ImageRGBA8& input,
                     const TileOptions& opts,
                     const TileUpscaleFn& upscale_fn) {
     const int scale = std::max(1, opts.scale);
-    const int64_t out_w64 = static_cast<int64_t>(input.width) * scale;
-    const int64_t out_h64 = static_cast<int64_t>(input.height) * scale;
+    // output_scale defaults to `scale` (original behavior: output ==
+    // input*scale, the model's native size). When explicitly set smaller
+    // than `scale`, the blend/accumulation buffer -- and every per-tile
+    // intermediate -- is sized off output_scale instead, so a full-frame
+    // buffer at the model's native scale is never allocated. See
+    // TileOptions::output_scale's doc comment in tile.h.
+    const int output_scale = opts.output_scale > 0 ? opts.output_scale : scale;
+    const bool needs_downsize = (output_scale != scale);
+
+    const int64_t out_w64 = static_cast<int64_t>(input.width) * output_scale;
+    const int64_t out_h64 = static_cast<int64_t>(input.height) * output_scale;
     // Validate the full output allocation up front (overflow/size-limit
-    // check) before touching any memory -- see limits.h.
+    // check) before touching any memory -- see limits.h. This is now sized
+    // off output_scale (the buffer we actually keep for the whole frame),
+    // not the model's native scale.
     safe_buffer_bytes(out_w64, out_h64, 4, 1);
     const int out_w = static_cast<int>(out_w64);
     const int out_h = static_cast<int>(out_h64);
@@ -65,7 +76,18 @@ void upscale_tiled(const ImageRGBA8& input,
     // Fast path: image fits in a single tile, skip blending/threading
     // entirely.
     if (input.width <= opts.tile_size && input.height <= opts.tile_size) {
-        upscale_fn(input, output);
+        if (!needs_downsize) {
+            upscale_fn(input, output);
+            return;
+        }
+        // Still only a single native-scale buffer alive at once (this
+        // function's `native_out` local, freed on return) -- fine even for
+        // a large `input`, since the whole point of output_scale is to
+        // avoid a FULL-FRAME native-scale buffer, and here input is by
+        // definition <= one tile.
+        ImageRGBA8 native_out;
+        upscale_fn(input, native_out);
+        resize_rgba_bilinear(native_out, output, out_w, out_h);
         return;
     }
 
@@ -131,7 +153,25 @@ void upscale_tiled(const ImageRGBA8& input,
                     uint8_t* dst_row = &tile_in.pixels[static_cast<size_t>(y) * job.tw * 4];
                     std::copy(src_row, src_row + static_cast<size_t>(job.tw) * 4, dst_row);
                 }
-                upscale_fn(tile_in, job.tile_out);
+                if (!needs_downsize) {
+                    upscale_fn(tile_in, job.tile_out);
+                } else {
+                    // Bound the per-tile native-scale intermediate too (see
+                    // limits.h) -- tile_size is normally chosen small enough
+                    // that tile*scale is nowhere near the limits, but this
+                    // guards against a caller-supplied oversized tile_size.
+                    // `tile_native` is scoped to this iteration only: it is
+                    // freed as soon as it's resampled down below, so peak
+                    // memory across the whole tiled run never includes more
+                    // than one tile's worth of native-scale data at a time,
+                    // regardless of how large `input` (the full frame) is.
+                    safe_buffer_bytes(static_cast<int64_t>(job.tw) * scale,
+                                       static_cast<int64_t>(job.th) * scale, 4, 1);
+                    ImageRGBA8 tile_native;
+                    upscale_fn(tile_in, tile_native);
+                    resize_rgba_bilinear(tile_native, job.tile_out,
+                                          job.tw * output_scale, job.th * output_scale);
+                }
             } catch (...) {
                 stop_flag.store(true, std::memory_order_relaxed);
                 std::lock_guard<std::mutex> lock(error_mutex);
@@ -169,15 +209,22 @@ void upscale_tiled(const ImageRGBA8& input,
     for (const TileJob& job : jobs) {
         const int tow = job.tile_out.width;
         const int toh = job.tile_out.height;
-        const int out_ox = job.tx * scale;
-        const int out_oy = job.ty * scale;
+        const int out_ox = job.tx * output_scale;
+        const int out_oy = job.ty * output_scale;
 
         for (int y = 0; y < toh; ++y) {
             const int oy = out_oy + y;
             if (oy >= out_h) break;
 
-            const int dist_top = job.ty > 0 ? y / scale : overlap;
-            const int dist_bottom = (job.ty + job.th) < input.height ? (job.th - 1 - y / scale) : overlap;
+            // Converts a position within job.tile_out (which is in
+            // output_scale space) back to an input-space distance from the
+            // tile's edge, for feathering purposes -- hence dividing by
+            // output_scale here, not `scale` (the model's native scale):
+            // job.tile_out's own pixel grid is output_scale-space
+            // regardless of what scale the model internally used to
+            // produce it.
+            const int dist_top = job.ty > 0 ? y / output_scale : overlap;
+            const int dist_bottom = (job.ty + job.th) < input.height ? (job.th - 1 - y / output_scale) : overlap;
             const float fy = std::min(feather_weight(dist_top, overlap),
                                        feather_weight(dist_bottom, overlap));
 
@@ -185,8 +232,8 @@ void upscale_tiled(const ImageRGBA8& input,
                 const int ox = out_ox + x;
                 if (ox >= out_w) break;
 
-                const int dist_left = job.tx > 0 ? x / scale : overlap;
-                const int dist_right = (job.tx + job.tw) < input.width ? (job.tw - 1 - x / scale) : overlap;
+                const int dist_left = job.tx > 0 ? x / output_scale : overlap;
+                const int dist_right = (job.tx + job.tw) < input.width ? (job.tw - 1 - x / output_scale) : overlap;
                 const float fx = std::min(feather_weight(dist_left, overlap),
                                            feather_weight(dist_right, overlap));
 

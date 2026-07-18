@@ -65,18 +65,30 @@ public:
     // shape/runtime error from onnxruntime).
     void infer(const ImageRGBA8& in, ImageRGBA8& out);
 
-    // Runs tiled inference (see tile.h) followed by, if necessary, a
-    // box/bilinear resample down to `requested_scale`. This is the
-    // primary entry point most callers (CLI, AE plugin) should use.
+    // Runs tiled inference (see tile.h), downsizing each tile immediately
+    // after inference to `requested_scale` when that's smaller than the
+    // model's native scale (via TileOptions::output_scale -- see tile.h),
+    // so a full-frame buffer at the model's native scale is never
+    // materialized. This is the primary entry point most callers (CLI, AE
+    // plugin) should use.
     //
-    // `requested_scale` is the scale the caller wants (2 or 4, typically).
-    // If the model's native scale is larger than requested_scale (e.g. a
-    // 4x model used for a 2x request), the 4x result is downsampled with a
-    // simple box/bilinear filter -- NOT a high quality Lanczos filter, see
-    // note in the .cpp -- to reach the requested size. If native scale is
-    // smaller than requested, we upscale to native scale and then use the
-    // model's own output as the base without further upsampling attempts
-    // (a mismatch here generally indicates the wrong model was loaded).
+    // `requested_scale` is the scale the caller wants:
+    //   - <= 0: use the model's native scale as-is (no downsizing).
+    //   - 1: same-resolution "detail regeneration" -- the model's
+    //     native-scale detail is generated per-tile and immediately
+    //     resampled back down to the tile's original size before
+    //     compositing (this is what the AE/Premiere plugin uses now --
+    //     see AIUpscale.cpp HandleRender -- since growing a layer's actual
+    //     output buffer via PF_OutFlag_I_EXPAND_BUFFER proved unreliable
+    //     on real Premiere Pro hosts).
+    //   - between 1 and native scale: downsized per-tile the same way.
+    //   - >= native scale: the native-scale result is used as-is; we do
+    //     not attempt a second inference pass (chaining SR passes tends to
+    //     amplify artifacts). Plugin-layer callers should pick a model
+    //     whose native scale matches the requested scale where possible.
+    // The per-tile downsize step uses resize_rgba_bilinear() (see tile.h)
+    // -- NOT a high quality Lanczos filter, but adequate for stepping down
+    // an already-upscaled tile.
     // If tile_opts.tile_size <= 0, a tile size is auto-selected via
     // choose_tile_size() based on the active execution provider and
     // input/output geometry (see tile.h). Otherwise tile_opts.tile_size is

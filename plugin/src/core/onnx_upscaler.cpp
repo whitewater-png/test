@@ -309,42 +309,16 @@ std::vector<uint8_t> resize_alpha_bilinear(const ImageRGBA8& img, int out_w, int
     return out;
 }
 
-// Box-filter downsample of a full RGBA8 image to an arbitrary smaller
-// size. Used to go from the model's native scale (e.g. 4x) down to a
-// smaller requested scale (e.g. 2x) when no matching model is available.
-// NOTE: this is a plain box/area filter, not a sharper Lanczos-style
-// filter -- acceptable quality for stepping down an already-upscaled
-// image, and keeps this core dependency-free (no separate resampling
-// library).
-void box_downsample(const ImageRGBA8& in, ImageRGBA8& out, int out_w, int out_h) {
-    out.resize(out_w, out_h);
-    const float sx = static_cast<float>(in.width) / out_w;
-    const float sy = static_cast<float>(in.height) / out_h;
-    for (int y = 0; y < out_h; ++y) {
-        const int y0 = static_cast<int>(y * sy);
-        const int y1 = std::max(y0 + 1, static_cast<int>((y + 1) * sy));
-        for (int x = 0; x < out_w; ++x) {
-            const int x0 = static_cast<int>(x * sx);
-            const int x1 = std::max(x0 + 1, static_cast<int>((x + 1) * sx));
-
-            std::array<float, 4> acc{0, 0, 0, 0};
-            int count = 0;
-            for (int yy = y0; yy < std::min(y1, in.height); ++yy) {
-                for (int xx = x0; xx < std::min(x1, in.width); ++xx) {
-                    const size_t src = (static_cast<size_t>(yy) * in.width + xx) * 4;
-                    for (int c = 0; c < 4; ++c) acc[c] += in.pixels[src + c];
-                    ++count;
-                }
-            }
-            const size_t dst = (static_cast<size_t>(y) * out_w + x) * 4;
-            for (int c = 0; c < 4; ++c) {
-                out.pixels[dst + c] = count > 0
-                    ? static_cast<uint8_t>(std::lround(acc[c] / count))
-                    : 0;
-            }
-        }
-    }
-}
+// NOTE: this file previously had a box_downsample() helper here that
+// stepped a full native-scale frame down to a smaller requested scale
+// after the fact. It's gone -- OnnxUpscaler::upscale() below now passes
+// the requested scale through to upscale_tiled() as TileOptions::
+// output_scale, which downsizes each tile immediately after inference
+// instead of ever materializing a full-frame native-scale buffer (see
+// tile.h/tile.cpp). This was required to fix a real-Premiere-hardware
+// render failure where the host handed HandleRender an input world far
+// larger than the nominal source resolution, making even a "just downsize
+// afterward" whole-frame native buffer too large to allocate.
 
 } // namespace
 
@@ -454,6 +428,18 @@ void OnnxUpscaler::upscale(const ImageRGBA8& in, ImageRGBA8& out, int requested_
 
     TileOptions opts = tile_opts;
     opts.scale = native_scale_;
+    // output_scale: if the caller asked for less than the model's native
+    // scale (e.g. a 2x request against a 4x model, or a same-resolution
+    // "detail regeneration" request where requested_scale == 1), tell
+    // upscale_tiled() to downsize EACH TILE immediately after inference
+    // rather than assembling a full-frame native-scale buffer and
+    // downsampling it afterward. This bounds peak memory to one tile's
+    // native-scale footprint regardless of how large `in` is -- see
+    // tile.h's TileOptions::output_scale doc comment. If requested_scale is
+    // <= 0 or >= native scale, output_scale falls back to native_scale_
+    // (the original no-downsize behavior).
+    const bool downsize_requested = (requested_scale > 0 && requested_scale < native_scale_);
+    opts.output_scale = downsize_requested ? requested_scale : native_scale_;
     if (opts.tile_size <= 0) {
         // Auto-select a tile size based on the active execution provider
         // and target geometry (see tile.h / choose_tile_size()).
@@ -469,13 +455,14 @@ void OnnxUpscaler::upscale(const ImageRGBA8& in, ImageRGBA8& out, int requested_
 
     // Overall output-size safety check up front (also re-checked inside
     // upscale_tiled(), but doing it here gives a clearer error before any
-    // tiling work starts).
-    safe_buffer_bytes(static_cast<int64_t>(in.width) * native_scale_,
-                       static_cast<int64_t>(in.height) * native_scale_, 4, 1);
+    // tiling work starts). Sized off output_scale -- the size we actually
+    // keep for the whole frame -- not the model's native scale.
+    safe_buffer_bytes(static_cast<int64_t>(in.width) * opts.output_scale,
+                       static_cast<int64_t>(in.height) * opts.output_scale, 4, 1);
 
-    ImageRGBA8 native_out;
+    ImageRGBA8 result;
     auto run_tiled = [&](TileOptions attempt_opts) {
-        upscale_tiled(in, native_out, attempt_opts, [this](const ImageRGBA8& tile_in, ImageRGBA8& tile_out) {
+        upscale_tiled(in, result, attempt_opts, [this](const ImageRGBA8& tile_in, ImageRGBA8& tile_out) {
             infer(tile_in, tile_out);
         });
     };
@@ -502,27 +489,13 @@ void OnnxUpscaler::upscale(const ImageRGBA8& in, ImageRGBA8& out, int requested_
         }
     }
 
-    if (requested_scale <= 0 || requested_scale == native_scale_) {
-        out = std::move(native_out);
-        return;
-    }
-
-    if (requested_scale > native_scale_) {
-        // Caller asked for more than the model natively provides. We do
-        // not attempt a second inference pass (chaining SR passes tends
-        // to amplify artifacts); return the native-scale result as-is.
-        // Plugin-layer callers should pick a model whose native scale
-        // matches the requested scale where possible.
-        out = std::move(native_out);
-        return;
-    }
-
-    // requested_scale < native_scale_: downsample the native-scale result
-    // down to the requested size (see box_downsample() note re: filter
-    // quality tradeoff).
-    const int target_w = in.width * requested_scale;
-    const int target_h = in.height * requested_scale;
-    box_downsample(native_out, out, target_w, target_h);
+    // upscale_tiled() has already produced `result` at the requested
+    // output_scale (native scale if requested_scale was <=0 or larger than
+    // native, or downsized in-tile otherwise) -- see comment above. No
+    // further whole-frame resample step needed (box_downsample() is now
+    // unused for this path but kept below for any direct caller that still
+    // wants a one-shot non-tiled box-filter downsample).
+    out = std::move(result);
 }
 
 } // namespace upscale
