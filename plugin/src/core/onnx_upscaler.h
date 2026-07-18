@@ -58,6 +58,41 @@ public:
     void load(const std::string& model_path,
               ExecutionProvider provider_preference = ExecutionProvider::kAuto);
 
+    // Returns a shared OnnxUpscaler (and thus a shared Ort::Session) for
+    // `model_path`, loading and caching a new one if none is currently
+    // live for that exact path. Process-wide cache keyed on model_path.
+    //
+    // This exists to fix a real-Premiere-hardware freeze: the AE/Premiere
+    // plugin layer's per-sequence-data self-healing (see AIUpscale.cpp
+    // ensure_sequence_data()) can end up creating more than one
+    // AIUpscaleSequenceData for what is really the same render session
+    // (e.g. once per render thread that ever saw a null sequence_data).
+    // Each sequence data used to own its own OnnxUpscaler, which meant
+    // its own ~64MB CoreML/ANE session plus working memory -- multiple
+    // sessions all fighting over the ANE/GPU/CPU at once, on top of the
+    // thread-count problem ConcurrencyGate (concurrency.h) addresses.
+    // get_shared() instead hands every caller asking for the same
+    // model_path a shared_ptr to the SAME OnnxUpscaler/Ort::Session;
+    // Ort::Session::Run() is documented thread-safe, so multiple threads
+    // running inference against the shared session concurrently (still
+    // capped by ConcurrencyGate) is safe. The underlying instance is
+    // reference-counted: it is destroyed (and its session freed) once the
+    // last shared_ptr referencing it goes out of scope -- no explicit
+    // process-exit cleanup is required.
+    //
+    // Throws OnnxUpscalerError if the (new) load fails; on failure nothing
+    // is cached for `model_path`, so a later retry can succeed once the
+    // underlying problem (e.g. a temporarily locked file) is resolved.
+    static std::shared_ptr<OnnxUpscaler> get_shared(
+        const std::string& model_path,
+        ExecutionProvider provider_preference = ExecutionProvider::kAuto);
+
+    // Test-only: number of distinct model_path entries currently backed by
+    // a live (not-yet-destroyed) shared instance. Used to verify get_shared()
+    // actually dedupes concurrent/repeated requests for the same path
+    // instead of creating a new session each time.
+    static size_t shared_cache_size_for_testing();
+
     // Runs a single forward pass on `in` (no tiling) and writes the result
     // to `out`. The output size is determined by the model's native scale
     // factor (see native_scale()), NOT by any externally requested scale.
@@ -155,6 +190,25 @@ private:
     //     that serialization.
     std::mutex infer_mutex_;
     bool serialize_inference_ = false;
+
+    // Guards the native_scale_ probe (see probe_native_scale()) so that
+    // when a shared OnnxUpscaler (see get_shared() above) is called
+    // concurrently by multiple threads before it has ever been probed,
+    // only one thread actually runs the probe inference and writes
+    // native_scale_ -- the rest wait and then observe the already-probed
+    // value, instead of racing to write the same (non-atomic) int from
+    // multiple threads.
+    std::mutex probe_mutex_;
+
+    // Throttles the "Auto-selected tile size" log line (see upscale()) to
+    // only fire when the selected size actually changes, the same pattern
+    // AIUpscale.cpp's log_render_diag_if_changed() uses. Field logs from a
+    // real Premiere Pro render showed dozens of concurrent render threads
+    // each logging this line every frame -- pure log-flood noise once the
+    // steady-state tile size stops changing, and a (very) minor
+    // contributor to the same-named freeze investigation.
+    std::mutex tile_log_mutex_;
+    int last_logged_tile_size_ = -1;
 };
 
 } // namespace upscale

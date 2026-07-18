@@ -103,14 +103,24 @@ struct AIUpscaleSequenceData {
     // a mode change and reload lazily instead of reloading every frame.
     int loaded_mode_choice = 0; // 0 = none loaded yet
 
-    // The Adobe-independent inference engine. Heap-allocated behind a
-    // unique_ptr so this struct stays POD-ish/handle-friendly; AE/Premiere
-    // sequence data is a flat PF_Handle, so this struct is heap-allocated
-    // via plain new/delete and only the raw AIUpscaleSequenceData* is
-    // stored inside a small (sizeof(void*)) PF_Handle obtained from
-    // AEGP_SuiteHandler(in_data->pica_basicP).HandleSuite1(). See
-    // AIUpscale.cpp HandleSequenceSetup/HandleSequenceSetdown.
-    std::unique_ptr<upscale::OnnxUpscaler> upscaler;
+    // The Adobe-independent inference engine. shared_ptr, NOT unique_ptr:
+    // ensure_model_loaded() (AIUpscale.cpp) populates this via
+    // upscale::OnnxUpscaler::get_shared(), which hands back a process-wide
+    // shared instance keyed on model path rather than a private one owned
+    // by this sequence data alone. This matters because the render-time
+    // self-healing path (ensure_sequence_data(), below) can end up
+    // creating more than one AIUpscaleSequenceData for what is really the
+    // same render session (one per render thread that ever observed a
+    // null sequence_data) -- without sharing, each would load its own
+    // ~64MB CoreML/ANE session, multiplying memory use and ANE/GPU
+    // contention. With get_shared(), every AIUpscaleSequenceData loading
+    // the same model_path ends up pointing at the SAME Ort::Session; this
+    // struct (and this shared_ptr) still gets heap-allocated via plain
+    // new/delete and its raw AIUpscaleSequenceData* stored inside a small
+    // (sizeof(void*)) PF_Handle obtained from
+    // AEGP_SuiteHandler(in_data->pica_basicP).HandleSuite1(), same as
+    // before -- see AIUpscale.cpp HandleSequenceSetup/HandleSequenceSetdown.
+    std::shared_ptr<upscale::OnnxUpscaler> upscaler;
 
     std::string plugin_dir; // resolved once, used to find models/
 };

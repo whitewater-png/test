@@ -16,6 +16,7 @@
 
 #include "size_limits.h"
 #include "logger.h"
+#include "concurrency.h"
 
 namespace upscale {
 
@@ -34,6 +35,63 @@ struct OnnxUpscaler::Impl {
 
 OnnxUpscaler::OnnxUpscaler() : impl_(std::make_unique<Impl>()) {}
 OnnxUpscaler::~OnnxUpscaler() = default;
+
+namespace {
+
+// Process-wide shared-instance cache backing get_shared() (see
+// onnx_upscaler.h for the full rationale). Keyed on model_path; holds only
+// weak_ptrs so a model that's no longer referenced by anyone (e.g. after a
+// mode switch away from it, once the last sequence data drops its
+// shared_ptr) is naturally freed rather than kept alive forever by the
+// cache itself. Guarded by a single mutex -- held across the (one-time,
+// per model_path) load() call too, which serializes concurrent first-time
+// loads of the SAME OR DIFFERENT model_path against each other; this is a
+// deliberate simplicity tradeoff since get_shared() is only called from
+// mode-switch-time paths (ensure_model_loaded() in AIUpscale.cpp), not
+// per-frame, so any contention here is rare and brief relative to a
+// render's overall runtime.
+std::mutex& shared_cache_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::unordered_map<std::string, std::weak_ptr<OnnxUpscaler>>& shared_cache_map() {
+    static std::unordered_map<std::string, std::weak_ptr<OnnxUpscaler>> m;
+    return m;
+}
+
+} // namespace
+
+std::shared_ptr<OnnxUpscaler> OnnxUpscaler::get_shared(const std::string& model_path,
+                                                        ExecutionProvider provider_preference) {
+    std::lock_guard<std::mutex> lock(shared_cache_mutex());
+    auto& cache = shared_cache_map();
+
+    auto it = cache.find(model_path);
+    if (it != cache.end()) {
+        if (std::shared_ptr<OnnxUpscaler> existing = it->second.lock()) {
+            return existing; // another caller is already keeping this model's session alive
+        }
+        // Stale entry (last shared_ptr was already dropped) -- fall through
+        // and replace it with a freshly loaded instance below.
+    }
+
+    auto instance = std::make_shared<OnnxUpscaler>();
+    instance->load(model_path, provider_preference); // throws OnnxUpscalerError on failure; nothing cached in that case
+    cache[model_path] = instance;
+    log_info("OnnxUpscaler::get_shared: created new shared session for '" + model_path +
+              "' (live cache entries=" + std::to_string(cache.size()) + ")");
+    return instance;
+}
+
+size_t OnnxUpscaler::shared_cache_size_for_testing() {
+    std::lock_guard<std::mutex> lock(shared_cache_mutex());
+    size_t live = 0;
+    for (const auto& [path, weak_instance] : shared_cache_map()) {
+        if (!weak_instance.expired()) ++live;
+    }
+    return live;
+}
 
 namespace {
 
@@ -160,16 +218,37 @@ void OnnxUpscaler::load(const std::string& model_path, ExecutionProvider provide
 
     try {
         Ort::SessionOptions options;
-        // Intra-op threads deliberately left at 1: tile-level parallelism
-        // (see tile.cpp) already saturates available cores by running
-        // multiple Run() calls concurrently on the CPU EP (documented
-        // thread-safe for a shared session) or by parallelizing pre/post
-        // processing around a serialized Run() on accelerated EPs (see
-        // infer_mutex_ below). Letting onnxruntime ALSO spin up its own
-        // intra-op thread pool per Run() call would oversubscribe cores
-        // (num_tile_workers * intra_op_threads >> hardware_concurrency),
-        // which the task explicitly calls out to avoid.
-        options.SetIntraOpNumThreads(1);
+        // Intra-op thread count: derived from ConcurrencyGate's configured
+        // max_concurrency() rather than hardcoded, so onnxruntime's own
+        // per-Run() thread pool cannot oversubscribe cores no matter how
+        // many callers are allowed through the gate at once.
+        //
+        // Background (this is the fix for a real-Premiere-hardware freeze):
+        // Premiere parallelizes 4K rendering across many host threads,
+        // each of which used to ALSO spin up tile.cpp's own worker pool
+        // (auto = hardware_concurrency) -- host_threads * tile_workers
+        // could reach ~200 threads all fighting for the same cores/ANE at
+        // once, freezing the machine. The plugin layer now forces
+        // TileOptions::num_workers=1 (see AIUpscale.cpp HandleRender -- the
+        // host already parallelizes across frames, so tile.cpp must not
+        // ALSO parallelize within a frame), and ConcurrencyGate
+        // (concurrency.h) caps how many upscale() calls run inference
+        // concurrently process-wide (default 2, AIUPSCALE_MAX_CONCURRENCY
+        // to override). With those two pieces in place, up to
+        // max_concurrency() Run() calls can be genuinely concurrent, so
+        // letting each one use more than a single intra-op thread no
+        // longer risks oversubscription the way a fixed "always 1" or a
+        // naive "always hardware_concurrency()" would -- as long as the
+        // per-call thread count times max_concurrency() stays within
+        // hardware_concurrency(). hardware_concurrency() / max_concurrency()
+        // (floored to at least 1) achieves exactly that bound.
+        const unsigned hw_threads = std::max(1u, std::thread::hardware_concurrency());
+        const int max_conc = std::max(1, ConcurrencyGate::instance().max_concurrency());
+        const int intra_op_threads = std::max(1, static_cast<int>(hw_threads) / max_conc);
+        options.SetIntraOpNumThreads(intra_op_threads);
+        log_info("OnnxUpscaler::load: intra_op_num_threads=" + std::to_string(intra_op_threads) +
+                  " (hardware_concurrency=" + std::to_string(hw_threads) +
+                  ", concurrency_gate.max_concurrency=" + std::to_string(max_conc) + ")");
         options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
         // Only an EXPLICIT accelerated-provider request (kCoreML/kCUDA/
@@ -422,8 +501,28 @@ void OnnxUpscaler::upscale(const ImageRGBA8& in, ImageRGBA8& out, int requested_
     // limits.h; also covers the "0x0 input" abnormal-input test case).
     validate_input_dims(in.width, in.height, 4);
 
+    // ConcurrencyGate: caps how many upscale() calls (across ALL
+    // OnnxUpscaler instances/threads in this process) are actually doing
+    // inference work at once -- see concurrency.h for the full real-
+    // Premiere-hardware freeze this fixes. Acquired for the ENTIRE rest of
+    // this call (probing + tiling + inference), released via RAII on every
+    // return path including exceptions. Safe against deadlock: neither
+    // tile.cpp's worker threads nor infer() ever try to acquire this gate
+    // themselves, so there is no re-entrant acquire from within this
+    // guarded section.
+    ConcurrencyGate::Guard concurrency_guard(ConcurrencyGate::instance());
+
     if (native_scale_ == 0) {
-        probe_native_scale();
+        // Double-checked locking: probe_mutex_ only serializes the (rare,
+        // one-time-per-model) probe itself, not every upscale() call --
+        // see probe_mutex_'s doc comment in onnx_upscaler.h for why this
+        // matters now that a shared OnnxUpscaler (get_shared()) can be
+        // entered concurrently by multiple threads before it's ever been
+        // probed.
+        std::lock_guard<std::mutex> probe_lock(probe_mutex_);
+        if (native_scale_ == 0) {
+            probe_native_scale();
+        }
     }
 
     TileOptions opts = tile_opts;
@@ -449,8 +548,17 @@ void OnnxUpscaler::upscale(const ImageRGBA8& in, ImageRGBA8& out, int requested_
         sizing.scale = native_scale_;
         sizing.accelerated = (active_provider_name_ != "CPUExecutionProvider");
         opts.tile_size = choose_tile_size(sizing);
-        log_info("Auto-selected tile size " + std::to_string(opts.tile_size) +
-                  "px (provider=" + active_provider_name_ + ")");
+        // Throttled: only log when the auto-selected size actually changes
+        // (see tile_log_mutex_/last_logged_tile_size_ doc comment in
+        // onnx_upscaler.h) -- field logs showed this line flooding
+        // AIUpscale.log from dozens of concurrent render threads every
+        // single frame once tiling settled into a steady state.
+        std::lock_guard<std::mutex> tile_log_lock(tile_log_mutex_);
+        if (opts.tile_size != last_logged_tile_size_) {
+            last_logged_tile_size_ = opts.tile_size;
+            log_info("Auto-selected tile size " + std::to_string(opts.tile_size) +
+                      "px (provider=" + active_provider_name_ + ")");
+        }
     }
 
     // Overall output-size safety check up front (also re-checked inside

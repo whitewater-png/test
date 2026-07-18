@@ -113,10 +113,30 @@ void upscale_tiled(const ImageRGBA8& input,
 
     const int num_workers = resolve_num_workers(opts.num_workers, jobs.size());
     {
-        std::ostringstream msg;
-        msg << "upscale_tiled: " << jobs.size() << " tile(s), tile=" << tile
-            << " overlap=" << overlap << " workers=" << num_workers;
-        log_info(msg.str());
+        // Throttled the same way as AIUpscale.cpp's
+        // log_render_diag_if_changed() / OnnxUpscaler's tile-size log: only
+        // log when the (job count, tile, overlap, workers) combination
+        // actually changes. Field logs from real Premiere Pro hardware
+        // showed dozens of concurrent render threads logging this line
+        // every single frame -- once tiling settles into a steady state
+        // (the common case), that's pure log-flood noise.
+        static std::mutex log_cache_mutex;
+        static size_t last_jobs = static_cast<size_t>(-1);
+        static int last_tile = -1, last_overlap = -1, last_workers = -1;
+
+        std::lock_guard<std::mutex> lock(log_cache_mutex);
+        if (jobs.size() != last_jobs || tile != last_tile || overlap != last_overlap ||
+            num_workers != last_workers) {
+            last_jobs = jobs.size();
+            last_tile = tile;
+            last_overlap = overlap;
+            last_workers = num_workers;
+
+            std::ostringstream msg;
+            msg << "upscale_tiled: " << jobs.size() << " tile(s), tile=" << tile
+                << " overlap=" << overlap << " workers=" << num_workers;
+            log_info(msg.str());
+        }
     }
 
     // --- Parallel compute phase -------------------------------------------------

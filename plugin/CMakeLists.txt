@@ -122,6 +122,7 @@ find_package(Threads REQUIRED)
 add_library(upscale_core STATIC
     src/core/onnx_upscaler.cpp
     src/core/tile.cpp
+    src/core/concurrency.cpp
 )
 target_include_directories(upscale_core
     PUBLIC
@@ -224,6 +225,67 @@ add_executable(test_tile_output_scale
 )
 target_link_libraries(test_tile_output_scale PRIVATE upscale_core)
 add_test(NAME test_tile_output_scale COMMAND test_tile_output_scale)
+
+# ---------------------------------------------------------------------------
+# test_concurrency_gate (upscale_core unit test, Linux/CI-runnable)
+#
+# Unit test for upscale::ConcurrencyGate (src/core/concurrency.h/.cpp),
+# added to fix a real-Premiere-hardware freeze on a MacBook Pro M4 Max
+# (36GB): field logs showed dozens of concurrent Premiere render threads
+# each spinning up their own internal tile-processing worker pool
+# (host_threads * tile_workers reaching ~200 threads), saturating every CPU
+# core at once. No onnxruntime/model dependency -- pure threading test, see
+# tests/test_concurrency_gate.cpp.
+# ---------------------------------------------------------------------------
+add_executable(test_concurrency_gate
+    tests/test_concurrency_gate.cpp
+)
+target_link_libraries(test_concurrency_gate PRIVATE upscale_core)
+add_test(NAME test_concurrency_gate COMMAND test_concurrency_gate)
+
+# ---------------------------------------------------------------------------
+# test_onnx_upscaler_sharing (upscale_core unit test, Linux/CI-runnable)
+#
+# Regression test for OnnxUpscaler::get_shared() (src/core/onnx_upscaler.h/
+# .cpp), the process-wide shared-session cache added alongside
+# ConcurrencyGate to fix the same real-Premiere-hardware freeze: the AE/
+# Premiere plugin's render-time sequence-data self-healing could create
+# more than one OnnxUpscaler (and thus more than one ~64MB CoreML/ANE
+# Ort::Session) for what was really the same render session. See
+# tests/test_onnx_upscaler_sharing.cpp.
+#
+# Needs a real (tiny, non-ML) ONNX model to actually call load()/upscale()
+# against -- generated at build time via scripts/make_test_model.py when a
+# Python 3 interpreter with the `onnx` package is available. If not
+# available, the generated model file won't exist and the test itself
+# detects that at runtime and skips (exits 0) rather than failing the
+# build or ctest run over a missing optional dev dependency.
+# ---------------------------------------------------------------------------
+find_program(PYTHON3_EXECUTABLE NAMES python3)
+set(TEST_MODEL_4X_PATH "${CMAKE_CURRENT_BINARY_DIR}/test_model_4x.onnx")
+if(PYTHON3_EXECUTABLE)
+    add_custom_command(
+        OUTPUT "${TEST_MODEL_4X_PATH}"
+        COMMAND ${PYTHON3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/make_test_model.py" "${TEST_MODEL_4X_PATH}"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/make_test_model.py"
+        COMMENT "Generating tiny test ONNX model (test_model_4x.onnx) for test_onnx_upscaler_sharing"
+    )
+    add_custom_target(generate_test_model_4x DEPENDS "${TEST_MODEL_4X_PATH}")
+else()
+    message(STATUS "python3 not found; test_onnx_upscaler_sharing will skip at runtime (no test model generated).")
+endif()
+
+add_executable(test_onnx_upscaler_sharing
+    tests/test_onnx_upscaler_sharing.cpp
+)
+target_link_libraries(test_onnx_upscaler_sharing PRIVATE upscale_core)
+target_compile_definitions(test_onnx_upscaler_sharing PRIVATE
+    TEST_MODEL_4X_PATH="${TEST_MODEL_4X_PATH}"
+)
+if(PYTHON3_EXECUTABLE)
+    add_dependencies(test_onnx_upscaler_sharing generate_test_model_4x)
+endif()
+add_test(NAME test_onnx_upscaler_sharing COMMAND test_onnx_upscaler_sharing)
 
 # ---------------------------------------------------------------------------
 # AIUpscale (Adobe After Effects / Premiere Pro plugin)

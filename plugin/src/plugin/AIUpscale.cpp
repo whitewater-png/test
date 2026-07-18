@@ -645,10 +645,6 @@ PF_Err ensure_model_loaded(AIUpscaleSequenceData* seq, A_long mode_choice, PF_Ou
         return PF_Err_NONE; // already loaded, nothing to do
     }
 
-    if (!seq->upscaler) {
-        seq->upscaler = std::make_unique<upscale::OnnxUpscaler>();
-    }
-
     const std::string model_path = model_path_for(seq->plugin_dir, mode_choice);
     if (model_path.empty()) {
         // model_path_for() already logged the specific reason (missing /
@@ -659,7 +655,16 @@ PF_Err ensure_model_loaded(AIUpscaleSequenceData* seq, A_long mode_choice, PF_Ou
     }
 
     try {
-        seq->upscaler->load(model_path, upscale::ExecutionProvider::kAuto);
+        // get_shared(), NOT a private load() on a locally-owned instance:
+        // this hands back a process-wide shared OnnxUpscaler/Ort::Session
+        // for `model_path`, so multiple AIUpscaleSequenceData instances
+        // for the same render session (see the self-healing comment on
+        // ensure_sequence_data() above -- the exact scenario that used to
+        // multiply model sessions) end up sharing one loaded model instead
+        // of each loading their own. See AIUpscaleSequenceData::upscaler's
+        // doc comment in AIUpscale.h and OnnxUpscaler::get_shared()'s in
+        // onnx_upscaler.h.
+        seq->upscaler = upscale::OnnxUpscaler::get_shared(model_path, upscale::ExecutionProvider::kAuto);
         seq->loaded_mode_choice = mode_choice;
         if (seq->upscaler->fell_back_to_cpu()) {
             set_return_msg(out_data,
@@ -807,11 +812,29 @@ PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* param
     upscale::TileOptions tile_opts;
     tile_opts.tile_size = 0; // auto-select based on active execution provider (see choose_tile_size())
     tile_opts.overlap = 16;
-    // Auto worker count (hardware_concurrency, capped to tile count by
-    // tile.cpp); AE/Premiere host processes are typically already busy
-    // with UI/other render threads, so we don't try to be cleverer than
-    // "use what's available" here.
-    tile_opts.num_workers = 0;
+    // num_workers FORCED TO 1 (serial tiling) here -- this is deliberate,
+    // not an oversight, and is one of the fixes for a real-Premiere-
+    // hardware freeze (see README.md "安定運用ガイド" and concurrency.h's
+    // file header for the full story): Premiere Pro already parallelizes
+    // 4K rendering across many of its OWN host threads (one call into
+    // HandleRender per in-flight frame). Field logs showed each of those
+    // ~14 host threads ALSO spinning up tile.cpp's internal worker pool
+    // (the old auto=hardware_concurrency default), producing on the order
+    // of host_threads * tile_workers (~14 x 14 = ~200) threads all
+    // fighting over the same CPU/ANE cores at once -- enough to saturate
+    // and freeze the machine. The host's own frame-level parallelism is
+    // the right place for concurrency here; this plugin must not ALSO
+    // parallelize within a single frame on top of it. (Overall
+    // concurrency across host threads is still bounded separately by
+    // ConcurrencyGate inside OnnxUpscaler::upscale() -- see
+    // onnx_upscaler.cpp/.h -- which caps how many upscale() calls run
+    // inference at once regardless of how many host threads call in.)
+    //
+    // upscale_cli (see src/cli/upscale_cli.cpp), by contrast, is a single
+    // process with no host-level frame parallelism to defer to, so it
+    // still passes the user's --jobs value through unchanged (0=auto is
+    // the right default there).
+    tile_opts.num_workers = 1;
 
     // Request SAME-RESOLUTION output (requested_scale=1) rather than the
     // model's raw native-scale result: this is the core of the buffer-
