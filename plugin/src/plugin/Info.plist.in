@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Info.plist.in - macOS bundle template for the AIUpscale.plugin bundle.
+
+NOT VERIFIED IN THIS ENVIRONMENT (no macOS/Xcode available here). Mirrors
+the Info.plist shape used by Adobe AE SDK sample plugins' Xcode bundle
+targets. CMake's MACOSX_BUNDLE_INFO_PLIST substitutes the @VAR@ tokens
+below from the corresponding MACOSX_BUNDLE_* target properties / CMake
+variables at configure time.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>${MACOSX_BUNDLE_EXECUTABLE_NAME}</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.example.aiupscale</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>AI Upscale</string>
+    <key>CFBundlePackageType</key>
+    <string>eFKT</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleSignature</key>
+    <string>FXTC</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+</dict>
+</plist>
