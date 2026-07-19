@@ -780,6 +780,34 @@ I/O負荷を避けるためで、フリーズの主因ではありませんが�
   （実装は分離可能フィルタで高速化）のため、非常に細いディテール（1px幅の
   線など）では効果が弱くなることがあります。
 
+## 知人への配布（個人配布パッケージ）
+
+ビルド済みの `AIUpscale.plugin` を、開発環境を持たない知人へ数人程度の
+個人間で配布したい場合、`plugin/scripts/package_for_distribution.sh` を
+使うと、ダブルクリックだけでインストールできる配布用zipを1コマンドで
+作成できます。
+
+```bash
+bash plugin/scripts/package_for_distribution.sh
+```
+
+- 事前に `bash plugin/setup_mac.sh` でビルド（`plugin/build/AIUpscale.plugin`
+  の生成）を済ませておく必要があります。未ビルドの場合はエラーで案内します。
+- バージョン番号は `src/plugin/AIUpscale.h` の
+  `AI_UPSCALE_MAJOR_VERSION`/`AI_UPSCALE_MINOR_VERSION` から自動抽出されます。
+- `~/Downloads/AIUpscale_v<バージョン>_<YYYYMMDD>.zip` が生成されます。中身は
+  `AIUpscale.plugin` 本体、ダブルクリック実行可能な
+  「インストールする.command」（Gatekeeperの隔離属性解除〜MediaCoreへの
+  コピーまで自動化）、日本語の手順書「はじめにお読みください.txt」の3点です。
+- 生成されたzipはAirDropやクラウドストレージ（iCloud Drive/Google Drive等）
+  で共有すればそのまま配布できます。
+
+**無署名配布であることに注意してください。** このzipに含まれる
+`AIUpscale.plugin` はApple開発者IDによるコード署名・公証（notarization）を
+行っていません。個人間で数人に配布する分には同梱のインストーラで
+Gatekeeper警告を回避できますが、不特定多数への一般配布を行う場合は
+Apple Developer Programでのコード署名・公証が別途必要です。
+
 ## ロードマップ
 
 - SmartFX対応（`PF_Cmd_SMART_PRE_RENDER` / `PF_Cmd_SMART_RENDER`）によるRAM
