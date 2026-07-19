@@ -22,11 +22,14 @@
 #
 # オプション:
 #   -o, --output <path>     出力パス (既定: <入力名>_upscaled.mov)
+#   --engine {ai,detail}    処理エンジン (既定 ai)
 #   --scale {2,4}           倍率 (既定 4)
-#   --mode {photo,anime}    使用モデル (既定 photo)
+#   --mode {photo,anime}    使用モデル (既定 photo、--engine ai のみ)
+#   --detail N              Detail Preserveエンジンの強度 0-100 (既定 50、
+#                           --engine detail のみ)
 #   --codec {prores,h264}   出力コーデック (既定 prores)
 #   --jobs N                upscale_cli に渡す並列度 (既定: upscale_cliのauto)
-#   --model-dir <dir>       モデルディレクトリ (既定: 自動検出)
+#   --model-dir <dir>       モデルディレクトリ (既定: 自動検出、--engine ai のみ)
 #   --upscale-cli <path>    upscale_cliバイナリのパス (既定: 自動検出)
 #   -h, --help              このヘルプを表示
 #
@@ -45,8 +48,10 @@ TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
 # 既定値
 OUTPUT=""
+ENGINE="ai"
 SCALE=4
 MODE="photo"
+DETAIL=""
 CODEC="prores"
 JOBS=""
 MODEL_DIR=""
@@ -80,24 +85,38 @@ Premiereでの編集前に、動画素材をフレーム単位でAIアップス�
 
 オプション:
   -o, --output <path>     出力パス (既定: <入力名>_upscaled.mov)
-  --scale {2,4}           倍率 (既定: 4)。モデルはネイティブ4x。
-                          --scale 2 の場合は upscale_cli の --scale 2
-                          (ネイティブ4x処理後に2xへダウンサンプル) を使う。
-  --mode {photo,anime}    使用モデル (既定: photo)。
+  --engine {ai,detail}    処理エンジン (既定: ai)
+                          ai     -> Real-ESRGAN (ONNX Runtime)。最高画質だが
+                                    低速 (実写/アニメのMode選択可)。
+                          detail -> 古典的エッジ保持アップスケール（AI Upscale
+                                    プラグインの既定エンジンと同じ独自実装、
+                                    detail_upscaler.h参照）。モデル不要で
+                                    高速。--mode は無視される。
+  --scale {2,4}           倍率 (既定: 4)。
+                          --engine ai: モデルはネイティブ4x。--scale 2の場合は
+                          upscale_cli の --scale 2 (ネイティブ4x処理後に2xへ
+                          ダウンサンプル) を使う。
+                          --engine detail: 指定倍率でLanczosベース拡大 +
+                          ディテール復元を行う。
+  --mode {photo,anime}    使用モデル (既定: photo、--engine ai のみ)。
                           photo -> models/realesrgan-x4plus.onnx
                           anime -> models/realesrgan-x4plus-anime.onnx
+  --detail N              Detail Preserveエンジンの強度 0-100 (既定: 50、
+                          --engine detail のみ。0=Lanczosのみ、100=最大強度)
   --codec {prores,h264}   出力コーデック (既定: prores = ProRes 422 HQ、
                           編集用途向け。h264も選択可)
-  --jobs N                upscale_cli に渡す並列度 (既定: upscale_cliのauto)
+  --jobs N                upscale_cli に渡す並列度 (既定: upscale_cliのauto。
+                          --engine detail は常に単一スレッドのため無視される)
   --model-dir <dir>       モデルディレクトリ (既定: インストール先の
                           MediaCore/models があればそれ、無ければ
-                          plugin/models)
+                          plugin/models。--engine ai のみ使用)
   --upscale-cli <path>    upscale_cli バイナリのパス
                           (既定: plugin/build/upscale_cli、無ければPATH探索)
   -h, --help              このヘルプを表示
 
 例:
   bash plugin/scripts/upscale_video.sh cam3sideA.mov --scale 4 --codec prores
+  bash plugin/scripts/upscale_video.sh cam3sideA.mov --engine detail --scale 4 --detail 75
 EOF
 }
 
@@ -111,6 +130,11 @@ while [[ $# -gt 0 ]]; do
             OUTPUT="$2"
             shift 2
             ;;
+        --engine)
+            [[ $# -ge 2 ]] || { log_error "$1 には値が必要です"; exit 1; }
+            ENGINE="$2"
+            shift 2
+            ;;
         --scale)
             [[ $# -ge 2 ]] || { log_error "$1 には値が必要です"; exit 1; }
             SCALE="$2"
@@ -119,6 +143,11 @@ while [[ $# -gt 0 ]]; do
         --mode)
             [[ $# -ge 2 ]] || { log_error "$1 には値が必要です"; exit 1; }
             MODE="$2"
+            shift 2
+            ;;
+        --detail)
+            [[ $# -ge 2 ]] || { log_error "$1 には値が必要です"; exit 1; }
+            DETAIL="$2"
             shift 2
             ;;
         --codec)
@@ -168,6 +197,11 @@ if [[ -z "${INPUT}" ]]; then
     exit 1
 fi
 
+case "${ENGINE}" in
+    ai|detail) ;;
+    *) log_error "--engine は ai または detail を指定してください (指定値: ${ENGINE})"; exit 1 ;;
+esac
+
 case "${SCALE}" in
     2|4) ;;
     *) log_error "--scale は 2 または 4 を指定してください (指定値: ${SCALE})"; exit 1 ;;
@@ -177,6 +211,17 @@ case "${MODE}" in
     photo|anime) ;;
     *) log_error "--mode は photo または anime を指定してください (指定値: ${MODE})"; exit 1 ;;
 esac
+
+if [[ -n "${DETAIL}" ]]; then
+    if ! [[ "${DETAIL}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        log_error "--detail は 0 から 100 の数値を指定してください (指定値: ${DETAIL})"
+        exit 1
+    fi
+    if (( $(awk -v d="${DETAIL}" 'BEGIN { print (d < 0 || d > 100) }') )); then
+        log_error "--detail は 0 から 100 の範囲で指定してください (指定値: ${DETAIL})"
+        exit 1
+    fi
+fi
 
 case "${CODEC}" in
     prores|h264) ;;
@@ -273,33 +318,42 @@ if [[ ! -x "${UPSCALE_CLI}" ]]; then
 fi
 log_info "upscale_cli: ${UPSCALE_CLI}"
 
-# モデルディレクトリの解決
-if [[ -z "${MODEL_DIR}" ]]; then
-    INSTALLED_MODELS="/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/models"
-    if [[ -d "${INSTALLED_MODELS}" ]]; then
-        MODEL_DIR="${INSTALLED_MODELS}"
-    else
-        MODEL_DIR="${PLUGIN_DIR}/models"
+# モデルディレクトリの解決 (--engine ai のみ必要。--engine detail はモデル
+# 不要な古典的アルゴリズム (plugin/src/core/detail_upscaler.h) を使うため、
+# モデルファイルの存在確認自体をスキップする)
+if [[ "${ENGINE}" == "ai" ]]; then
+    if [[ -z "${MODEL_DIR}" ]]; then
+        INSTALLED_MODELS="/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/models"
+        if [[ -d "${INSTALLED_MODELS}" ]]; then
+            MODEL_DIR="${INSTALLED_MODELS}"
+        else
+            MODEL_DIR="${PLUGIN_DIR}/models"
+        fi
     fi
-fi
-log_info "モデルディレクトリ: ${MODEL_DIR}"
+    log_info "モデルディレクトリ: ${MODEL_DIR}"
 
-case "${MODE}" in
-    photo) MODEL_FILE="${MODEL_DIR}/realesrgan-x4plus.onnx" ;;
-    anime) MODEL_FILE="${MODEL_DIR}/realesrgan-x4plus-anime.onnx" ;;
-esac
+    case "${MODE}" in
+        photo) MODEL_FILE="${MODEL_DIR}/realesrgan-x4plus.onnx" ;;
+        anime) MODEL_FILE="${MODEL_DIR}/realesrgan-x4plus-anime.onnx" ;;
+    esac
 
-if [[ ! -f "${MODEL_FILE}" ]]; then
-    log_error "モデルファイルが見つかりません: ${MODEL_FILE}"
-    log_error "先に 'python3 plugin/scripts/download_models.py --out-dir ${MODEL_DIR}' を実行するか、"
-    log_error "'bash plugin/setup_mac.sh' でセットアップを完了してください。"
-    exit 1
+    if [[ ! -f "${MODEL_FILE}" ]]; then
+        log_error "モデルファイルが見つかりません: ${MODEL_FILE}"
+        log_error "先に 'python3 plugin/scripts/download_models.py --out-dir ${MODEL_DIR}' を実行するか、"
+        log_error "'bash plugin/setup_mac.sh' でセットアップを完了してください。"
+        exit 1
+    fi
+    log_info "モデル: ${MODEL_FILE} (mode=${MODE})"
+else
+    # --engine detail: upscale_cli はこのモード時にモデル引数を開かないため、
+    # プレースホルダを渡すだけでよい (plugin/src/cli/upscale_cli.cpp 参照)。
+    MODEL_FILE="-"
+    log_info "エンジン: detail (古典的エッジ保持アップスケール、モデル不要、detail=${DETAIL:-50})"
 fi
-log_info "モデル: ${MODEL_FILE} (mode=${MODE})"
 
 log_info "入力ファイル: ${INPUT}"
 log_info "出力ファイル: ${OUTPUT}"
-log_info "scale=${SCALE} codec=${CODEC} jobs=${JOBS:-auto}"
+log_info "engine=${ENGINE} scale=${SCALE} codec=${CODEC} jobs=${JOBS:-auto}"
 
 # ---------------------------------------------------------------------------
 # ffprobe で動画情報を取得
@@ -409,14 +463,21 @@ TOTAL_FRAMES=${NUM_EXTRACTED}
 # ---------------------------------------------------------------------------
 # フレーム単位アップスケール
 # ---------------------------------------------------------------------------
-log_info "=== [2/3] AIアップスケールしています (mode=${MODE}, scale=${SCALE}) ==="
+if [[ "${ENGINE}" == "ai" ]]; then
+    log_info "=== [2/3] AIアップスケールしています (engine=ai, mode=${MODE}, scale=${SCALE}) ==="
+else
+    log_info "=== [2/3] アップスケールしています (engine=detail, scale=${SCALE}, detail=${DETAIL:-50}) ==="
+fi
 
-CLI_ARGS=()
+CLI_ARGS=(--engine "${ENGINE}")
 if [[ "${SCALE}" -ne 4 ]]; then
     CLI_ARGS+=(--scale "${SCALE}")
 fi
 if [[ -n "${JOBS}" ]]; then
     CLI_ARGS+=(--jobs "${JOBS}")
+fi
+if [[ "${ENGINE}" == "detail" && -n "${DETAIL}" ]]; then
+    CLI_ARGS+=(--detail "${DETAIL}")
 fi
 
 FRAME_IDX=0

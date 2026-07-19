@@ -46,6 +46,15 @@
 // plugin/src/core/onnx_upscaler.h. It is linked into this target by
 // plugin/CMakeLists.txt.
 #include "onnx_upscaler.h"
+// detail_upscaler.h: the classical (non-neural), clean-room edge-preserving
+// upscale engine that is now the DEFAULT "Engine" choice below (see
+// ENGINE_POPUP_CHOICES / ENGINE_CHOICE_DETAIL) -- replacing Real-ESRGAN/
+// ONNX as the default because that neural engine proved far too slow for
+// realtime/render use in Premiere on real hardware (multiple seconds per 4K
+// frame). The AI engine remains selectable via the "Engine" popup for users
+// who explicitly want it. See detail_upscaler.h for the algorithm itself
+// and its clean-room/no-Adobe-code disclaimer.
+#include "detail_upscaler.h"
 
 // ---------------------------------------------------------------------------
 // Versioning / string table constants (mirrors the "Skeleton"/"SDK_Noise"
@@ -54,10 +63,17 @@
 #define AI_UPSCALE_NAME            "AI Upscale"
 #define AI_UPSCALE_CATEGORY        "AI Enhance"
 #define AI_UPSCALE_MATCH_NAME      "ADBE AI Upscale" // must be globally unique; replace vendor prefix before shipping
-#define AI_UPSCALE_DESCRIPTION     "AI super-resolution upscaling (Real-ESRGAN) for Premiere Pro / After Effects."
+#define AI_UPSCALE_DESCRIPTION     "Detail-preserving upscaling (fast, classical edge-preserving algorithm, default) " \
+                                    "with an optional Real-ESRGAN AI engine, for Premiere Pro / After Effects."
 
 #define AI_UPSCALE_MAJOR_VERSION   1
-#define AI_UPSCALE_MINOR_VERSION   0
+// MINOR bumped 0 -> 1 for this revision: adds the "Engine" popup and
+// "Detail" slider params, and changes the default processing engine from
+// AI (Real-ESRGAN/ONNX) to the new classical Detail Preserve engine (see
+// detail_upscaler.h). AIUpscalePiPL.r's AE_Effect_Version MUST be
+// recomputed and kept numerically in sync with this -- see that file's own
+// comment for the derivation.
+#define AI_UPSCALE_MINOR_VERSION   1
 #define AI_UPSCALE_BUG_VERSION     0
 #define AI_UPSCALE_STAGE_VERSION   PF_Stage_DEVELOP
 #define AI_UPSCALE_BUILD_VERSION   1
@@ -66,18 +82,26 @@
 // Parameter indices / IDs (order must match PF_Cmd_PARAMS_SETUP additions).
 // ---------------------------------------------------------------------------
 enum {
-    AI_UPSCALE_INPUT = 0,   // implicit layer input, always index 0
-    AI_UPSCALE_SCALE_POPUP, // "Scale": 2x | 4x
-    AI_UPSCALE_MODE_POPUP,  // "Mode": Photo | Anime
+    AI_UPSCALE_INPUT = 0,    // implicit layer input, always index 0
+    AI_UPSCALE_ENGINE_POPUP, // "Engine": Detail Preserve (Fast) | AI Real-ESRGAN
+    AI_UPSCALE_SCALE_POPUP,  // "Scale": 2x | 4x
+    AI_UPSCALE_MODE_POPUP,   // "Mode": Photo | Anime (AI engine only)
+    AI_UPSCALE_DETAIL_SLIDER, // "Detail": 0..100 (Detail Preserve engine only)
     AI_UPSCALE_NUM_PARAMS
 };
 
 enum {
-    SCALE_DISK_ID = 1,
+    ENGINE_DISK_ID = 1,
+    SCALE_DISK_ID,
     MODE_DISK_ID,
+    DETAIL_DISK_ID,
 };
 
 // Popup choices. PF_ADD_POPUP wants a single "|"-delimited string.
+#define ENGINE_POPUP_CHOICES     "Detail Preserve (Fast)|AI Real-ESRGAN"
+#define ENGINE_POPUP_NUM_CHOICES 2
+enum { ENGINE_CHOICE_DETAIL = 1, ENGINE_CHOICE_AI = 2 }; // PF popups are 1-based; Detail Preserve is the default
+
 #define SCALE_POPUP_CHOICES     "2x|4x"
 #define SCALE_POPUP_NUM_CHOICES 2
 enum { SCALE_CHOICE_2X = 1, SCALE_CHOICE_4X = 2 }; // PF popups are 1-based
@@ -85,6 +109,15 @@ enum { SCALE_CHOICE_2X = 1, SCALE_CHOICE_4X = 2 }; // PF popups are 1-based
 #define MODE_POPUP_CHOICES      "Photo|Anime"
 #define MODE_POPUP_NUM_CHOICES  2
 enum { MODE_CHOICE_PHOTO = 1, MODE_CHOICE_ANIME = 2 };
+
+// "Detail" float slider: 0 (pure Lanczos base resize / identity, no
+// sharpening) .. 100 (this implementation's maximum strength), default 50.
+// Only meaningful when Engine == Detail Preserve; ignored (but still shown,
+// per the task's params-count/order stability requirement) when Engine ==
+// AI Real-ESRGAN -- see plugin/README.md.
+#define DETAIL_SLIDER_MIN     0.0
+#define DETAIL_SLIDER_MAX     100.0
+#define DETAIL_SLIDER_DEFAULT 50.0
 
 // Model filenames expected alongside the plugin binary, under models/.
 // See plugin/README.md for how these get there (download_models.py).

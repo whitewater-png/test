@@ -410,7 +410,8 @@ static_assert(PF_OutFlag_DISPLAY_ERROR_MESSAGE == (1L << 8),
 
 PF_Err HandleAbout(PF_InData* in_data, PF_OutData* out_data) {
     set_return_msg(out_data,
-        "%s v%d.%d\r%s\rAI super-resolution upscaling (Real-ESRGAN via ONNX Runtime).",
+        "%s v%d.%d\r%s\rDefault engine: Detail Preserve (fast, classical edge-preserving upscale, own "
+        "implementation). Optional: AI Real-ESRGAN (via ONNX Runtime).",
         AI_UPSCALE_NAME, AI_UPSCALE_MAJOR_VERSION, AI_UPSCALE_MINOR_VERSION, AI_UPSCALE_DESCRIPTION);
     return PF_Err_NONE;
 }
@@ -458,6 +459,18 @@ PF_Err HandleParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* 
     PF_Err err = PF_Err_NONE;
     PF_ParamDef def;
 
+    // "Engine": selects the processing engine. Detail Preserve (Fast) is
+    // the default (choice 1) -- see AIUpscale.h's AI_UPSCALE_MINOR_VERSION
+    // comment and plugin/README.md for why the default changed from the AI
+    // engine to this classical one.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUP(
+        "Engine",
+        ENGINE_POPUP_NUM_CHOICES,
+        ENGINE_CHOICE_DETAIL,
+        ENGINE_POPUP_CHOICES,
+        ENGINE_DISK_ID);
+
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUP(
         "Scale",
@@ -466,6 +479,9 @@ PF_Err HandleParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* 
         SCALE_POPUP_CHOICES,
         SCALE_DISK_ID);
 
+    // "Mode" only matters when Engine == AI Real-ESRGAN (selects Photo vs.
+    // Anime model); ignored by the Detail Preserve engine. Still always
+    // shown/added -- see AI_UPSCALE_NUM_PARAMS / plugin/README.md.
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUP(
         "Mode",
@@ -473,6 +489,22 @@ PF_Err HandleParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* 
         MODE_CHOICE_PHOTO,
         MODE_POPUP_CHOICES,
         MODE_DISK_ID);
+
+    // "Detail": 0..100 strength for the Detail Preserve engine's edge-
+    // adaptive unsharp mask (see detail_upscaler.h). Ignored when Engine ==
+    // AI Real-ESRGAN.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX(
+        "Detail",
+        DETAIL_SLIDER_MIN,      // MIN_VALUE (slider range)
+        DETAIL_SLIDER_MAX,      // MAX_VALUE (slider range)
+        DETAIL_SLIDER_MIN,      // VALID_MIN (typed-value range)
+        DETAIL_SLIDER_MAX,      // VALID_MAX (typed-value range)
+        DETAIL_SLIDER_DEFAULT,  // DEF_VALUE
+        1,                      // PRECISION (decimal places shown)
+        0,                      // DISPLAY_FLAGS
+        0,                      // WANT_PHASE (not an angle-style param)
+        DETAIL_DISK_ID);
 
     out_data->num_params = AI_UPSCALE_NUM_PARAMS;
     return err;
@@ -746,9 +778,25 @@ PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* param
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
 
-    const A_long mode_choice = params[AI_UPSCALE_MODE_POPUP]->u.pd.value;
-    err = ensure_model_loaded(seq, mode_choice, out_data);
-    if (err) return err;
+    // "Engine": Detail Preserve (Fast, the default -- see
+    // AIUpscale.h's AI_UPSCALE_MINOR_VERSION comment) is the classical,
+    // non-neural algorithm in detail_upscaler.h/.cpp; AI Real-ESRGAN is the
+    // original ONNX-based engine, kept as an opt-in choice. Only the AI
+    // engine needs a loaded model -- the Detail Preserve engine skips
+    // ensure_model_loaded() entirely (no ConcurrencyGate, no ONNX Runtime
+    // session, no model file lookup at all), which also means it works even
+    // if models/ was never installed next to the plugin.
+    const A_long engine_choice = params[AI_UPSCALE_ENGINE_POPUP]->u.pd.value;
+    const bool use_ai_engine = (engine_choice == ENGINE_CHOICE_AI);
+
+    if (use_ai_engine) {
+        // "Mode" (Photo/Anime) only matters for the AI engine -- selects
+        // which Real-ESRGAN model to load; the Detail Preserve engine
+        // ignores it entirely (see plugin/README.md).
+        const A_long mode_choice = params[AI_UPSCALE_MODE_POPUP]->u.pd.value;
+        err = ensure_model_loaded(seq, mode_choice, out_data);
+        if (err) return err;
+    }
 
     // `scale` (2x/4x from the "Scale" UI popup) no longer selects an output
     // buffer size (see file-header comment) -- kept here only for the
@@ -809,64 +857,89 @@ PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* param
 
     upscale::ImageRGBA8 in_img = world_to_rgba8(input_world);
 
-    upscale::TileOptions tile_opts;
-    tile_opts.tile_size = 0; // auto-select based on active execution provider (see choose_tile_size())
-    tile_opts.overlap = 16;
-    // num_workers FORCED TO 1 (serial tiling) here -- this is deliberate,
-    // not an oversight, and is one of the fixes for a real-Premiere-
-    // hardware freeze (see README.md "安定運用ガイド" and concurrency.h's
-    // file header for the full story): Premiere Pro already parallelizes
-    // 4K rendering across many of its OWN host threads (one call into
-    // HandleRender per in-flight frame). Field logs showed each of those
-    // ~14 host threads ALSO spinning up tile.cpp's internal worker pool
-    // (the old auto=hardware_concurrency default), producing on the order
-    // of host_threads * tile_workers (~14 x 14 = ~200) threads all
-    // fighting over the same CPU/ANE cores at once -- enough to saturate
-    // and freeze the machine. The host's own frame-level parallelism is
-    // the right place for concurrency here; this plugin must not ALSO
-    // parallelize within a single frame on top of it. (Overall
-    // concurrency across host threads is still bounded separately by
-    // ConcurrencyGate inside OnnxUpscaler::upscale() -- see
-    // onnx_upscaler.cpp/.h -- which caps how many upscale() calls run
-    // inference at once regardless of how many host threads call in.)
-    //
-    // upscale_cli (see src/cli/upscale_cli.cpp), by contrast, is a single
-    // process with no host-level frame parallelism to defer to, so it
-    // still passes the user's --jobs value through unchanged (0=auto is
-    // the right default there).
-    tile_opts.num_workers = 1;
-
-    // Request SAME-RESOLUTION output (requested_scale=1) rather than the
-    // model's raw native-scale result: this is the core of the buffer-
-    // expansion retraction (see file-header comment). Passing 1 here tells
-    // OnnxUpscaler::upscale() to set TileOptions::output_scale=1 (see
-    // tile.h/tile.cpp and onnx_upscaler.cpp), which downsizes EACH TILE's
-    // native-scale (typically 4x) result back down immediately after
-    // inference, before compositing -- so at no point does a buffer sized
-    // input_world*4 for the WHOLE frame ever get allocated, regardless of
-    // how large input_world is (this is what let a host-handed input world
-    // far bigger than the nominal source resolution -- e.g.
-    // 4892x8192 -- blow up to a 641,204,224px intermediate and crash the
-    // render in the previous, non-tiled-downsize version of this fix).
-    // Peak memory per tile job is bounded to (tile_size*native_scale)^2,
-    // not (input_world*native_scale)^2.
-    //
-    // The "Scale" UI popup (2x/4x) no longer controls output buffer size
-    // (there's only one output size now: input_world's own size) -- it's
-    // reserved for a future internal detail-regeneration-strength knob
-    // (TODO, see README.md); both choices currently take the same
-    // same-resolution code path here.
+    // Request SAME-RESOLUTION output (both engines): this is the core of
+    // the buffer-expansion retraction (see file-header comment) -- the
+    // output world is always kept at input_world's own size, never grown.
     upscale::ImageRGBA8 same_res_out;
-    try {
-        seq->upscaler->upscale(in_img, same_res_out, /*requested_scale=*/1, tile_opts);
-    } catch (const upscale::OnnxUpscalerError& ex) {
-        upscale::log_error(std::string("HandleRender: upscale failed: ") + ex.what());
-        set_return_msg(out_data, "AI Upscale: render failed (%s).", ex.what());
-        return PF_Err_INTERNAL_STRUCT_DAMAGED;
-    } catch (const upscale::SizeLimitError& ex) {
-        upscale::log_error(std::string("HandleRender: upscale rejected by size limit: ") + ex.what());
-        set_return_msg(out_data, "AI Upscale: frame too large (%s).", ex.what());
-        return PF_Err_INTERNAL_STRUCT_DAMAGED;
+
+    if (use_ai_engine) {
+        upscale::TileOptions tile_opts;
+        tile_opts.tile_size = 0; // auto-select based on active execution provider (see choose_tile_size())
+        tile_opts.overlap = 16;
+        // num_workers FORCED TO 1 (serial tiling) here -- this is deliberate,
+        // not an oversight, and is one of the fixes for a real-Premiere-
+        // hardware freeze (see README.md "安定運用ガイド" and concurrency.h's
+        // file header for the full story): Premiere Pro already parallelizes
+        // 4K rendering across many of its OWN host threads (one call into
+        // HandleRender per in-flight frame). Field logs showed each of those
+        // ~14 host threads ALSO spinning up tile.cpp's internal worker pool
+        // (the old auto=hardware_concurrency default), producing on the order
+        // of host_threads * tile_workers (~14 x 14 = ~200) threads all
+        // fighting over the same CPU/ANE cores at once -- enough to saturate
+        // and freeze the machine. The host's own frame-level parallelism is
+        // the right place for concurrency here; this plugin must not ALSO
+        // parallelize within a single frame on top of it. (Overall
+        // concurrency across host threads is still bounded separately by
+        // ConcurrencyGate inside OnnxUpscaler::upscale() -- see
+        // onnx_upscaler.cpp/.h -- which caps how many upscale() calls run
+        // inference at once regardless of how many host threads call in.)
+        //
+        // upscale_cli (see src/cli/upscale_cli.cpp), by contrast, is a single
+        // process with no host-level frame parallelism to defer to, so it
+        // still passes the user's --jobs value through unchanged (0=auto is
+        // the right default there).
+        tile_opts.num_workers = 1;
+
+        // requested_scale=1 tells OnnxUpscaler::upscale() to set
+        // TileOptions::output_scale=1 (see tile.h/tile.cpp and
+        // onnx_upscaler.cpp), which downsizes EACH TILE's native-scale
+        // (typically 4x) result back down immediately after inference,
+        // before compositing -- so at no point does a buffer sized
+        // input_world*4 for the WHOLE frame ever get allocated, regardless of
+        // how large input_world is (this is what let a host-handed input world
+        // far bigger than the nominal source resolution -- e.g.
+        // 4892x8192 -- blow up to a 641,204,224px intermediate and crash the
+        // render in the previous, non-tiled-downsize version of this fix).
+        // Peak memory per tile job is bounded to (tile_size*native_scale)^2,
+        // not (input_world*native_scale)^2.
+        //
+        // The "Scale" UI popup (2x/4x) no longer controls output buffer size
+        // (there's only one output size now: input_world's own size) -- it's
+        // reserved for a future internal detail-regeneration-strength knob
+        // (TODO, see README.md); both choices currently take the same
+        // same-resolution code path here.
+        try {
+            seq->upscaler->upscale(in_img, same_res_out, /*requested_scale=*/1, tile_opts);
+        } catch (const upscale::OnnxUpscalerError& ex) {
+            upscale::log_error(std::string("HandleRender: upscale failed: ") + ex.what());
+            set_return_msg(out_data, "AI Upscale: render failed (%s).", ex.what());
+            return PF_Err_INTERNAL_STRUCT_DAMAGED;
+        } catch (const upscale::SizeLimitError& ex) {
+            upscale::log_error(std::string("HandleRender: upscale rejected by size limit: ") + ex.what());
+            set_return_msg(out_data, "AI Upscale: frame too large (%s).", ex.what());
+            return PF_Err_INTERNAL_STRUCT_DAMAGED;
+        }
+    } else {
+        // Detail Preserve (Fast) engine -- the default. Classical, non-
+        // neural, clean-room algorithm (see detail_upscaler.h); no model,
+        // no OnnxUpscaler, no ConcurrencyGate, and (unlike the AI engine
+        // above) no need to force num_workers=1 since this function never
+        // spawns worker threads to begin with -- it always runs directly,
+        // serially, on the calling (Premiere host) render thread, which is
+        // exactly the "num_workers=1-equivalent" behavior the task calls
+        // for. Same-size in/out (out_w/out_h == in_img's own size) means
+        // detail_preserving_upscale() skips its internal Lanczos base
+        // resize entirely and only runs the detail-restoration stage --
+        // see detail_upscaler.h/.cpp.
+        const float detail_amount = static_cast<float>(params[AI_UPSCALE_DETAIL_SLIDER]->u.fs_d.value);
+        try {
+            upscale::detail_preserving_upscale(in_img, same_res_out, in_img.width, in_img.height, detail_amount);
+        } catch (const upscale::SizeLimitError& ex) {
+            upscale::log_error(std::string("HandleRender: detail_preserving_upscale rejected by size limit: ") +
+                                ex.what());
+            set_return_msg(out_data, "AI Upscale: frame too large (%s).", ex.what());
+            return PF_Err_INTERNAL_STRUCT_DAMAGED;
+        }
     }
 
     const int out_target_w = static_cast<int>(output->width);

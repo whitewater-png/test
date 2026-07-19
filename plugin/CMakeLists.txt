@@ -123,6 +123,7 @@ add_library(upscale_core STATIC
     src/core/onnx_upscaler.cpp
     src/core/tile.cpp
     src/core/concurrency.cpp
+    src/core/detail_upscaler.cpp
 )
 target_include_directories(upscale_core
     PUBLIC
@@ -318,6 +319,21 @@ if(PYTHON3_EXECUTABLE)
     add_dependencies(test_onnx_upscaler_sharing generate_test_model_4x)
 endif()
 add_test(NAME test_onnx_upscaler_sharing COMMAND test_onnx_upscaler_sharing)
+
+# ---------------------------------------------------------------------------
+# test_detail_upscaler (upscale_core unit test, Linux/CI-runnable)
+#
+# Unit test for the classical edge-preserving upscaler added as the new
+# default "AI Upscale" engine (src/core/detail_upscaler.h/.cpp), replacing
+# Real-ESRGAN/ONNX as the default because that neural engine was too slow
+# for realtime/render use in Premiere. No onnxruntime/model dependency --
+# pure upscale_core math, see tests/test_detail_upscaler.cpp.
+# ---------------------------------------------------------------------------
+add_executable(test_detail_upscaler
+    tests/test_detail_upscaler.cpp
+)
+target_link_libraries(test_detail_upscaler PRIVATE upscale_core)
+add_test(NAME test_detail_upscaler COMMAND test_detail_upscaler)
 
 endif() # AIUPSCALE_BUILD_TESTS
 

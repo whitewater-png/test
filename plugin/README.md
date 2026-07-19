@@ -25,10 +25,22 @@ bash plugin/setup_mac.sh
 詳しい各工程の説明・トラブルシューティングは以下の各節を参照してください。
 
 FlashBack Japan の [ScaleUp](https://flashbackj.com/product/scaleup) と同形態の、
-Premiere Pro / After Effects 用ネイティブAIアップスケール・エフェクトプラグインです。
-編集ソフト内でエフェクトとして適用でき、Real-ESRGAN系のONNXモデルによる超解像処理で
-クリップを2倍・4倍にアップスケールします（Photo=実写向け / Anime=アニメ・イラスト向け、
-ScaleUpのSharp/Cartoonに相当）。
+Premiere Pro / After Effects 用ネイティブアップスケール・エフェクトプラグインです。
+
+**既定の処理エンジンは「Detail Preserve（ディテール保持アップスケール）」です。**
+After Effects純正の「ディテール保持アップスケール」（Detail-preserving Upscale）
+と同種の、**高速な古典的（非ニューラル）エッジ保持拡大アルゴリズム**を
+クリーンルームで独自実装したものです（`src/core/detail_upscaler.h/.cpp`。
+Adobeのコードは一切参照・移植していません — Lanczosリサンプル・アンシャープ
+マスク・Sobelエッジ検出・ローカルmin/maxクランプという、いずれも数十年前から
+公知の古典的画像処理手法の組み合わせによる独立実装です）。1フレームあたり
+数十〜数百ms級で動作するため、Premiereのタイムライン上でのリアルタイム
+プレビュー・レンダリング用途に向いています。
+
+Real-ESRGAN系のONNXモデルによるニューラル超解像（Photo=実写向け /
+Anime=アニメ・イラスト向け、ScaleUpのSharp/Cartoonに相当）も「Engine」
+パラメータで選択式で利用できますが、4K実機で1フレーム数秒かかるため
+リアルタイム用途には不向きです（後述「使い分け」参照）。
 
 ルートの `upscale.py`（ffmpeg + realesrgan-ncnn-vulkanによる書き出し前処理ツール）とは別に、
 こちらは編集ソフト内で完結させたい場合の選択肢です。両者の違いは
@@ -49,8 +61,11 @@ ScaleUpのSharp/Cartoonに相当）。
 |                              | ImageRGBA8 (core非依存の共通形式) |
 |   +--------------------------v-------------------------------+ |
 |   |  src/core/ (Adobe非依存。この環境で単体ビルド・テスト可) | |
-|   |   onnx_upscaler.cpp/.h : ONNX Runtime推論、前処理/後処理  | |
+|   |   detail_upscaler.cpp/.h : 既定エンジン。古典的エッジ保持  | |
+|   |                            アップスケール（独自実装、モデル不要） | |
+|   |   onnx_upscaler.cpp/.h : 選択式AIエンジン。ONNX Runtime推論 | |
 |   |   tile.cpp/.h          : タイル分割・オーバーラップ合成    | |
+|   |                            (AIエンジンのみ使用)            | |
 |   +------------------------------------------------------------+ |
 +-------------------------------------------------------------+
 
@@ -117,8 +132,8 @@ python3 plugin/tests/check_png_size.py /tmp/out.png --expect 256 256
 ### 単体テスト（開発者向け、既定では無効）
 
 `test_resample` / `test_tile_output_scale` / `test_concurrency_gate` /
-`test_onnx_upscaler_sharing` の4つの単体テスト（および
-`test_onnx_upscaler_sharing` 用のテストモデル生成
+`test_onnx_upscaler_sharing` / `test_detail_upscaler` の5つの単体テスト
+（および `test_onnx_upscaler_sharing` 用のテストモデル生成
 `generate_test_model_4x`）は既定のビルドには含まれません
 （`AIUPSCALE_BUILD_TESTS` オプションが既定でOFF）。これは、エンドユーザー
 向けの `setup_mac.sh` のビルド（onnx未導入が前提）がテストモデル生成の
@@ -296,6 +311,33 @@ python3 plugin/scripts/export_realesrgan_onnx.py \
 
 ## 使い方ガイド
 
+### パラメータ
+
+Premiere/AEのエフェクトコントロールに表示されるパラメータは以下の4つです
+（`src/plugin/AIUpscale.h`/`.cpp`、`PF_Cmd_PARAMS_SETUP`で追加される順）。
+
+| パラメータ | 種類 | 選択肢 / 範囲 | 既定値 | 説明 |
+|---|---|---|---|---|
+| `Engine` | ポップアップ | `Detail Preserve (Fast)` / `AI Real-ESRGAN` | `Detail Preserve (Fast)` | 処理エンジンの選択。既定は高速な古典的（非ニューラル）エッジ保持アップスケール（`src/core/detail_upscaler.h`、独自実装）。`AI Real-ESRGAN`を選ぶと従来のONNX推論エンジンに切り替わる（低速・高画質） |
+| `Scale` | ポップアップ | `2x` / `4x` | `2x` | 内部処理倍率の目安（本エフェクトは常に入力と同解像度で出力するため出力解像度自体には影響しない。CLI/`upscale_video.sh`での実際の拡大用途と共用の概念） |
+| `Mode` | ポップアップ | `Photo` / `Anime` | `Photo` | **`Engine = AI Real-ESRGAN` のときのみ意味を持つ。** 使用するRealESRGANモデル（実写向け/アニメ向け）を選択。`Engine = Detail Preserve (Fast)` のときは無視される |
+| `Detail` | 数値スライダー | `0` 〜 `100` | `50` | **`Engine = Detail Preserve (Fast)` のときのみ意味を持つ。** エッジ適応アンシャープマスクの強さ。`0`=Lanczosベース処理のみ（シャープ化なし）、`50`=標準、`100`=最大強度。`Engine = AI Real-ESRGAN` のときは無視される |
+
+### 使い分け: Detail Preserveエンジン（リアルタイム）と AI/`upscale_video.sh`（事前変換）
+
+| | Detail Preserveエンジン（既定、リアルタイム） | AI Real-ESRGANエンジン / `upscale_video.sh` |
+|---|---|---|
+| アルゴリズム | 古典的エッジ保持アップスケール（独自実装、非ニューラル） | ニューラル超解像（Real-ESRGAN、ONNX Runtime） |
+| 速度 | 4Kフレームあたり数十〜数百ms級（このリポジトリのLinux/CPU環境での実測は後述） | 4Kフレームあたり数百ms〜数秒級（実機M4 Max/CoreMLでも） |
+| 用途 | タイムライン上のリアルタイムプレビュー・軽量なレンダリング | 本番用の最高画質が必要な事前変換（バッチ処理） |
+| モデルファイル | 不要 | 必要（`plugin/models/`配下、`download_models.py`で取得） |
+| 画質の性質 | AEの「ディテール保持アップスケール」と同種の古典的手法。エッジは保持しつつハロー（輪郭破綻）を抑制 | ニューラルネットによる高度なディテール復元・テクスチャ生成 |
+
+推奨: 編集中の確認やリアルタイム用途では既定のDetail Preserveエンジンを
+そのまま使い、書き出し前の最高画質が必要な素材だけ `Engine`
+を `AI Real-ESRGAN` に切り替えるか、後述の `upscale_video.sh`
+（AIエンジンによる事前バッチ変換、真に解像度が上がる）を使ってください。
+
 ### 推奨ワークフロー: 素材の事前アップスケール（パンチイン用途）
 
 4K素材をPremiereのタイムライン上で「モーション/トランスフォーム」の
@@ -323,7 +365,11 @@ python3 plugin/scripts/export_realesrgan_onnx.py \
 #### 使い方
 
 ```bash
+# AIエンジン（既定、最高画質・低速）
 bash plugin/scripts/upscale_video.sh cam3sideA.mov --scale 4 --codec prores
+
+# Detail Preserveエンジン（高速、モデル不要）で事前一括変換したい場合
+bash plugin/scripts/upscale_video.sh cam3sideA.mov --engine detail --scale 4 --detail 75 --codec prores
 ```
 
 主なオプション（詳細は `bash plugin/scripts/upscale_video.sh --help`）:
@@ -331,18 +377,24 @@ bash plugin/scripts/upscale_video.sh cam3sideA.mov --scale 4 --codec prores
 | オプション | 説明 | 既定値 |
 |---|---|---|
 | `-o, --output <path>` | 出力パス | `<入力名>_upscaled.mov` |
+| `--engine {ai,detail}` | 処理エンジン。`ai`=Real-ESRGAN（最高画質・低速）、`detail`=古典的エッジ保持アップスケール（プラグインの既定エンジンと同じ実装、高速・モデル不要） | `ai`（本スクリプトは事前バッチ変換用途のためAI既定。プラグイン本体側の既定は`detail`） |
 | `--scale {2,4}` | 拡大倍率 | `4` |
-| `--mode {photo,anime}` | 実写向け/アニメ向けモデル | `photo` |
+| `--mode {photo,anime}` | 実写向け/アニメ向けモデル（`--engine ai` のみ） | `photo` |
+| `--detail N` | Detail Preserveエンジンの強度 0〜100（`--engine detail` のみ） | `50` |
 | `--codec {prores,h264}` | 出力コーデック | `prores` (ProRes 422 HQ) |
-| `--jobs N` | `upscale_cli` へ渡す並列度 | 自動 |
-| `--model-dir <dir>` | モデルディレクトリ | インストール先の`models/`、無ければ`plugin/models` |
+| `--jobs N` | `upscale_cli` へ渡す並列度（`--engine ai` のみ。`detail`は常に単一スレッド） | 自動 |
+| `--model-dir <dir>` | モデルディレクトリ（`--engine ai` のみ） | インストール先の`models/`、無ければ`plugin/models` |
 | `--upscale-cli <path>` | `upscale_cli` バイナリのパス | `plugin/build/upscale_cli` を自動探索 |
 
 内部では、動画をフレームごとのPNG連番に分解し、`upscale_cli`
-（`plugin/src/cli/upscale_cli.cpp`、ONNX Runtime / CoreML実行プロバイダ）
-で1枚ずつAIアップスケールした後、元動画の音声・fps・タイムコードを
-保持したまま動画へ再結合します。事前に `bash plugin/setup_mac.sh` で
-`upscale_cli` のビルドとモデル取得を済ませておく必要があります。
+（`plugin/src/cli/upscale_cli.cpp`）で1枚ずつアップスケールした後、元動画の
+音声・fps・タイムコードを保持したまま動画へ再結合します。`--engine ai`
+（既定）はONNX Runtime / CoreML実行プロバイダによるRealESRGAN推論、
+`--engine detail` は `src/core/detail_upscaler.h`
+の古典的エッジ保持アップスケール（モデル不要）を使います。`--engine ai`
+を使う場合は事前に `bash plugin/setup_mac.sh` で `upscale_cli`
+のビルドとモデル取得を済ませておく必要がありますが、`--engine detail`
+はモデル不要なので `upscale_cli` のビルドさえ済んでいればすぐ使えます。
 
 #### Premiereでの使い方
 
@@ -378,15 +430,15 @@ bash plugin/scripts/upscale_video.sh cam3sideA.mov --scale 4 --codec prores
 
 #### プラグイン（リアルタイム版）との使い分け
 
-| | AI Upscaleプラグイン（リアルタイム） | `upscale_video.sh`（本節） |
+| | AI Upscaleプラグイン（リアルタイム、既定=Detail Preserveエンジン） | `upscale_video.sh`（本節） |
 |---|---|---|
 | 用途 | 編集中の軽い確認・同解像度でのディテール強調 | 本番の高品質パンチイン向け事前処理 |
 | 解像度 | 変化しない（入力と同じ） | 実際に上がる（`--scale`倍） |
 | 処理タイミング | 編集中にリアルタイム/レンダリング時に適用 | 編集前にバッチで一度だけ実行 |
-| 負荷 | 毎フレームのプレビュー・書き出しで発生 | 事前処理時のみ（編集中は軽い） |
+| 負荷 | 毎フレームのプレビュー・書き出しで発生（既定のDetail Preserveエンジンなら軽量） | 事前処理時のみ（編集中は軽い） |
 | 向いているケース | ラフカット段階での見た目確認、同解像度のままのシャープ化 | 本番用素材、大きくパンチインしたいカット |
 
-### このエフェクトの動作モデル: 同解像度でのAIディテール強調
+### このエフェクトの動作モデル: 同解像度でのディテール強調（既定=古典的手法、選択式でAI）
 
 **重要（正直な説明）:** 本エフェクトは、実機検証の結果、**出力バッファの
 解像度を入力より大きくする方式（`PF_OutFlag_I_EXPAND_BUFFER`によるバッファ
@@ -398,23 +450,31 @@ Premiere Proはこのバッファ拡張要求を安定して扱えず、エフ�
 （例: 19568x32768 = 641,204,224ピクセル）が安全上限を超えてレンダリングが
 失敗する不具合が実機ログで確認されました。
 
-そのため、**本エフェクトは常に「入力と同じ解像度のまま、AIでディテールを
+そのため、**本エフェクトは常に「入力と同じ解像度のまま、ディテールを
 再生成・シャープ化して書き戻す」フィルタとして動作します。** ワークフロー上は
 標準的なAE/Premiereのフィルタエフェクトと同じで、レイヤーの解像度自体を
 上げることはしません（そもそも一般のフィルタエフェクトが下流のトランス
 フォームへ真に高解像度なバッファを渡す手段は、ホストの仕様上ありません）。
+この「常に同解像度」という制約自体はAI/Detail Preserveどちらのエンジンにも
+共通です。既定の**Detail Preserveエンジン**では、この同解像度リクエストは
+`detail_preserving_upscale()`（`src/core/detail_upscaler.h`）が内部の
+Lanczosベース拡大ステージを丸ごとスキップし、エッジ適応アンシャープマスクの
+みを直接適用する形で処理されます（同一実装がCLI/`upscale_video.sh`側では
+実際の拡大にも使われます -- 出力サイズが入力と異なる場合はLanczosベース拡大
+ステージも実行されます）。
 
 ### 主な用途: トランスフォームでの拡大（パンチイン）の見え方改善
 
 このエフェクトが最も効果を発揮する典型的なシナリオは、**4Kシーケンス上の
 4K素材を「モーション/トランスフォーム」エフェクトのスケールでパンチイン
-（部分拡大）したときに映像が荒くなる問題**を、AIでディテールを再生成・
+（部分拡大）したときに映像が荒くなる問題**を、ディテールを再生成・
 シャープ化しておくことで軽減することです（真の解像度向上ではなく、拡大後の
 見た目の鮮明さの改善である点に注意してください）。
 
 **手順:**
 
-1. 4Kクリップ（4Kシーケンス上）に「AI Upscale」エフェクトを適用します。
+1. 4Kクリップ（4Kシーケンス上）に「AI Upscale」エフェクトを適用します
+   （既定のままなら`Engine = Detail Preserve (Fast)`）。
    出力は入力と同じ解像度のまま、ディテールが強調されたフレームになります。
 2. 同じクリップに「モーション」エフェクト（またはトランスフォームエフェクト）
    を追加し、`スケール` を目的のパンチイン率に設定して拡大します。
@@ -423,9 +483,14 @@ Premiere Proはこのバッファ拡張要求を安定して扱えず、エフ�
    トランスフォーム後の（既に拡大されて荒れた）フレームを処理することに
    なり、狙った効果が得られません。
 4. `Scale` パラメータ（2x/4x）は現時点では内部処理の目安（将来の強度調整用
-   フック、TODO）であり、出力解像度には影響しません。どちらを選んでも
-   同じ「モデルのネイティブ倍率で処理→同解像度へ高品質ダウンサンプルして
-   書き戻す」処理が行われます。
+   フック、TODO）であり、出力解像度には影響しません。どちらを選んでも、
+   選択中のエンジンが内部でネイティブ倍率相当の処理→同解像度へ高品質
+   ダウンサンプルして書き戻す、という同じ結果になります（`Engine`
+   ポップアップで実際の処理内容は変わりますが、`Scale`
+   自体はどちらのエンジンでも出力サイズに影響しません）。
+5. シャープ化の強弱は、Detail Preserveエンジン使用時は `Detail`
+   スライダー（0〜100、既定50）で調整できます。AI Real-ESRGANエンジン
+   使用時は `Detail` は無視されます。
 
 現在どのサイズ関係で動作しているかは、ログの `expand_status`
 （`detail-regen` = 想定通りの同解像度動作 / `custom` = ホスト側の事情による
@@ -455,6 +520,16 @@ Premiere Proはこのバッファ拡張要求を安定して扱えず、エフ�
 ## 安定運用ガイド
 
 このプラグイン/CLIで問題が起きた場合の切り分け手順です。
+
+**注記:** 本節で説明するモデルロード・CoreML実行プロバイダ・
+ConcurrencyGate・タイル並列処理まわりのトラブルシューティングは、
+すべて `Engine = AI Real-ESRGAN` を選択した場合にのみ関係します。
+既定の `Engine = Detail Preserve (Fast)` はモデルを一切ロードせず
+（`ensure_model_loaded()` 自体を呼びません）、ConcurrencyGateやONNX
+Runtimeのタイル並列処理も経由しないため、本節のほとんどの項目は
+そもそも発生しようがありません。Detail Preserveエンジン使用時に
+問題が起きた場合は、ログの `detail_preserving_upscale` 関連の
+`[ERROR]`行（サイズ上限超過など）を確認してください。
 
 ### ログの場所
 
@@ -634,10 +709,19 @@ I/O負荷を避けるためで、フリーズの主因ではありませんが�
   (`TileOptions::output_scale`) に変更し、ホストが渡す入力ワールドが
   どれだけ大きくても、モデルのネイティブ倍率×フレーム全体サイズの巨大な
   中間バッファを確保しないようにしています。
-- **リアルタイム再生は不可**、レンダリング/書き出し用途を想定しています
-  （CPU推論はもちろん、GPU/ANE推論であっても4Kフレームの超解像はフレームあたり
-  数百ms〜数秒かかるため）。
-- **CoreML EP (macOS) はこの環境では実機未検証です。** `UPSCALE_WITH_COREML`
+- **`Engine = AI Real-ESRGAN` はリアルタイム再生に不向き**で、レンダリング/
+  書き出し用途を想定しています（CPU推論はもちろん、GPU/ANE推論であっても
+  4Kフレームの超解像はフレームあたり数百ms〜数秒かかるため）。既定の
+  `Engine = Detail Preserve (Fast)` はこの制約に当てはまりません
+  （モデル推論を一切行わない古典的アルゴリズムのため、このリポジトリの
+  Linux/CPU開発環境でも4Kフレームあたり概ね1秒未満、多くの場合数百ms級 --
+  実測値は「この環境（Adobe SDK無し・GPU無し）での検証について」参照）が、
+  それでも真のリアルタイム（毎フレーム数ms級）ではないため、タイムライン上の
+  プレビュー品質設定やシーケンスのプレビュー解像度によっては、なお
+  スクラブ時にコマ落ちする可能性があります。
+- **CoreML EP (macOS) はこの環境では実機未検証です。** これは
+  `Engine = AI Real-ESRGAN` にのみ関係します（`Engine = Detail Preserve
+  (Fast)` はCoreML/ONNX Runtimeを一切使いません）。`UPSCALE_WITH_COREML`
   はコンパイル時に有効化され、`AppendExecutionProvider("CoreML", ...)` の
   呼び出しコード自体はこのLinux環境でもコンパイル対象になりますが
   （`#ifdef __APPLE__` の外側のロジックはビルドされます）、実際にCoreML EPが
@@ -646,6 +730,15 @@ I/O負荷を避けるためで、フリーズの主因ではありませんが�
 - SmartFX（`PF_Cmd_SMART_PRE_RENDER` / `PF_Cmd_SMART_RENDER`）には未対応です。
   現状は旧来の（バッファ拡張を伴わない、同解像度の）レンダリングパスのみ
   実装しています。
+- **Detail Preserveエンジン自体の性質**: ニューラルネットのようにテクスチャ
+  や欠落したディテールを「生成」するわけではなく、既存のエッジ情報を
+  Lanczosリサンプル + エッジ適応アンシャープマスクで強調・保持する古典的な
+  手法です。そのため、AIエンジンほど劇的なディテール復元（特に低解像度な
+  素材からの復元）は期待できません -- 4K以上の素材の同解像度シャープ化や、
+  中程度の拡大率でのパンチイン向けの軽量な選択肢という位置付けです。
+  エッジ検出はSobel勾配ベースの3x3近傍、ハロー抑制も3x3近傍のmin/maxクランプ
+  （実装は分離可能フィルタで高速化）のため、非常に細いディテール（1px幅の
+  線など）では効果が弱くなることがあります。
 
 ## ロードマップ
 
@@ -693,6 +786,43 @@ I/O負荷を避けるためで、フリーズの主因ではありませんが�
 | 1024x1024 | 128 | 8 | 2.094s | `cmp` で一致 |
 | 2048x2048 | 128 | 1 | 11.286s | 基準 |
 | 2048x2048 | 128 | 4 | 3.311s (**約3.4倍高速**) | `cmp` で一致 |
+
+### Detail Preserveエンジンの速度測定結果（このLinux/CPU環境、共有・仮想化環境）
+
+`detail_preserving_upscale()`（`src/core/detail_upscaler.h/.cpp`、既定エンジン）
+の単体テスト `test_detail_upscaler`（`AIUPSCALE_BUILD_TESTS=ON`時のみビルド）で
+1920x1080 → 3840x2160（4x、`detail_amount=50`）の1回あたりの処理時間を計測した
+参考値です。
+
+| 実行 | 処理時間 |
+|---|---|
+| 1回目 | 約1.0〜1.1秒 |
+| 2回目 | 約1.0〜2.5秒（このリポジトリのサンドボックス/共有CPU環境のため実行毎にばらつきあり） |
+
+このリポジトリの開発コンテナはCPUが共有・仮想化されており実行毎の
+ばらつきが大きいため、上記は目安の参考値です。当初の素朴な実装
+（3x3近傍のmin/maxを毎画素で愚直に再計算）では同条件で約2.9秒でしたが、
+separable（分離可能フィルタ）なmin/max演算（`local_min_max_rgb()`、
+2Dの正方形構造要素によるmin/maxフィルタは2つの1Dパスに分解できるという
+数学的最適化の標準テクニック）に置き換えたことで約2.7倍高速化しています。
+M4 Max実機や、このコンテナのようなCPU共有・スロットリングの無い専有環境
+では、より安定して1秒未満（目標値）に収まると見込まれますが、実機での
+確認を推奨します。`--engine ai` のRealESRGAN推論（4Kフレームあたり数百ms〜
+数秒）と比べると、モデル推論を一切行わない分、明確に高速です。
+
+`upscale_cli --engine detail` による簡易な鮮明さ（シャープネス）の
+統計チェックも行いました。320x240のテスト画像を4倍に拡大し、隣接画素間の
+平均輝度勾配（エッジの強さの目安）を比較したところ:
+
+| 手法 | 平均勾配 |
+|---|---|
+| `resize_rgba_bilinear()` のみ | 1.8899 |
+| Detail Preserveエンジン, `detail=0`（Lanczosベースのみ） | 2.6118 |
+| Detail Preserveエンジン, `detail=100`（最大強度） | 2.7063 |
+
+単純なbilinear補間よりLanczosベース拡大の方が既に鮮明（高周波成分をより
+保持する）で、そこにエッジ適応アンシャープマスクを最大強度で適用すると
+さらに鮮明になる、という期待通りの単調な傾向が確認できました。
 
 出力は `cmp`（バイト完全一致）で検証しており、これは意図的な設計です
 （`upscale_tiled()` はタイルの推論・前処理・後処理を並列実行しつつ、

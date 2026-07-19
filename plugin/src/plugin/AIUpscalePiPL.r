@@ -65,15 +65,20 @@ resource 'PiPL' (16000) {
         AE_Effect_Version {
             // Major.Minor.Bug, stage (develop/alpha/beta/release), build
             // -- keep in sync with AIUpscale.h's AI_UPSCALE_*_VERSION
-            // (MAJOR=1, MINOR=0, BUG=0, STAGE=PF_Stage_DEVELOP=0, BUILD=1).
+            // (MAJOR=1, MINOR=1, BUG=0, STAGE=PF_Stage_DEVELOP=0, BUILD=1).
+            // MINOR bumped 0 -> 1 when the "Engine" popup and "Detail"
+            // slider params were added and the default processing engine
+            // changed from AI (Real-ESRGAN) to the classical Detail
+            // Preserve engine (see AIUpscale.h/.cpp and
+            // detail_upscaler.h/.cpp).
             // Verified against AE_EffectVers.h's packing:
             //   PF_VERSION(MAJOR,MINOR,BUG,STAGE,BUILD) =
             //     ((MAJOR & 0x7) << 19) | ((MINOR & 0xF) << 15) |
             //     ((BUG & 0xF) << 11) | ((STAGE & 0x3) << 9) | (BUILD & 0x1FF)
-            //   = (1 << 19) | 1 = 524288 + 1 = 524289. Recompute this value
-            // (and update it here) if AI_UPSCALE_*_VERSION in AIUpscale.h
-            // ever changes.
-            524289
+            //   = (1 << 19) | (1 << 15) | 1 = 524288 + 32768 + 1 = 557057.
+            // Recompute this value (and update it here) if
+            // AI_UPSCALE_*_VERSION in AIUpscale.h ever changes.
+            557057
         },
 
         AE_Effect_Info_Flags {
