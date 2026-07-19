@@ -27,7 +27,7 @@ bash plugin/setup_mac.sh
 FlashBack Japan の [ScaleUp](https://flashbackj.com/product/scaleup) と同形態の、
 Premiere Pro / After Effects 用ネイティブアップスケール・エフェクトプラグインです。
 
-**既定の処理エンジンは「Detail Preserve（ディテール保持アップスケール）」です。**
+**処理エンジンは「Detail Preserve（ディテール保持アップスケール）」のみです。**
 After Effects純正の「ディテール保持アップスケール」（Detail-preserving Upscale）
 と同種の、**高速な古典的（非ニューラル）エッジ保持拡大アルゴリズム**を
 クリーンルームで独自実装したものです（`src/core/detail_upscaler.h/.cpp`。
@@ -37,10 +37,16 @@ Adobeのコードは一切参照・移植していません — Lanczosリサン
 数十〜数百ms級で動作するため、Premiereのタイムライン上でのリアルタイム
 プレビュー・レンダリング用途に向いています。
 
+**このPremiere/AEプラグインはDetail Preserveエンジン専用です。** かつては
 Real-ESRGAN系のONNXモデルによるニューラル超解像（Photo=実写向け /
-Anime=アニメ・イラスト向け、ScaleUpのSharp/Cartoonに相当）も「Engine」
-パラメータで選択式で利用できますが、4K実機で1フレーム数秒かかるため
-リアルタイム用途には不向きです（後述「使い分け」参照）。
+Anime=アニメ・イラスト向け）も「Engine」パラメータで選択式に利用できましたが、
+このAIエンジンは実機（開発者のマシン）では重すぎて実用にならず、誤って
+選択するとレンダリングがフリーズする原因にしかならなかったため、Premiere用
+プラグインからは完全に削除しました。パラメータは「Detail」スライダー1つのみ
+です。真にAIアップスケールを使いたい場合は、後述の `upscale_cli` /
+`plugin/scripts/upscale_video.sh`（事前バッチ変換用途、Premiereの
+リアルタイムエフェクトとは無関係）を使ってください。こちらはAIエンジンを
+引き続きフルサポートしています。
 
 ルートの `upscale.py`（ffmpeg + realesrgan-ncnn-vulkanによる書き出し前処理ツール）とは別に、
 こちらは編集ソフト内で完結させたい場合の選択肢です。両者の違いは
@@ -56,21 +62,26 @@ Anime=アニメ・イラスト向け、ScaleUpのSharp/Cartoonに相当）も「
 |   |  src/plugin/ (AE SDK層。Adobe SDKが無いとビルド不可)    | |
 |   |   AIUpscale.cpp/.h : PF_Cmd ディスパッチ、               | |
 |   |                       PF_EffectWorld <-> ImageRGBA8 変換  | |
+|   |                       (Detail Preserveエンジン専用。AI    | |
+|   |                       エンジン/onnxruntimeへの依存なし)    | |
 |   |   AIUpscalePiPL.r  : PiPLリソース (エフェクト名/カテゴリ) | |
 |   +--------------------------|-------------------------------+ |
 |                              | ImageRGBA8 (core非依存の共通形式) |
 |   +--------------------------v-------------------------------+ |
 |   |  src/core/ (Adobe非依存。この環境で単体ビルド・テスト可) | |
-|   |   detail_upscaler.cpp/.h : 既定エンジン。古典的エッジ保持  | |
-|   |                            アップスケール（独自実装、モデル不要） | |
-|   |   onnx_upscaler.cpp/.h : 選択式AIエンジン。ONNX Runtime推論 | |
-|   |   tile.cpp/.h          : タイル分割・オーバーラップ合成    | |
-|   |                            (AIエンジンのみ使用)            | |
+|   |   detail_upscaler.cpp/.h : 古典的エッジ保持アップスケール  | |
+|   |                            （独自実装、モデル不要）。       | |
+|   |                            プラグイン・CLI両方が使用       | |
+|   |   onnx_upscaler.cpp/.h : AIエンジン。ONNX Runtime推論      | |
+|   |                            (CLI/upscale_video.shのみ使用。 | |
+|   |                            Premiereプラグインには含まれない)| |
+|   |   tile.cpp/.h          : タイル分割・オーバーラップ合成、   | |
+|   |                            resize_rgba_bilinear()          | |
 |   +------------------------------------------------------------+ |
 +-------------------------------------------------------------+
 
    src/cli/upscale_cli.cpp : src/core/ を単体で叩くテスト用CLI
-                              (PNG入出力、Adobe/GPU不要)
+                              (PNG入出力、Adobe/GPU不要。AI/Detail両エンジン対応)
 ```
 
 コア層 (`src/core`) はAdobe SDKに一切依存しないため、Adobe SDKもGPUも無い
@@ -78,6 +89,16 @@ Linux環境でも `upscale_cli` を通してビルド・テストできます。
 `src/plugin` 層は薄いアダプタで、`PF_EffectWorld`（BGRA_8u前提）を
 `ImageRGBA8` に変換してコア層に渡すだけです。Adobe SDKが手に入り次第、
 コア層はそのまま流用してプラグイン層だけをビルドできる構成にしています。
+
+**AIUpscale（Premiereプラグイン）とupscale_cli/upscale_video.shで、リンクする
+コアライブラリが異なります。** `plugin/CMakeLists.txt` は `src/core` から
+2つの静的ライブラリをビルドします: `upscale_core`（`onnx_upscaler.cpp` /
+`tile.cpp` / `concurrency.cpp` / `detail_upscaler.cpp` を含む、onnxruntimeに
+リンクするフル版。`upscale_cli` と単体テストが使用）と、
+`upscale_detail_core`（`detail_upscaler.cpp` / `tile.cpp` のみを含む、
+onnxruntimeへの依存が一切無い版。AIUpscaleプラグインターゲットが使用）です。
+プラグインがDetail Preserveエンジン専用になったため、この分離によって
+プラグイン本体はonnxruntimeライブラリを一切リンクしなくなりました。
 
 ## 前提条件
 
@@ -305,38 +326,44 @@ python3 plugin/scripts/export_realesrgan_onnx.py \
 | After Effects | `Adobe After Effects <version>/Support Files/Plug-ins/` |
 | Premiere Pro | 共通プラグインフォルダ（MediaCore）: Windows `C:\Program Files\Common Files\Adobe\Plug-ins\Common\`、macOS `/Library/Application Support/Adobe/Common/Plug-ins/<version>/MediaCore/` |
 
-`models/` ディレクトリはプラグイン本体（`.aex` / `.plugin`）と同じ場所に
-配置してください（`AIUpscale.cpp` の `resolve_plugin_directory()` が
-プラグインディレクトリ配下の `models/` を参照します）。
+**`models/` はPremiereプラグイン自体には不要です。** プラグインは
+Detail Preserveエンジン専用になり、モデルファイルを一切ロードしないため
+（`resolve_plugin_directory()` / モデルパス解決コードはプラグインから
+削除済み）です。`models/` ディレクトリが必要になるのは、AIエンジンを使う
+`upscale_cli` / `plugin/scripts/upscale_video.sh` を使う場合のみです
+（`--model-dir` で指定するか、既定の `plugin/models` を使ってください）。
 
 ## 使い方ガイド
 
 ### パラメータ
 
-Premiere/AEのエフェクトコントロールに表示されるパラメータは以下の4つです
-（`src/plugin/AIUpscale.h`/`.cpp`、`PF_Cmd_PARAMS_SETUP`で追加される順）。
+**Premiere/AEのエフェクトコントロールに表示されるパラメータは `Detail` の
+1つだけです**（`src/plugin/AIUpscale.h`/`.cpp`、`PF_Cmd_PARAMS_SETUP`）。
+かつて存在した `Engine`（Detail Preserve / AI Real-ESRGAN選択）、`Scale`、
+`Mode` の3ポップアップは削除しました。AIエンジンは実機（開発者のマシン）
+では重すぎて実用にならず、誤って選択するとレンダリングがフリーズする原因に
+しかならなかったため、Premiere用プラグインからは完全に取り除いています。
 
 | パラメータ | 種類 | 選択肢 / 範囲 | 既定値 | 説明 |
 |---|---|---|---|---|
-| `Engine` | ポップアップ | `Detail Preserve (Fast)` / `AI Real-ESRGAN` | `Detail Preserve (Fast)` | 処理エンジンの選択。既定は高速な古典的（非ニューラル）エッジ保持アップスケール（`src/core/detail_upscaler.h`、独自実装）。`AI Real-ESRGAN`を選ぶと従来のONNX推論エンジンに切り替わる（低速・高画質） |
-| `Scale` | ポップアップ | `2x` / `4x` | `2x` | 内部処理倍率の目安（本エフェクトは常に入力と同解像度で出力するため出力解像度自体には影響しない。CLI/`upscale_video.sh`での実際の拡大用途と共用の概念） |
-| `Mode` | ポップアップ | `Photo` / `Anime` | `Photo` | **`Engine = AI Real-ESRGAN` のときのみ意味を持つ。** 使用するRealESRGANモデル（実写向け/アニメ向け）を選択。`Engine = Detail Preserve (Fast)` のときは無視される |
-| `Detail` | 数値スライダー | `0` 〜 `100` | `50` | **`Engine = Detail Preserve (Fast)` のときのみ意味を持つ。** エッジ適応アンシャープマスクの強さ。`0`=Lanczosベース処理のみ（シャープ化なし）、`50`=標準、`100`=最大強度。`Engine = AI Real-ESRGAN` のときは無視される |
+| `Detail` | 数値スライダー | `0` 〜 `100` | `50` | エッジ適応アンシャープマスクの強さ。`0`=Lanczosベース処理のみ（シャープ化なし）、`50`=標準、`100`=最大強度 |
 
-### 使い分け: Detail Preserveエンジン（リアルタイム）と AI/`upscale_video.sh`（事前変換）
+### 使い分け: Premiereプラグイン（Detail Preserve、リアルタイム）と AI/`upscale_video.sh`（事前変換）
 
-| | Detail Preserveエンジン（既定、リアルタイム） | AI Real-ESRGANエンジン / `upscale_video.sh` |
+| | Premiereプラグイン（Detail Preserveのみ、リアルタイム） | AI Real-ESRGAN（`upscale_cli` / `upscale_video.sh`） |
 |---|---|---|
 | アルゴリズム | 古典的エッジ保持アップスケール（独自実装、非ニューラル） | ニューラル超解像（Real-ESRGAN、ONNX Runtime） |
 | 速度 | 4Kフレームあたり数十〜数百ms級（このリポジトリのLinux/CPU環境での実測は後述） | 4Kフレームあたり数百ms〜数秒級（実機M4 Max/CoreMLでも） |
 | 用途 | タイムライン上のリアルタイムプレビュー・軽量なレンダリング | 本番用の最高画質が必要な事前変換（バッチ処理） |
-| モデルファイル | 不要 | 必要（`plugin/models/`配下、`download_models.py`で取得） |
+| モデルファイル | 不要（プラグイン自体がモデルをロードするコードを持たない） | 必要（`plugin/models/`配下、`download_models.py`で取得） |
 | 画質の性質 | AEの「ディテール保持アップスケール」と同種の古典的手法。エッジは保持しつつハロー（輪郭破綻）を抑制 | ニューラルネットによる高度なディテール復元・テクスチャ生成 |
+| Premiereプラグインからの利用 | 可能（既定、唯一のエンジン） | 不可（プラグインには含まれない。CLI/バッチ変換専用） |
 
-推奨: 編集中の確認やリアルタイム用途では既定のDetail Preserveエンジンを
-そのまま使い、書き出し前の最高画質が必要な素材だけ `Engine`
-を `AI Real-ESRGAN` に切り替えるか、後述の `upscale_video.sh`
-（AIエンジンによる事前バッチ変換、真に解像度が上がる）を使ってください。
+推奨: 編集中の確認やリアルタイム用途ではPremiereプラグインのDetail
+Preserveエンジンをそのまま使い、書き出し前に最高画質が必要な素材だけ、
+後述の `upscale_video.sh`（AIエンジンによる事前バッチ変換、真に解像度が
+上がる）で別途処理してください。AIエンジンをPremiereのリアルタイム
+エフェクトとして使う手段はもう提供していません。
 
 ### 推奨ワークフロー: 素材の事前アップスケール（パンチイン用途）
 
@@ -430,15 +457,15 @@ bash plugin/scripts/upscale_video.sh cam3sideA.mov --engine detail --scale 4 --d
 
 #### プラグイン（リアルタイム版）との使い分け
 
-| | AI Upscaleプラグイン（リアルタイム、既定=Detail Preserveエンジン） | `upscale_video.sh`（本節） |
+| | AI Upscaleプラグイン（リアルタイム、Detail Preserveエンジン専用） | `upscale_video.sh`（本節、AI/Detail両対応） |
 |---|---|---|
 | 用途 | 編集中の軽い確認・同解像度でのディテール強調 | 本番の高品質パンチイン向け事前処理 |
 | 解像度 | 変化しない（入力と同じ） | 実際に上がる（`--scale`倍） |
 | 処理タイミング | 編集中にリアルタイム/レンダリング時に適用 | 編集前にバッチで一度だけ実行 |
-| 負荷 | 毎フレームのプレビュー・書き出しで発生（既定のDetail Preserveエンジンなら軽量） | 事前処理時のみ（編集中は軽い） |
+| 負荷 | 毎フレームのプレビュー・書き出しで発生（軽量） | 事前処理時のみ（編集中は軽い） |
 | 向いているケース | ラフカット段階での見た目確認、同解像度のままのシャープ化 | 本番用素材、大きくパンチインしたいカット |
 
-### このエフェクトの動作モデル: 同解像度でのディテール強調（既定=古典的手法、選択式でAI）
+### このエフェクトの動作モデル: 同解像度でのディテール強調（Detail Preserveエンジン専用）
 
 **重要（正直な説明）:** 本エフェクトは、実機検証の結果、**出力バッファの
 解像度を入力より大きくする方式（`PF_OutFlag_I_EXPAND_BUFFER`によるバッファ
@@ -455,13 +482,14 @@ Premiere Proはこのバッファ拡張要求を安定して扱えず、エフ�
 標準的なAE/Premiereのフィルタエフェクトと同じで、レイヤーの解像度自体を
 上げることはしません（そもそも一般のフィルタエフェクトが下流のトランス
 フォームへ真に高解像度なバッファを渡す手段は、ホストの仕様上ありません）。
-この「常に同解像度」という制約自体はAI/Detail Preserveどちらのエンジンにも
-共通です。既定の**Detail Preserveエンジン**では、この同解像度リクエストは
-`detail_preserving_upscale()`（`src/core/detail_upscaler.h`）が内部の
-Lanczosベース拡大ステージを丸ごとスキップし、エッジ適応アンシャープマスクの
-みを直接適用する形で処理されます（同一実装がCLI/`upscale_video.sh`側では
-実際の拡大にも使われます -- 出力サイズが入力と異なる場合はLanczosベース拡大
-ステージも実行されます）。
+この「常に同解像度」という制約は、AIエンジンがまだ存在していた頃から
+Premiere/AEフィルタエフェクトのホスト仕様に起因するものでした（本エフェクト
+固有の制限ではありません）。**Detail Preserveエンジン**（本プラグイン唯一の
+エンジン）では、この同解像度リクエストは `detail_preserving_upscale()`
+（`src/core/detail_upscaler.h`）が内部のLanczosベース拡大ステージを丸ごと
+スキップし、エッジ適応アンシャープマスクのみを直接適用する形で処理されます
+（同一実装がCLI/`upscale_video.sh`側では実際の拡大にも使われます --
+出力サイズが入力と異なる場合はLanczosベース拡大ステージも実行されます）。
 
 ### 主な用途: トランスフォームでの拡大（パンチイン）の見え方改善
 
@@ -474,7 +502,7 @@ Lanczosベース拡大ステージを丸ごとスキップし、エッジ適応�
 **手順:**
 
 1. 4Kクリップ（4Kシーケンス上）に「AI Upscale」エフェクトを適用します
-   （既定のままなら`Engine = Detail Preserve (Fast)`）。
+   （Detail Preserveエンジン専用で、切り替え用のポップアップはありません）。
    出力は入力と同じ解像度のまま、ディテールが強調されたフレームになります。
 2. 同じクリップに「モーション」エフェクト（またはトランスフォームエフェクト）
    を追加し、`スケール` を目的のパンチイン率に設定して拡大します。
@@ -482,15 +510,8 @@ Lanczosベース拡大ステージを丸ごとスキップし、エッジ適応�
    **前**（上）にあることを確認してください。順序が逆だと、AI Upscaleが
    トランスフォーム後の（既に拡大されて荒れた）フレームを処理することに
    なり、狙った効果が得られません。
-4. `Scale` パラメータ（2x/4x）は現時点では内部処理の目安（将来の強度調整用
-   フック、TODO）であり、出力解像度には影響しません。どちらを選んでも、
-   選択中のエンジンが内部でネイティブ倍率相当の処理→同解像度へ高品質
-   ダウンサンプルして書き戻す、という同じ結果になります（`Engine`
-   ポップアップで実際の処理内容は変わりますが、`Scale`
-   自体はどちらのエンジンでも出力サイズに影響しません）。
-5. シャープ化の強弱は、Detail Preserveエンジン使用時は `Detail`
-   スライダー（0〜100、既定50）で調整できます。AI Real-ESRGANエンジン
-   使用時は `Detail` は無視されます。
+4. シャープ化の強弱は `Detail` スライダー（0〜100、既定50）で調整します。
+   これがこのエフェクトの唯一のパラメータです。
 
 現在どのサイズ関係で動作しているかは、ログの `expand_status`
 （`detail-regen` = 想定通りの同解像度動作 / `custom` = ホスト側の事情による
@@ -523,11 +544,12 @@ Lanczosベース拡大ステージを丸ごとスキップし、エッジ適応�
 
 **注記:** 本節で説明するモデルロード・CoreML実行プロバイダ・
 ConcurrencyGate・タイル並列処理まわりのトラブルシューティングは、
-すべて `Engine = AI Real-ESRGAN` を選択した場合にのみ関係します。
-既定の `Engine = Detail Preserve (Fast)` はモデルを一切ロードせず
-（`ensure_model_loaded()` 自体を呼びません）、ConcurrencyGateやONNX
-Runtimeのタイル並列処理も経由しないため、本節のほとんどの項目は
-そもそも発生しようがありません。Detail Preserveエンジン使用時に
+**Premiere/AEプラグインには一切関係ありません。** プラグインは
+Detail Preserveエンジン専用であり、モデルロード・ConcurrencyGate・ONNX
+Runtimeのタイル並列処理を呼び出すコード自体を含んでいません（AIエンジンは
+プラグインから完全に削除済み -- 本節の内容は、AIエンジンを引き続き
+フルサポートする `upscale_cli` / `plugin/scripts/upscale_video.sh
+--engine ai` を使う場合にのみ関係します）。Premiereプラグイン使用時に
 問題が起きた場合は、ログの `detail_preserving_upscale` 関連の
 `[ERROR]`行（サイズ上限超過など）を確認してください。
 
@@ -594,6 +616,17 @@ Runtimeのタイル並列処理も経由しないため、本節のほとんど�
 
 ### 過負荷・フリーズ対策（実機M4 Max: レンダー中にマシンがフリーズした場合）
 
+**本節はAI (Real-ESRGAN/ONNX) エンジンがまだPremiereプラグインに搭載されて
+いた頃に実機で観測された不具合の記録です。** そのAIエンジンはこのリビジョン
+でプラグインから完全に削除されており（Detail Preserveエンジンはモデル
+ロード・タイル並列ワーカープール・`OnnxUpscaler`のいずれも使わないため、
+本節で説明する二重並列化・セッション多重化はどちらも構造的に発生し
+えません）、今後もこの種のフリーズがPremiereプラグイン側で再発することは
+ありません。本節は経緯の記録として残していますが、`AIUpscaleSequenceData`
+自体、および以下で言及する `--jobs`/`AIUPSCALE_MAX_CONCURRENCY` は
+`upscale_cli` / `upscale_video.sh --engine ai`（事前バッチ変換専用、
+Premiereのリアルタイムレンダーとは無関係）にのみ関係します。
+
 実機（MacBook Pro M4 Max, 36GB）でPremiereの4Kレンダー中にマシン全体が
 フリーズした事例の原因と対策です。実機ログでは、Premiereが自前で並列実行
 している多数のレンダースレッド（4Kレンダーで10数スレッド規模）それぞれが、
@@ -652,13 +685,15 @@ I/O負荷を避けるためで、フリーズの主因ではありませんが�
 
 ## セキュリティ
 
-- **モデルパスの検証**: AE/Premiereプラグイン層 (`AIUpscale.cpp` の
-  `model_path_for()`) は、モデルを必ず `<プラグインディレクトリ>/models/`
-  配下からのみロードします。`std::filesystem::canonical()` でシンボリック
-  リンクを解決した上で、解決後のパスが `models/` ディレクトリの子孫である
-  ことを文字列プレフィックス比較で検証し、範囲外であれば空文字列を返して
-  ロードを拒否します（パストラバーサル・シンボリックリンク経由の
-  ディレクトリエスケープ対策）。
+- **モデルパスの検証は現在プラグイン層には存在しません（該当なし）**:
+  AI (Real-ESRGAN) エンジンをPremiere/AEプラグインから完全に削除した結果、
+  プラグインはそもそもモデルファイルを一切ロードしないため、`model_path_for()`
+  型のパストラバーサル対策コード自体が不要になり削除されています。この種の
+  検証が今も必要なのは `upscale_cli` 経由でモデルパスを扱う場合のみですが、
+  `upscale_cli` は呼び出し元（`upscale_video.sh` またはユーザー自身）が
+  明示的にコマンドライン引数で渡したパスをそのまま使う設計であり、
+  ディレクトリ配下の自動探索・パス合成を行わないため、同種のエスケープ
+  対策コードはそもそも該当しません。
 - **`download_models.py`**: HTTPS以外のURLはリクエスト前に拒否します
   (`require_https()`)。ダウンロード後はSHA-256チェックサムを検証します
   （既知ハッシュは `KNOWN_SHA256` 定数に保持）。ハッシュが未登録のURLは
@@ -709,19 +744,24 @@ I/O負荷を避けるためで、フリーズの主因ではありませんが�
   (`TileOptions::output_scale`) に変更し、ホストが渡す入力ワールドが
   どれだけ大きくても、モデルのネイティブ倍率×フレーム全体サイズの巨大な
   中間バッファを確保しないようにしています。
-- **`Engine = AI Real-ESRGAN` はリアルタイム再生に不向き**で、レンダリング/
-  書き出し用途を想定しています（CPU推論はもちろん、GPU/ANE推論であっても
-  4Kフレームの超解像はフレームあたり数百ms〜数秒かかるため）。既定の
-  `Engine = Detail Preserve (Fast)` はこの制約に当てはまりません
+- **AI (Real-ESRGAN) エンジンはPremiere/AEプラグインから完全に削除しました。**
+  リアルタイム再生に不向き（CPU推論はもちろん、GPU/ANE推論であっても4K
+  フレームの超解像はフレームあたり数百ms〜数秒かかる）な上、開発者の実機
+  では重すぎて実用にならず、誤って選択するとレンダリングがフリーズする
+  だけの機能だったため、プラグインからは丸ごと取り除いています。Premiere
+  プラグインの唯一のエンジンであるDetail Preserveはこの制約に当てはまりません
   （モデル推論を一切行わない古典的アルゴリズムのため、このリポジトリの
   Linux/CPU開発環境でも4Kフレームあたり概ね1秒未満、多くの場合数百ms級 --
   実測値は「この環境（Adobe SDK無し・GPU無し）での検証について」参照）が、
   それでも真のリアルタイム（毎フレーム数ms級）ではないため、タイムライン上の
   プレビュー品質設定やシーケンスのプレビュー解像度によっては、なお
-  スクラブ時にコマ落ちする可能性があります。
+  スクラブ時にコマ落ちする可能性があります。AIエンジン自体は
+  `upscale_cli` / `upscale_video.sh` に残っており、事前バッチ変換用途では
+  引き続きフルサポートしています。
 - **CoreML EP (macOS) はこの環境では実機未検証です。** これは
-  `Engine = AI Real-ESRGAN` にのみ関係します（`Engine = Detail Preserve
-  (Fast)` はCoreML/ONNX Runtimeを一切使いません）。`UPSCALE_WITH_COREML`
+  `upscale_cli` / `upscale_video.sh --engine ai` にのみ関係します
+  （Premiere/AEプラグインはCoreML/ONNX Runtimeを一切使いません -- AI
+  エンジンがプラグインから削除済みのため）。`UPSCALE_WITH_COREML`
   はコンパイル時に有効化され、`AppendExecutionProvider("CoreML", ...)` の
   呼び出しコード自体はこのLinux環境でもコンパイル対象になりますが
   （`#ifdef __APPLE__` の外側のロジックはビルドされます）、実際にCoreML EPが

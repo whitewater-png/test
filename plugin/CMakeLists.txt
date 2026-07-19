@@ -174,6 +174,31 @@ if(EXISTS "${ONNXRUNTIME_ROOT}/lib")
 endif()
 
 # ---------------------------------------------------------------------------
+# upscale_detail_core (Adobe-independent, NO onnxruntime dependency)
+#
+# A second, slimmer static library containing ONLY the classical Detail
+# Preserve engine (detail_upscaler.cpp) plus the generic tiling/resample
+# helper (tile.cpp, for resize_rgba_bilinear()/ImageRGBA8 -- no onnxruntime
+# symbols are referenced by either file). This exists so the AIUpscale
+# Premiere/AE plugin target -- which, as of this revision, no longer offers
+# an "AI Real-ESRGAN" engine choice at all (see plugin/src/plugin/AIUpscale.h/
+# .cpp) -- does not need to link onnxruntime (a large native dependency the
+# plugin no longer has any code path that calls into). upscale_cli and the
+# unit tests still link the full upscale_core (below) unchanged, since the
+# CLI intentionally keeps the AI engine for pre-conversion batch workflows
+# (upscale_video.sh --engine ai).
+# ---------------------------------------------------------------------------
+add_library(upscale_detail_core STATIC
+    src/core/detail_upscaler.cpp
+    src/core/tile.cpp
+)
+target_include_directories(upscale_detail_core
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+)
+target_link_libraries(upscale_detail_core PUBLIC Threads::Threads)
+
+# ---------------------------------------------------------------------------
 # upscale_cli (test harness, PNG in/out via stb_image)
 # ---------------------------------------------------------------------------
 add_executable(upscale_cli
@@ -463,11 +488,15 @@ if(DEFINED AE_SDK_PATH AND NOT "${AE_SDK_PATH}" STREQUAL "")
             ${AEGP_SUITE_HANDLER_SRC}
         )
 
+        # NOTE: AIUpscale links upscale_detail_core (Detail Preserve engine
+        # only), NOT upscale_core -- the AI (Real-ESRGAN/ONNX) engine has
+        # been removed from this plugin entirely (see AIUpscale.h/.cpp), so
+        # there is no onnxruntime dependency here anymore, and no need for
+        # ${ONNXRUNTIME_INCLUDE_DIR} in this target's include path either.
         target_include_directories(AIUpscale PRIVATE
             ${AE_SDK_INCLUDE_DIRS}
-            ${ONNXRUNTIME_INCLUDE_DIR}
         )
-        target_link_libraries(AIUpscale PRIVATE upscale_core Threads::Threads)
+        target_link_libraries(AIUpscale PRIVATE upscale_detail_core Threads::Threads)
 
         if(WIN32)
             # After Effects/Premiere plugins on Windows are DLLs renamed to

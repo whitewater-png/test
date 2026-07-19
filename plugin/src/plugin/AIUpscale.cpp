@@ -7,6 +7,17 @@
 // one handler per command) so it should need at most small adjustments
 // once built against the real SDK headers.
 //
+// AI (Real-ESRGAN/ONNX) ENGINE REMOVED from this file entirely (see
+// AIUpscale.h's file-header comment for the rationale): this plugin now
+// only ever runs the classical Detail Preserve engine
+// (upscale::detail_preserving_upscale(), src/core/detail_upscaler.h/.cpp).
+// There is no "Engine"/"Scale"/"Mode" param anymore, no OnnxUpscaler, no
+// ConcurrencyGate, no model file resolution/loading, and (since none of
+// that needs any per-sequence cached state) no per-sequence data at all --
+// PF_Cmd_SEQUENCE_SETUP/_RESETUP/_SETDOWN are simply left unhandled
+// (default: break in EffectMain's switch), matching what AE/Premiere SDK
+// samples do for effects with no cached state to carry between frames.
+//
 // Buffer-expansion RETRACTED (third real-Premiere-hardware render-failure
 // fix; see README.md "既知の制約" for the user-facing writeup): earlier
 // revisions of this file had PF_Cmd_FRAME_SETUP grow out_data->width/height
@@ -26,14 +37,13 @@
 // downstream to a later Transform/Motion scale in the effects chain (host
 // constraint, not a bug in this plugin), and I_EXPAND_BUFFER does not
 // behave reliably here, this effect now ALWAYS keeps the output world at
-// input size and works as a same-resolution AI detail-regeneration /
+// input size and works as a same-resolution detail-regeneration /
 // sharpening filter instead: apply it, then scale up afterward (Transform/
-// Motion) for a punched-in look -- the AI-regenerated detail holds up
-// better under that later scale than plain bilinear/bicubic interpolation
-// of the untouched source would. See README.md for the full user-facing
+// Motion) for a punched-in look. See README.md for the full user-facing
 // workflow writeup, including the honest caveat that this does NOT
 // increase the layer's actual pixel resolution, and the alternative
-// upscale_cli-based pre-processing workflow for users who need that.
+// upscale_cli/upscale_video.sh-based pre-processing workflow (which still
+// supports the AI engine) for users who need that.
 #include "AIUpscale.h"
 
 #include <algorithm>
@@ -41,25 +51,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <filesystem>
 #include <mutex>
-#include <new>
 #include <sstream>
 #include <stdexcept>
-#include <system_error>
-
-// Platform module-path lookup used by resolve_plugin_directory() below:
-// Windows resolves the .aex's own path via GetModuleHandleExA/
-// GetModuleFileNameA, everyone else (macOS -- the primary target -- and
-// any other POSIX host) uses dladdr(), which is available on both macOS
-// and Linux (the latter only matters for this repo's dladdr-based unit
-// test, since the AIUpscale target itself is never built on Linux -- see
-// plugin/CMakeLists.txt).
-#ifdef _WIN32
-#include <Windows.h>
-#else
-#include <dlfcn.h>
-#endif
 
 #include "logger.h"
 #include "size_limits.h"
@@ -90,11 +84,11 @@ namespace {
 // that implicitly references a variable named `in_data` in the caller's
 // scope (e.g. `(*in_data->utils->ansi.strcpy)(...)`), which breaks in any
 // function that doesn't happen to have an in_data parameter with that exact
-// name (see ensure_model_loaded() below). PF_SPRINTF is also effectively an
-// unbounded sprintf into out_data->return_msg (char[PF_MAX_EFFECT_MSG_LEN +
-// 1]). To avoid depending on a spelling-sensitive macro and to get a
-// length-bounded, NUL-terminated write, every return_msg assignment in this
-// file goes through this helper instead.
+// name. PF_SPRINTF is also effectively an unbounded sprintf into
+// out_data->return_msg (char[PF_MAX_EFFECT_MSG_LEN + 1]). To avoid
+// depending on a spelling-sensitive macro and to get a length-bounded,
+// NUL-terminated write, every return_msg assignment in this file goes
+// through this helper instead.
 #if defined(__GNUC__) || defined(__clang__)
 void set_return_msg(PF_OutData* out_data, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
 #endif
@@ -103,148 +97,6 @@ void set_return_msg(PF_OutData* out_data, const char* fmt, ...) {
     va_start(args, fmt);
     std::vsnprintf(out_data->return_msg, sizeof(out_data->return_msg), fmt, args);
     va_end(args);
-}
-
-int scale_choice_to_factor(PF_ParamDef* params[]) {
-    const A_long choice = params[AI_UPSCALE_SCALE_POPUP]->u.pd.value;
-    return (choice == SCALE_CHOICE_4X) ? 4 : 2;
-}
-
-const char* mode_choice_to_model_filename(A_long choice) {
-    return (choice == MODE_CHOICE_ANIME) ? MODEL_FILENAME_ANIME : MODEL_FILENAME_PHOTO;
-}
-
-// Resolves the directory the plugin binary lives in, so we can find
-// <plugin_dir>/models/*.onnx.
-//
-// THIS WAS THE ROOT CAUSE of the real-hardware PF_Err_INTERNAL_STRUCT_DAMAGED
-// (512) reported at render time: this function used to unconditionally
-// return the literal string "models", resolved by every later
-// std::filesystem call relative to the host process's current working
-// directory. Premiere Pro/After Effects do NOT run with CWD set to the
-// plugin's install directory (MediaCore or Plug-ins), so
-// model_path_for()'s fs::canonical(models_dir) lookup failed, model_path_for
-// returned "", and ensure_model_loaded() surfaced that as
-// PF_Err_INTERNAL_STRUCT_DAMAGED -- exactly the error code seen in the
-// field. Premiere reports render-time errors in aggregate at
-// PF_Cmd_FRAME_SETDOWN (selector 11), which is why the error dialog
-// pointed at teardown rather than the actual failing command.
-//
-// Fixed by resolving the plugin's own module/bundle path via the
-// platform loader APIs instead of trusting CWD:
-//   - macOS: dladdr() on this very function's address gives the absolute
-//     path of the Mach-O binary inside the bundle,
-//     .../MediaCore/AIUpscale.plugin/Contents/MacOS/AIUpscale. Four
-//     parent_path() calls walk back up to MediaCore, the directory
-//     setup_mac.sh's step6_install() installs models/ into as a sibling
-//     of AIUpscale.plugin (see MEDIACORE_DIR/dest_bundle/dest_models
-//     there) -- i.e. exactly the plugin_dir model_path_for() expects.
-//   - Windows: the plugin ships as a bare .aex (a renamed DLL) placed
-//     directly in the shared Plug-ins/MediaCore folder, with models/ as
-//     an immediate sibling (no bundle nesting like macOS), so the
-//     directory containing the .aex IS the plugin directory --
-//     GetModuleFileNameA's result needs only one parent_path().
-// Both branches fall back to the old CWD-relative "models" (with a WARN
-// log) if the platform lookup fails, so behavior degrades gracefully
-// rather than throwing/crashing.
-std::string resolve_plugin_directory() {
-#ifdef _WIN32
-    HMODULE module = nullptr;
-    if (GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCSTR>(&resolve_plugin_directory),
-            &module)) {
-        char path_buf[MAX_PATH];
-        const DWORD len = GetModuleFileNameA(module, path_buf, sizeof(path_buf));
-        // GetModuleFileNameA returns 0 on failure, or a length == the
-        // buffer size (with no reliable way to distinguish "exact fit"
-        // from "truncated") on overflow -- treat both as failure rather
-        // than risk silently using a truncated path.
-        if (len > 0 && len < sizeof(path_buf)) {
-            const std::filesystem::path aex_path(std::string(path_buf, len));
-            // .../Plug-ins/Common/AIUpscale.aex -> .../Plug-ins/Common (1)
-            const std::filesystem::path plugin_dir = aex_path.parent_path();
-            if (!plugin_dir.empty()) {
-                return plugin_dir.string();
-            }
-        }
-    }
-    upscale::log_warn(
-        "resolve_plugin_directory: GetModuleHandleExA/GetModuleFileNameA failed to resolve the "
-        "plugin's own module path; falling back to CWD-relative \"models\" (this will very likely "
-        "fail to find models/ under a real Premiere/AE host -- see AIUpscale.cpp comment).");
-    return "models";
-#else
-    Dl_info info{};
-    if (dladdr(reinterpret_cast<void*>(&resolve_plugin_directory), &info) && info.dli_fname &&
-        info.dli_fname[0] != '\0') {
-        const std::filesystem::path bin(info.dli_fname);
-        // .../MediaCore/AIUpscale.plugin/Contents/MacOS/AIUpscale
-        //   -> .../MediaCore/AIUpscale.plugin/Contents/MacOS   (1)
-        //   -> .../MediaCore/AIUpscale.plugin/Contents         (2)
-        //   -> .../MediaCore/AIUpscale.plugin                  (3)
-        //   -> .../MediaCore                                   (4)
-        const std::filesystem::path plugin_dir =
-            bin.parent_path().parent_path().parent_path().parent_path();
-        if (!plugin_dir.empty()) {
-            return plugin_dir.string();
-        }
-    }
-    upscale::log_warn(
-        "resolve_plugin_directory: dladdr() failed to resolve the plugin's own module path; "
-        "falling back to CWD-relative \"models\" (this will very likely fail to find models/ "
-        "under a real Premiere/AE host -- see AIUpscale.cpp comment).");
-    return "models";
-#endif
-}
-
-// Resolves and validates the on-disk path of the model for `mode_choice`,
-// enforcing that it lives inside <plugin_dir>/models/ -- defense against
-// path traversal (e.g. a tampered/malicious plugin_dir value, or a future
-// code path that lets mode_choice-derived strings contain "../") even
-// though today's mode_choice_to_model_filename() only ever returns one of
-// two fixed constants. Symlinks are resolved (std::filesystem::canonical)
-// before the containment check, so a symlink planted inside models/ that
-// points outside the directory is also rejected.
-//
-// Returns the empty string if the resolved path is missing or escapes
-// <plugin_dir>/models/; callers must treat that as a load failure.
-std::string model_path_for(const std::string& plugin_dir, A_long mode_choice) {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-
-    const fs::path models_dir = fs::path(plugin_dir) / "models";
-    const fs::path candidate = models_dir / mode_choice_to_model_filename(mode_choice);
-
-    const fs::path canonical_models_dir = fs::canonical(models_dir, ec);
-    if (ec) {
-        upscale::log_error("model_path_for: models/ directory not found or unreadable: " + models_dir.string() +
-                            " (" + ec.message() + ")");
-        return "";
-    }
-    const fs::path canonical_candidate = fs::canonical(candidate, ec);
-    if (ec) {
-        upscale::log_error("model_path_for: model file not found or unreadable: " + candidate.string() +
-                            " (" + ec.message() + ")");
-        return "";
-    }
-
-    // Containment check: canonical_candidate must be canonical_models_dir
-    // itself or a descendant of it (string-prefix check on the canonical,
-    // symlink-resolved paths -- this is what defeats both "../.." style
-    // traversal AND a symlink planted inside models/ pointing elsewhere).
-    const std::string dir_str = canonical_models_dir.string();
-    const std::string file_str = canonical_candidate.string();
-    const bool contained = file_str.size() > dir_str.size() &&
-        file_str.compare(0, dir_str.size(), dir_str) == 0 &&
-        (file_str[dir_str.size()] == fs::path::preferred_separator);
-    if (!contained) {
-        upscale::log_error("model_path_for: resolved model path escapes plugin models/ directory, rejecting: " +
-                            file_str);
-        return "";
-    }
-
-    return canonical_candidate.string();
 }
 
 // Converts a PF_EffectWorld (assumed BGRA_8u, see header caveat) into the
@@ -292,9 +144,9 @@ upscale::ImageRGBA8 world_to_rgba8(const PF_EffectWorld* world) {
 // disagreement about frame sizes rather than a genuinely oversized request.
 // Logging every size on every frame/tile-thread would be spam (the report
 // showed many threads logging per frame); this cache logs only when the
-// (input size, output size, downsample, scale) combination actually
-// changes, so a size-mismatch pattern is visible in AIUpscale.log without
-// drowning it in repeats.
+// (input size, output size, downsample) combination actually changes, so a
+// size-mismatch pattern is visible in AIUpscale.log without drowning it in
+// repeats.
 // ---------------------------------------------------------------------------
 struct RenderDiagCache {
     std::mutex mutex;
@@ -303,7 +155,6 @@ struct RenderDiagCache {
     int64_t last_full_w = -1, last_full_h = -1;
     int64_t last_dsx_num = -1, last_dsx_den = -1;
     int64_t last_dsy_num = -1, last_dsy_den = -1;
-    int last_scale = -1;
 };
 RenderDiagCache g_render_diag_cache;
 
@@ -319,7 +170,7 @@ RenderDiagCache g_render_diag_cache;
 // user's next report. (This used to also classify an "expanded" case for
 // the retracted I_EXPAND_BUFFER behavior; that case is no longer possible
 // since HandleFrameSetup never requests expansion.)
-const char* classify_expand_status(int64_t in_w, int64_t in_h, int64_t out_w, int64_t out_h, int /*scale*/) {
+const char* classify_expand_status(int64_t in_w, int64_t in_h, int64_t out_w, int64_t out_h) {
     if (out_w == in_w && out_h == in_h) {
         return "detail-regen";
     }
@@ -327,7 +178,7 @@ const char* classify_expand_status(int64_t in_w, int64_t in_h, int64_t out_w, in
 }
 
 void log_render_diag_if_changed(PF_InData* in_data, const PF_EffectWorld* input_world,
-                                 const PF_LayerDef* output, int scale) {
+                                 const PF_LayerDef* output) {
     const int64_t in_w = input_world->width, in_h = input_world->height;
     const int64_t out_w = output->width, out_h = output->height;
     const int64_t full_w = in_data->width, full_h = in_data->height;
@@ -338,8 +189,7 @@ void log_render_diag_if_changed(PF_InData* in_data, const PF_EffectWorld* input_
     RenderDiagCache& c = g_render_diag_cache;
     if (in_w == c.last_in_w && in_h == c.last_in_h && out_w == c.last_out_w && out_h == c.last_out_h &&
         full_w == c.last_full_w && full_h == c.last_full_h && dsx_num == c.last_dsx_num &&
-        dsx_den == c.last_dsx_den && dsy_num == c.last_dsy_num && dsy_den == c.last_dsy_den &&
-        scale == c.last_scale) {
+        dsx_den == c.last_dsx_den && dsy_num == c.last_dsy_num && dsy_den == c.last_dsy_den) {
         return; // identical to last-logged combination, skip (avoid per-frame/per-thread spam)
     }
     c.last_in_w = in_w; c.last_in_h = in_h;
@@ -347,9 +197,8 @@ void log_render_diag_if_changed(PF_InData* in_data, const PF_EffectWorld* input_
     c.last_full_w = full_w; c.last_full_h = full_h;
     c.last_dsx_num = dsx_num; c.last_dsx_den = dsx_den;
     c.last_dsy_num = dsy_num; c.last_dsy_den = dsy_den;
-    c.last_scale = scale;
 
-    const char* expand_status = classify_expand_status(in_w, in_h, out_w, out_h, scale);
+    const char* expand_status = classify_expand_status(in_w, in_h, out_w, out_h);
 
     std::ostringstream oss;
     oss << "HandleRender: size combo changed - input_world=" << in_w << "x" << in_h
@@ -357,7 +206,6 @@ void log_render_diag_if_changed(PF_InData* in_data, const PF_EffectWorld* input_
         << " in_data(full-res)=" << full_w << "x" << full_h
         << " downsample_x=" << dsx_num << "/" << dsx_den
         << " downsample_y=" << dsy_num << "/" << dsy_den
-        << " scale_param=" << scale
         << " expand_status=" << expand_status;
     upscale::log_info(oss.str());
 }
@@ -410,8 +258,8 @@ static_assert(PF_OutFlag_DISPLAY_ERROR_MESSAGE == (1L << 8),
 
 PF_Err HandleAbout(PF_InData* in_data, PF_OutData* out_data) {
     set_return_msg(out_data,
-        "%s v%d.%d\r%s\rDefault engine: Detail Preserve (fast, classical edge-preserving upscale, own "
-        "implementation). Optional: AI Real-ESRGAN (via ONNX Runtime).",
+        "%s v%d.%d\r%s\rEngine: Detail Preserve (fast, classical edge-preserving upscale, own "
+        "implementation, no AI model). For AI (Real-ESRGAN) pre-conversion, see upscale_video.sh.",
         AI_UPSCALE_NAME, AI_UPSCALE_MAJOR_VERSION, AI_UPSCALE_MINOR_VERSION, AI_UPSCALE_DESCRIPTION);
     return PF_Err_NONE;
 }
@@ -423,7 +271,8 @@ PF_Err HandleGlobalSetup(PF_InData* in_data, PF_OutData* out_data) {
 
     // PF_OutFlag_DEEP_COLOR_AWARE intentionally NOT set: 8bpc only for
     // now (see README "known limitations"). PF_OutFlag_SEQUENCE_DATA_NEEDS_FLATTENING
-    // omitted since our sequence data is not persisted to project files.
+    // omitted since this plugin has no sequence data at all anymore (no
+    // model/engine state to cache -- see file-header comment).
     //
     // PF_OutFlag_I_EXPAND_BUFFER: DELIBERATELY NOT SET (retracted -- see
     // the large comment at the top of this file). It used to be declared
@@ -436,7 +285,7 @@ PF_Err HandleGlobalSetup(PF_InData* in_data, PF_OutData* out_data) {
     // compounding with this plugin's own native upscale into a
     // 641,204,224px intermediate that blew every size safety margin. This
     // effect now always keeps the output world at input size (same-
-    // resolution AI detail regeneration), so there is no expansion left to
+    // resolution detail regeneration), so there is no expansion left to
     // authorize.
     // PF_OutFlag_DISPLAY_ERROR_MESSAGE: makes the host actually surface
     // out_data->return_msg (set via set_return_msg() throughout this file)
@@ -459,40 +308,11 @@ PF_Err HandleParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* 
     PF_Err err = PF_Err_NONE;
     PF_ParamDef def;
 
-    // "Engine": selects the processing engine. Detail Preserve (Fast) is
-    // the default (choice 1) -- see AIUpscale.h's AI_UPSCALE_MINOR_VERSION
-    // comment and plugin/README.md for why the default changed from the AI
-    // engine to this classical one.
-    AEFX_CLR_STRUCT(def);
-    PF_ADD_POPUP(
-        "Engine",
-        ENGINE_POPUP_NUM_CHOICES,
-        ENGINE_CHOICE_DETAIL,
-        ENGINE_POPUP_CHOICES,
-        ENGINE_DISK_ID);
-
-    AEFX_CLR_STRUCT(def);
-    PF_ADD_POPUP(
-        "Scale",
-        SCALE_POPUP_NUM_CHOICES,
-        SCALE_CHOICE_2X,
-        SCALE_POPUP_CHOICES,
-        SCALE_DISK_ID);
-
-    // "Mode" only matters when Engine == AI Real-ESRGAN (selects Photo vs.
-    // Anime model); ignored by the Detail Preserve engine. Still always
-    // shown/added -- see AI_UPSCALE_NUM_PARAMS / plugin/README.md.
-    AEFX_CLR_STRUCT(def);
-    PF_ADD_POPUP(
-        "Mode",
-        MODE_POPUP_NUM_CHOICES,
-        MODE_CHOICE_PHOTO,
-        MODE_POPUP_CHOICES,
-        MODE_DISK_ID);
-
     // "Detail": 0..100 strength for the Detail Preserve engine's edge-
-    // adaptive unsharp mask (see detail_upscaler.h). Ignored when Engine ==
-    // AI Real-ESRGAN.
+    // adaptive unsharp mask (see detail_upscaler.h). This is now the ONLY
+    // param this effect has -- the former "Engine"/"Scale"/"Mode" popups
+    // and the AI (Real-ESRGAN/ONNX) engine they selected have been removed
+    // entirely (see AIUpscale.h's file-header comment).
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX(
         "Detail",
@@ -510,222 +330,9 @@ PF_Err HandleParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* 
     return err;
 }
 
-// Allocates and initializes a fresh AIUpscaleSequenceData, wrapped in a
-// PF_Handle the way AE/Premiere sequence data must be. Factored out of
-// HandleSequenceSetup() so the exact same initialization can also be used
-// as a same-call self-healing fallback from HandleRender()/HandleFrameSetup()
-// (see ensure_sequence_data() below) when the host hands us a render/frame
-// call without ever having delivered PF_Cmd_SEQUENCE_SETUP/_RESETUP first.
-//
-// PF_InData has no "in_data" member -- in_data IS the PF_InData*, so
-// members are accessed directly (in_data->pica_basicP etc.), not via a
-// nonexistent in_data->in_data. pica_basicP is an SPBasicSuite*, which is
-// only an AcquireSuite/ReleaseSuite bridge -- it has no
-// new_handle/lock_handle/etc. members itself. The correct AE SDK way to
-// get handle-manipulation functions is to acquire AEGP_HandleSuite1 via
-// AEGP_SuiteHandler (declared in AEGP_SuiteHandler.h, included by
-// AIUpscale.h), which wraps AcquireSuite/ReleaseSuite for the common
-// suites and can throw on a missing suite -- safe here because every
-// caller of this function is inside EffectMain's try/catch boundary.
-//
-// On success, *out_seq_handle receives the new PF_Handle and PF_Err_NONE
-// is returned. On failure, *out_seq_handle is left untouched and a
-// non-NONE PF_Err is returned.
-PF_Err CreateSequenceData(PF_InData* in_data, PF_Handle* out_seq_handle) {
-    AEGP_SuiteHandler suites(in_data->pica_basicP);
-
-    // Allocate our sequence data on the heap and stash the raw pointer in
-    // a PF_Handle. This mirrors the pattern used by AE SDK samples that
-    // need non-flat (C++ object) sequence data -- e.g. wrapping the
-    // pointer in a small fixed-size handle rather than trying to make
-    // AIUpscaleSequenceData itself relocatable, since it owns a
-    // unique_ptr<OnnxUpscaler>.
-    PF_Handle seq_handle = suites.HandleSuite1()->host_new_handle(sizeof(AIUpscaleSequenceData*));
-    if (!seq_handle) {
-        return PF_Err_OUT_OF_MEMORY;
-    }
-
-    auto** stored_ptr = reinterpret_cast<AIUpscaleSequenceData**>(
-        suites.HandleSuite1()->host_lock_handle(seq_handle));
-    *stored_ptr = new (std::nothrow) AIUpscaleSequenceData();
-    if (!*stored_ptr) {
-        suites.HandleSuite1()->host_unlock_handle(seq_handle);
-        suites.HandleSuite1()->host_dispose_handle(seq_handle);
-        return PF_Err_OUT_OF_MEMORY;
-    }
-    (*stored_ptr)->plugin_dir = resolve_plugin_directory();
-    suites.HandleSuite1()->host_unlock_handle(seq_handle);
-
-    *out_seq_handle = seq_handle;
-    return PF_Err_NONE;
-}
-
-PF_Err HandleSequenceSetup(PF_InData* in_data, PF_OutData* out_data) {
-    PF_Handle seq_handle = nullptr;
-    const PF_Err err = CreateSequenceData(in_data, &seq_handle);
-    if (err) {
-        return err;
-    }
-
-    // AE SDK convention: PF_Cmd_SEQUENCE_SETUP (and _RESETUP) hand the new
-    // sequence data back to the host via out_data->sequence_data; the host
-    // stores it and passes it back on subsequent calls as
-    // in_data->sequence_data (an in-only field on PF_InData -- there is no
-    // corresponding settable field on PF_InData itself).
-    out_data->sequence_data = seq_handle;
-    return PF_Err_NONE;
-}
-
-PF_Err HandleSequenceSetdown(PF_InData* in_data, PF_OutData* out_data) {
-    if (in_data->sequence_data) {
-        AEGP_SuiteHandler suites(in_data->pica_basicP);
-        auto** stored_ptr = reinterpret_cast<AIUpscaleSequenceData**>(
-            suites.HandleSuite1()->host_lock_handle(in_data->sequence_data));
-        if (stored_ptr && *stored_ptr) {
-            delete *stored_ptr;
-            *stored_ptr = nullptr;
-        }
-        suites.HandleSuite1()->host_unlock_handle(in_data->sequence_data);
-        suites.HandleSuite1()->host_dispose_handle(in_data->sequence_data);
-    }
-    out_data->sequence_data = nullptr;
-    return PF_Err_NONE;
-}
-
-AIUpscaleSequenceData* get_sequence_data(PF_InData* in_data) {
-    if (!in_data->sequence_data) return nullptr;
-    AEGP_SuiteHandler suites(in_data->pica_basicP);
-    auto** stored_ptr = reinterpret_cast<AIUpscaleSequenceData**>(
-        suites.HandleSuite1()->host_lock_handle(in_data->sequence_data));
-    AIUpscaleSequenceData* seq = stored_ptr ? *stored_ptr : nullptr;
-    suites.HandleSuite1()->host_unlock_handle(in_data->sequence_data);
-    return seq;
-}
-
-// Self-healing sequence-data accessor for the render-time path
-// (HandleFrameSetup/HandleRender). AE always issues PF_Cmd_SEQUENCE_SETUP
-// (or _RESETUP) before the first PF_Cmd_FRAME_SETUP/PF_Cmd_RENDER of a
-// sequence, so get_sequence_data() returning nullptr there should never
-// happen in principle -- but this is exactly the failure that was
-// observed on real Premiere Pro hardware (in_data->sequence_data == null
-// / get_sequence_data() == nullptr at render time), reported as
-// PF_Err_INTERNAL_STRUCT_DAMAGED (512) and surfaced by Premiere's
-// aggregate error reporting at PF_Cmd_FRAME_SETDOWN (selector 11). Since
-// some hosts apparently do not guarantee AE's exact sequence-command
-// timing, prefer self-recovery over an immediate hard failure: our
-// sequence data is trivial to reconstruct (it's just a lazily-populated
-// model cache keyed off resolve_plugin_directory()), so there is nothing
-// to actually lose by creating it on the spot here.
-//
-// Every recovery is logged at WARN so a pattern of "missing sequence data
-// at render time" is visible in AIUpscale.log even though the render
-// itself now succeeds -- see plugin/README.md "安定運用ガイド".
-//
-// Returns nullptr only if self-healing itself fails (e.g. out of memory),
-// in which case callers must still surface PF_Err_INTERNAL_STRUCT_DAMAGED
-// as before.
-AIUpscaleSequenceData* ensure_sequence_data(PF_InData* in_data, PF_OutData* out_data) {
-    AIUpscaleSequenceData* seq = get_sequence_data(in_data);
-    if (seq) {
-        return seq;
-    }
-
-    upscale::log_warn(
-        "ensure_sequence_data: in_data->sequence_data missing at render/frame-setup time "
-        "(expected PF_Cmd_SEQUENCE_SETUP/_RESETUP to have run first); self-healing by creating "
-        "sequence data now instead of failing the render.");
-
-    PF_Handle seq_handle = nullptr;
-    const PF_Err err = CreateSequenceData(in_data, &seq_handle);
-    if (err || !seq_handle) {
-        upscale::log_error(
-            "ensure_sequence_data: self-recovery failed to allocate sequence data (out of memory?); "
-            "render must fail.");
-        return nullptr;
-    }
-
-    // Hand the newly-created sequence data back to the host the same way
-    // PF_Cmd_SEQUENCE_SETUP does, so that -- on hosts that do honor
-    // out_data->sequence_data when set outside of SEQUENCE_SETUP -- later
-    // calls in this sequence no longer need to self-heal.
-    out_data->sequence_data = seq_handle;
-
-    // Deliberately NOT re-read via get_sequence_data(in_data) here:
-    // in_data is this call's (const, host-owned) input, and the host has
-    // no opportunity to echo the out_data->sequence_data we just set back
-    // into in_data->sequence_data until its NEXT call into EffectMain --
-    // so in_data->sequence_data is still null right now regardless of
-    // what we just did to out_data. Read the pointer back out of
-    // seq_handle directly instead.
-    AEGP_SuiteHandler suites(in_data->pica_basicP);
-    auto** stored_ptr = reinterpret_cast<AIUpscaleSequenceData**>(
-        suites.HandleSuite1()->host_lock_handle(seq_handle));
-    AIUpscaleSequenceData* result = stored_ptr ? *stored_ptr : nullptr;
-    suites.HandleSuite1()->host_unlock_handle(seq_handle);
-    return result;
-}
-
-// Ensures the correct model (per current Mode param) is loaded into the
-// cached OnnxUpscaler, reloading only when the mode actually changed.
-// Prefers CoreML on macOS (see OnnxUpscaler::load()'s append_providers()
-// for the actual EP selection/fallback logic); any load failure --
-// including a rejected/missing model path -- is surfaced to the host via
-// both PF_Err and out_data->return_msg, and logged with the attempted
-// path for offline diagnosis (see plugin/README.md "安定運用ガイド").
-PF_Err ensure_model_loaded(AIUpscaleSequenceData* seq, A_long mode_choice, PF_OutData* out_data) {
-    if (seq->upscaler && seq->loaded_mode_choice == mode_choice) {
-        return PF_Err_NONE; // already loaded, nothing to do
-    }
-
-    const std::string model_path = model_path_for(seq->plugin_dir, mode_choice);
-    if (model_path.empty()) {
-        // model_path_for() already logged the specific reason (missing /
-        // path-traversal / symlink-escape).
-        set_return_msg(out_data,
-                  "AI Upscale: model file not found or invalid. Reinstall models/ next to the plugin.");
-        return PF_Err_INTERNAL_STRUCT_DAMAGED;
-    }
-
-    try {
-        // get_shared(), NOT a private load() on a locally-owned instance:
-        // this hands back a process-wide shared OnnxUpscaler/Ort::Session
-        // for `model_path`, so multiple AIUpscaleSequenceData instances
-        // for the same render session (see the self-healing comment on
-        // ensure_sequence_data() above -- the exact scenario that used to
-        // multiply model sessions) end up sharing one loaded model instead
-        // of each loading their own. See AIUpscaleSequenceData::upscaler's
-        // doc comment in AIUpscale.h and OnnxUpscaler::get_shared()'s in
-        // onnx_upscaler.h.
-        seq->upscaler = upscale::OnnxUpscaler::get_shared(model_path, upscale::ExecutionProvider::kAuto);
-        seq->loaded_mode_choice = mode_choice;
-        if (seq->upscaler->fell_back_to_cpu()) {
-            set_return_msg(out_data,
-                      "AI Upscale: accelerated execution provider unavailable; running on CPU (slower). See log.");
-        }
-    } catch (const upscale::OnnxUpscalerError& ex) {
-        upscale::log_error(std::string("ensure_model_loaded: failed to load '") + model_path + "': " + ex.what());
-        set_return_msg(out_data, "AI Upscale: failed to load model (%s).", ex.what());
-        return PF_Err_INTERNAL_STRUCT_DAMAGED; // best available generic PF_Err for "bad model file"
-    }
-    return PF_Err_NONE;
-}
-
 PF_Err HandleFrameSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[]) {
     if (!in_data || !out_data || !params) {
         return PF_Err_BAD_CALLBACK_PARAM;
-    }
-
-    // Self-healing precondition (see ensure_sequence_data() above): make
-    // sure sequence data exists before doing anything else, so that by the
-    // time PF_Cmd_RENDER runs for this frame it is already present rather
-    // than needing its own recovery. FRAME_SETUP itself doesn't otherwise
-    // need the pointer, but this is the earliest render-path opportunity
-    // to detect and fix a missing-sequence-data host (the actual root
-    // cause behind the field-reported PF_Err_INTERNAL_STRUCT_DAMAGED /
-    // 512).
-    if (!ensure_sequence_data(in_data, out_data)) {
-        set_return_msg(out_data, "AI Upscale: internal error (missing sequence data, self-recovery failed).");
-        return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
 
     // Validate the input size the host reports before computing anything
@@ -745,10 +352,7 @@ PF_Err HandleFrameSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* p
     // simply describe "same size, no reposition" -- growing them here would
     // be inconsistent with the flags declared in HandleGlobalSetup() and is
     // exactly the host/plugin disagreement that caused the real-hardware
-    // render failure this fix targets. The "Scale" param no longer changes
-    // the output buffer's size; HandleRender uses it to control how much
-    // internal AI detail-regeneration strength is applied while writing
-    // back to this same-size buffer.
+    // render failure this fix targets.
     out_data->width = in_data->width;
     out_data->height = in_data->height;
     out_data->origin.h = 0;
@@ -772,39 +376,6 @@ PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* param
         return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
 
-    AIUpscaleSequenceData* seq = ensure_sequence_data(in_data, out_data);
-    if (!seq) {
-        set_return_msg(out_data, "AI Upscale: internal error (missing sequence data, self-recovery failed).");
-        return PF_Err_INTERNAL_STRUCT_DAMAGED;
-    }
-
-    // "Engine": Detail Preserve (Fast, the default -- see
-    // AIUpscale.h's AI_UPSCALE_MINOR_VERSION comment) is the classical,
-    // non-neural algorithm in detail_upscaler.h/.cpp; AI Real-ESRGAN is the
-    // original ONNX-based engine, kept as an opt-in choice. Only the AI
-    // engine needs a loaded model -- the Detail Preserve engine skips
-    // ensure_model_loaded() entirely (no ConcurrencyGate, no ONNX Runtime
-    // session, no model file lookup at all), which also means it works even
-    // if models/ was never installed next to the plugin.
-    const A_long engine_choice = params[AI_UPSCALE_ENGINE_POPUP]->u.pd.value;
-    const bool use_ai_engine = (engine_choice == ENGINE_CHOICE_AI);
-
-    if (use_ai_engine) {
-        // "Mode" (Photo/Anime) only matters for the AI engine -- selects
-        // which Real-ESRGAN model to load; the Detail Preserve engine
-        // ignores it entirely (see plugin/README.md).
-        const A_long mode_choice = params[AI_UPSCALE_MODE_POPUP]->u.pd.value;
-        err = ensure_model_loaded(seq, mode_choice, out_data);
-        if (err) return err;
-    }
-
-    // `scale` (2x/4x from the "Scale" UI popup) no longer selects an output
-    // buffer size (see file-header comment) -- kept here only for the
-    // diagnostic log below and as a TODO hook for a future detail-
-    // regeneration-strength knob; it does not change what gets requested
-    // from seq->upscaler->upscale() further down (always requested_scale=1,
-    // same resolution).
-    const int scale = scale_choice_to_factor(params);
     PF_EffectWorld* input_world = &params[AI_UPSCALE_INPUT]->u.ld;
 
     // NULL / zero-size input world checks -- a well-behaved host should
@@ -853,103 +424,46 @@ PF_Err HandleRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* param
     // log_render_diag_if_changed() above) so a host/plugin size mismatch
     // like the one that caused the field-reported render failure is
     // immediately visible in AIUpscale.log on the next report.
-    log_render_diag_if_changed(in_data, input_world, output, scale);
+    log_render_diag_if_changed(in_data, input_world, output);
 
     upscale::ImageRGBA8 in_img = world_to_rgba8(input_world);
 
-    // Request SAME-RESOLUTION output (both engines): this is the core of
-    // the buffer-expansion retraction (see file-header comment) -- the
-    // output world is always kept at input_world's own size, never grown.
+    // Request SAME-RESOLUTION output: this is the core of the buffer-
+    // expansion retraction (see file-header comment) -- the output world is
+    // always kept at input_world's own size, never grown.
+    //
+    // Detail Preserve (Fast) is now the ONLY engine (see AIUpscale.h's
+    // file-header comment for why the AI/Real-ESRGAN engine was removed
+    // entirely from this plugin). This is a classical, non-neural, clean-
+    // room algorithm (see detail_upscaler.h); no model, no OnnxUpscaler, no
+    // ConcurrencyGate, and no worker-thread pool -- it always runs
+    // directly, serially, on the calling (Premiere host) render thread,
+    // which is exactly the safe behavior needed given that Premiere already
+    // parallelizes rendering across its own host threads (see
+    // plugin/README.md "安定運用ガイド" for the history of why an
+    // additional layer of in-plugin parallelism was actively harmful for
+    // the old AI engine). Same-size in/out (out_w/out_h == in_img's own
+    // size) means detail_preserving_upscale() skips its internal Lanczos
+    // base resize entirely and only runs the detail-restoration stage --
+    // see detail_upscaler.h/.cpp.
     upscale::ImageRGBA8 same_res_out;
-
-    if (use_ai_engine) {
-        upscale::TileOptions tile_opts;
-        tile_opts.tile_size = 0; // auto-select based on active execution provider (see choose_tile_size())
-        tile_opts.overlap = 16;
-        // num_workers FORCED TO 1 (serial tiling) here -- this is deliberate,
-        // not an oversight, and is one of the fixes for a real-Premiere-
-        // hardware freeze (see README.md "安定運用ガイド" and concurrency.h's
-        // file header for the full story): Premiere Pro already parallelizes
-        // 4K rendering across many of its OWN host threads (one call into
-        // HandleRender per in-flight frame). Field logs showed each of those
-        // ~14 host threads ALSO spinning up tile.cpp's internal worker pool
-        // (the old auto=hardware_concurrency default), producing on the order
-        // of host_threads * tile_workers (~14 x 14 = ~200) threads all
-        // fighting over the same CPU/ANE cores at once -- enough to saturate
-        // and freeze the machine. The host's own frame-level parallelism is
-        // the right place for concurrency here; this plugin must not ALSO
-        // parallelize within a single frame on top of it. (Overall
-        // concurrency across host threads is still bounded separately by
-        // ConcurrencyGate inside OnnxUpscaler::upscale() -- see
-        // onnx_upscaler.cpp/.h -- which caps how many upscale() calls run
-        // inference at once regardless of how many host threads call in.)
-        //
-        // upscale_cli (see src/cli/upscale_cli.cpp), by contrast, is a single
-        // process with no host-level frame parallelism to defer to, so it
-        // still passes the user's --jobs value through unchanged (0=auto is
-        // the right default there).
-        tile_opts.num_workers = 1;
-
-        // requested_scale=1 tells OnnxUpscaler::upscale() to set
-        // TileOptions::output_scale=1 (see tile.h/tile.cpp and
-        // onnx_upscaler.cpp), which downsizes EACH TILE's native-scale
-        // (typically 4x) result back down immediately after inference,
-        // before compositing -- so at no point does a buffer sized
-        // input_world*4 for the WHOLE frame ever get allocated, regardless of
-        // how large input_world is (this is what let a host-handed input world
-        // far bigger than the nominal source resolution -- e.g.
-        // 4892x8192 -- blow up to a 641,204,224px intermediate and crash the
-        // render in the previous, non-tiled-downsize version of this fix).
-        // Peak memory per tile job is bounded to (tile_size*native_scale)^2,
-        // not (input_world*native_scale)^2.
-        //
-        // The "Scale" UI popup (2x/4x) no longer controls output buffer size
-        // (there's only one output size now: input_world's own size) -- it's
-        // reserved for a future internal detail-regeneration-strength knob
-        // (TODO, see README.md); both choices currently take the same
-        // same-resolution code path here.
-        try {
-            seq->upscaler->upscale(in_img, same_res_out, /*requested_scale=*/1, tile_opts);
-        } catch (const upscale::OnnxUpscalerError& ex) {
-            upscale::log_error(std::string("HandleRender: upscale failed: ") + ex.what());
-            set_return_msg(out_data, "AI Upscale: render failed (%s).", ex.what());
-            return PF_Err_INTERNAL_STRUCT_DAMAGED;
-        } catch (const upscale::SizeLimitError& ex) {
-            upscale::log_error(std::string("HandleRender: upscale rejected by size limit: ") + ex.what());
-            set_return_msg(out_data, "AI Upscale: frame too large (%s).", ex.what());
-            return PF_Err_INTERNAL_STRUCT_DAMAGED;
-        }
-    } else {
-        // Detail Preserve (Fast) engine -- the default. Classical, non-
-        // neural, clean-room algorithm (see detail_upscaler.h); no model,
-        // no OnnxUpscaler, no ConcurrencyGate, and (unlike the AI engine
-        // above) no need to force num_workers=1 since this function never
-        // spawns worker threads to begin with -- it always runs directly,
-        // serially, on the calling (Premiere host) render thread, which is
-        // exactly the "num_workers=1-equivalent" behavior the task calls
-        // for. Same-size in/out (out_w/out_h == in_img's own size) means
-        // detail_preserving_upscale() skips its internal Lanczos base
-        // resize entirely and only runs the detail-restoration stage --
-        // see detail_upscaler.h/.cpp.
-        const float detail_amount = static_cast<float>(params[AI_UPSCALE_DETAIL_SLIDER]->u.fs_d.value);
-        try {
-            upscale::detail_preserving_upscale(in_img, same_res_out, in_img.width, in_img.height, detail_amount);
-        } catch (const upscale::SizeLimitError& ex) {
-            upscale::log_error(std::string("HandleRender: detail_preserving_upscale rejected by size limit: ") +
-                                ex.what());
-            set_return_msg(out_data, "AI Upscale: frame too large (%s).", ex.what());
-            return PF_Err_INTERNAL_STRUCT_DAMAGED;
-        }
+    const float detail_amount = static_cast<float>(params[AI_UPSCALE_DETAIL_SLIDER]->u.fs_d.value);
+    try {
+        upscale::detail_preserving_upscale(in_img, same_res_out, in_img.width, in_img.height, detail_amount);
+    } catch (const upscale::SizeLimitError& ex) {
+        upscale::log_error(std::string("HandleRender: detail_preserving_upscale rejected by size limit: ") +
+                            ex.what());
+        set_return_msg(out_data, "AI Upscale: frame too large (%s).", ex.what());
+        return PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
 
     const int out_target_w = static_cast<int>(output->width);
     const int out_target_h = static_cast<int>(output->height);
 
     if (same_res_out.width == out_target_w && same_res_out.height == out_target_h) {
-        // Expected case: same_res_out is input_world-sized (requested_scale
-        // =1), and output world is also input_world-sized now that
-        // I_EXPAND_BUFFER is retracted -- sizes already match, nothing to
-        // resample.
+        // Expected case: same_res_out is input_world-sized, and output
+        // world is also input_world-sized now that I_EXPAND_BUFFER is
+        // retracted -- sizes already match, nothing to resample.
         rgba8_to_world(same_res_out, output);
     } else {
         // Sizes differ -- the host handed a different output world size
@@ -1010,19 +524,19 @@ PF_Err EffectMain(
             case PF_Cmd_PARAMS_SETUP:
                 err = HandleParamsSetup(in_data, out_data, params);
                 break;
-            case PF_Cmd_SEQUENCE_SETUP:
-            case PF_Cmd_SEQUENCE_RESETUP:
-                err = HandleSequenceSetup(in_data, out_data);
-                break;
-            case PF_Cmd_SEQUENCE_SETDOWN:
-                err = HandleSequenceSetdown(in_data, out_data);
-                break;
             case PF_Cmd_FRAME_SETUP:
                 err = HandleFrameSetup(in_data, out_data, params);
                 break;
             case PF_Cmd_RENDER:
                 err = HandleRender(in_data, out_data, params, output);
                 break;
+            // PF_Cmd_SEQUENCE_SETUP / _RESETUP / _SETDOWN: intentionally
+            // unhandled (falls to default: below). This effect has no
+            // per-sequence state to cache anymore -- no model, no engine
+            // handle, nothing -- now that the AI (Real-ESRGAN/ONNX) engine
+            // has been removed (see AIUpscale.h's file-header comment), so
+            // there is nothing left worth allocating/freeing a sequence
+            // data handle for.
             default:
                 break;
         }
