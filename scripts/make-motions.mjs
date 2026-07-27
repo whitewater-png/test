@@ -100,6 +100,24 @@ function add(pose, bone, delta) {
   pose[bone] = [current[0] + delta[0], current[1] + delta[1], current[2] + delta[2]];
 }
 
+/**
+ * Set one arm from two intuitive 0…1 dials, replacing whatever was there.
+ *
+ * `raise` deliberately tops out well below horizontal. An upper arm at 0° *is*
+ * the T-pose, and a swing that sweeps through it twice a bar looks like a
+ * scarecrow no matter how good the rest of the body is — the first cut of these
+ * dances made exactly that mistake. Big visible movement should come from
+ * `fold` (the elbow), which has the whole range to play with.
+ */
+function armSwing(pose, side, { raise = 0, fold = 0.2, twist = 0 } = {}) {
+  const mirror = side === 'left' ? 1 : -1;
+  const upper = 72 - 52 * raise; // 72° down … 20° down, never horizontal
+  const elbow = 14 + 96 * fold;
+  pose[`${side}UpperArm`] = [0, 0, -mirror * upper];
+  pose[`${side}LowerArm`] = [0, -mirror * elbow, 0];
+  pose[`${side}Hand`] = [0, -mirror * twist, -mirror * 4];
+}
+
 // ---------------------------------------------------------------- motions
 
 // Each motion is sampled over `duration` seconds. `frame(t01)` receives
@@ -200,12 +218,8 @@ const MOTIONS = {
       // T-pose with the volume turned up.
       const up = (halfBeat + 1) / 2; // 0…1
       const down = 1 - up;
-      add(pose, 'leftUpperArm', [0, 0, 40 * up + 8 * bounce]);
-      add(pose, 'leftLowerArm', [0, -(34 + 52 * up), 0]);
-      add(pose, 'rightUpperArm', [0, 0, -40 * down - 8 * bounce]);
-      add(pose, 'rightLowerArm', [0, 34 + 52 * down, 0]);
-      add(pose, 'leftHand', [0, -12 * beat, 0]);
-      add(pose, 'rightHand', [0, 12 * beat, 0]);
+      armSwing(pose, 'left', { raise: 0.35 + 0.3 * up, fold: 0.3 + 0.55 * up, twist: 12 * beat });
+      armSwing(pose, 'right', { raise: 0.35 + 0.3 * down, fold: 0.3 + 0.55 * down, twist: -12 * beat });
 
       // Knees flex on the down-beat so the bounce reads as weight, not floating.
       add(pose, 'leftUpperLeg', [4 * bounce, 0, 0]);
@@ -217,6 +231,111 @@ const MOTIONS = {
         pose,
         hips: [0.03 * halfBeat, -0.045 * bounce, 0],
         expressions: { happy: 0.8 },
+      };
+    },
+  },
+
+  'dance-bouncy': {
+    duration: 3.2,
+    loop: true,
+    describe: 'よく跳ねる元気なダンス。膝を深く、腕を高く',
+    frame(t) {
+      const pose = relaxedPose();
+      const halfBeat = sin(t, 2);
+      const bounce = Math.abs(sin(t, 4));
+      const beat = sin(t, 4);
+      const up = (halfBeat + 1) / 2;
+      const down = 1 - up;
+
+      add(pose, 'hips', [0, 10 * halfBeat, 5 * halfBeat]);
+      add(pose, 'spine', [5 * bounce, -5 * halfBeat, -4 * halfBeat]);
+      add(pose, 'chest', [-6 * bounce, -6 * halfBeat, 0]);
+      add(pose, 'neck', [3 * bounce, 5 * halfBeat, 0]);
+      add(pose, 'head', [5 * bounce, 8 * halfBeat, -7 * halfBeat]);
+
+      // Hands pump hard, but the pumping lives in the elbows.
+      armSwing(pose, 'left', { raise: 0.45 + 0.4 * up, fold: 0.25 + 0.7 * down, twist: 18 * beat });
+      armSwing(pose, 'right', { raise: 0.45 + 0.4 * down, fold: 0.25 + 0.7 * up, twist: -18 * beat });
+
+      // Deep knee flex, and the hips drop far enough that it reads as a jump.
+      add(pose, 'leftUpperLeg', [10 * bounce, 0, 0]);
+      add(pose, 'rightUpperLeg', [10 * bounce, 0, 0]);
+      add(pose, 'leftLowerLeg', [-34 * bounce, 0, 0]);
+      add(pose, 'rightLowerLeg', [-34 * bounce, 0, 0]);
+      add(pose, 'leftFoot', [16 * bounce, 0, 0]);
+      add(pose, 'rightFoot', [16 * bounce, 0, 0]);
+
+      return {
+        pose,
+        hips: [0.035 * halfBeat, -0.085 * bounce, 0],
+        expressions: { happy: 0.9 },
+      };
+    },
+  },
+
+  'dance-slow': {
+    duration: 9,
+    loop: true,
+    describe: 'ゆったり揺れるダンス。ながら作業の横で流しておく用',
+    frame(t) {
+      const pose = relaxedPose();
+      const sway = sin(t, 1);
+      const drift = sin(t, 0.5);
+      const rise = (sin(t, 1, -0.25) + 1) / 2; // 0…1, offset a quarter phase
+
+      add(pose, 'hips', [0, 5 * sway, 4 * sway]);
+      add(pose, 'spine', [0, -3 * sway, -4 * sway]);
+      add(pose, 'chest', [-2 * rise, -3 * sway, -2 * sway]);
+      add(pose, 'neck', [1.5 * rise, 3 * sway, 0]);
+      add(pose, 'head', [1 * rise, 5 * sway, -6 * sway]);
+
+      // Both arms drift together in a slow, narrow arc — nothing sudden.
+      armSwing(pose, 'left', { raise: 0.16 + 0.2 * rise, fold: 0.22 + 0.16 * rise, twist: 8 * sway });
+      armSwing(pose, 'right', { raise: 0.16 + 0.2 * rise, fold: 0.22 + 0.16 * rise, twist: -8 * sway });
+
+      add(pose, 'leftLowerLeg', [-6 * rise, 0, 0]);
+      add(pose, 'rightLowerLeg', [-6 * rise, 0, 0]);
+
+      return { pose, hips: [0.03 * sway, -0.015 * rise, 0], expressions: { relaxed: 0.6 } };
+    },
+  },
+
+  'dance-idol': {
+    duration: 4,
+    loop: true,
+    describe: 'アイドル寄り。肘を高く構えて左右にステップ、首をかしげる',
+    frame(t) {
+      const pose = relaxedPose();
+      const step = sin(t, 2);
+      const beat = sin(t, 4);
+      const bounce = Math.abs(sin(t, 4));
+      const point = (sin(t, 2, -0.25) + 1) / 2; // which side is pointing
+
+      add(pose, 'hips', [0, 7 * step, 6 * step]);
+      add(pose, 'spine', [1 * bounce, -4 * step, -5 * step]);
+      add(pose, 'chest', [-2 * bounce, -5 * step, -2 * step]);
+      add(pose, 'neck', [1 * bounce, 5 * step, 0]);
+      // The head tilt is what sells it — it lags the step by a quarter beat.
+      add(pose, 'head', [2 * bounce, 7 * step, -11 * sin(t, 2, -0.12)]);
+
+      // Hands stay up by the shoulders throughout; the accent is a flick of the
+      // forearm, not a swing of the whole arm.
+      armSwing(pose, 'left', { raise: 0.74 + 0.2 * point, fold: 0.72 + 0.26 * point, twist: 14 * beat });
+      armSwing(pose, 'right', {
+        raise: 0.74 + 0.2 * (1 - point),
+        fold: 0.72 + 0.26 * (1 - point),
+        twist: -14 * beat,
+      });
+
+      add(pose, 'leftUpperLeg', [3 * bounce, 0, 0]);
+      add(pose, 'rightUpperLeg', [3 * bounce, 0, 0]);
+      add(pose, 'leftLowerLeg', [-12 * bounce, 0, 0]);
+      add(pose, 'rightLowerLeg', [-12 * bounce, 0, 0]);
+
+      return {
+        pose,
+        hips: [0.028 * step, -0.03 * bounce, 0],
+        expressions: { happy: 0.85 },
       };
     },
   },

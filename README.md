@@ -97,10 +97,20 @@ motions/
 **`.vrma` をコードから生成できます。** 買う必要も、モーキャプも要りません。
 
 ```bash
-npm run make-motions            # idle / wave / nod / shake / dance / spin を生成
+npm run make-motions            # 9種類を生成
 npm run make-motions -- --list  # 一覧
 npm run make-motions -- dance   # 個別に作り直す
 ```
+
+| | |
+| --- | --- |
+| `idle` | 待機。呼吸と重心移動だけ。ループ |
+| `wave` `nod` `shake` | 挨拶・うなずき・首振り。単発 |
+| `dance` | 標準テンポ。ループ |
+| `dance-bouncy` | よく跳ねる元気なやつ |
+| `dance-slow` | ゆったり。ながら作業の横で流す用 |
+| `dance-idol` | アイドル寄り。肘を高く構えて首をかしげる |
+| `spin` | その場で一回転 |
 
 中身は [`scripts/make-motions.mjs`](scripts/make-motions.mjs) の1ファイルで、
 「正規化時間 0〜1 を受け取ってボーンの角度を返す関数」を書くだけで増やせます。
@@ -125,6 +135,23 @@ dance: {
 | 肩を上げる | `leftUpperArm` +Z / `rightUpperArm` -Z |
 | 肘を曲げる | `leftLowerArm` -Y / `rightLowerArm` +Y |
 | 膝を曲げる | `lowerLeg` -X（左右とも） |
+
+腕は `armSwing(pose, 'left', { raise, fold })` を使ってください。**上腕は絶対に水平まで上げないよう内部で頭打ちにしてあります** —
+上腕0°はTポーズそのもので、1小節に2回そこを通過するだけで案山子に見えます。大きな動きは肘（`fold`）側で作ります。
+
+## モーションの説明文（`motions/motions.json`）
+
+ファイル名だけだとClaudeには意味が伝わりません（`v-sign` が12秒のポーズ集だとは分からない）。
+`motions/motions.json` に一行ずつ書いておくと、そのままシステムプロンプトに乗ります。
+
+```json
+{
+  "v-sign": "ピースサインを出すポーズ。写真を撮るときに（約12秒）",
+  "dance-slow": "ゆったり揺れるダンス。落ち着いた雰囲気、長め"
+}
+```
+
+無くても動きます（名前だけ渡ります）。
 
 ### 既製品が欲しいとき
 

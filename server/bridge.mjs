@@ -53,9 +53,33 @@ async function listFiles(dir, extensions) {
 /** A motion file named `pokemon-dance.vrma` is offered to Claude as `pokemon-dance`. */
 const motionName = (file) => basename(file, extname(file));
 
-function buildSystemPrompt(motions) {
+/**
+ * Optional `motions/motions.json` — `{ "<motion name>": "<what it looks like>" }`.
+ *
+ * File names alone are a poor brief: `VRMA_03` tells Claude nothing, and even
+ * `v-sign` doesn't say it's a 12-second pose routine. Descriptions go straight
+ * into the system prompt so she can pick something that fits what was asked.
+ */
+async function loadDescriptions() {
+  try {
+    const raw = await readFile(join(MOTIONS, 'motions.json'), 'utf8');
+    const parsed = JSON.parse(raw);
+    return typeof parsed === 'object' && parsed !== null ? parsed : {};
+  } catch (err) {
+    if (err.code !== 'ENOENT') console.warn(`[motions] motions.json ignored: ${err.message}`);
+    return {};
+  }
+}
+
+function buildSystemPrompt(motions, descriptions = {}) {
   const list = motions.length
-    ? motions.map((m) => `- ${motionName(m)}`).join('\n')
+    ? motions
+        .map((file) => {
+          const name = motionName(file);
+          const note = descriptions[name];
+          return note ? `- ${name} … ${note}` : `- ${name}`;
+        })
+        .join('\n')
     : '- (motions フォルダが空です。踊れません)';
 
   return [
@@ -203,12 +227,15 @@ async function handleChat(req, res) {
   const controller = new AbortController();
   req.on('close', () => controller.abort());
 
-  const motions = await listFiles(MOTIONS, MOTION_EXT);
+  const [motions, descriptions] = await Promise.all([
+    listFiles(MOTIONS, MOTION_EXT),
+    loadDescriptions(),
+  ]);
 
   try {
     const result = await respond({
       message,
-      systemPrompt: buildSystemPrompt(motions),
+      systemPrompt: buildSystemPrompt(motions, descriptions),
       sessionId: payload.sessionId ?? null,
       cwd: process.env.MASCOT_PROJECT_DIR ?? root,
       signal: controller.signal,
@@ -238,13 +265,21 @@ const server = createServer(async (req, res) => {
   if (req.method === 'POST' && path === '/api/chat') return handleChat(req, res);
 
   if (req.method === 'GET' && path === '/api/manifest') {
-    const [models, motions] = await Promise.all([
+    const [models, motions, descriptions] = await Promise.all([
       listFiles(MODELS, MODEL_EXT),
       listFiles(MOTIONS, MOTION_EXT),
+      loadDescriptions(),
     ]);
     return sendJson(res, 200, {
-      models: models.map((f) => ({ name: motionName(f), url: `/assets/models/${f}` })),
-      motions: motions.map((f) => ({ name: motionName(f), url: `/assets/motions/${f}` })),
+      models: models.map((f) => ({
+        name: motionName(f),
+        url: `/assets/models/${encodeURIComponent(f)}`,
+      })),
+      motions: motions.map((f) => ({
+        name: motionName(f),
+        description: descriptions[motionName(f)] ?? null,
+        url: `/assets/motions/${encodeURIComponent(f)}`,
+      })),
       emotions: EMOTIONS,
       backend: (await probeClaudeCli()) ? 'claude-code' : 'messages-api',
     });

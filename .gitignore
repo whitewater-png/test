@@ -8,3 +8,5 @@ models/*
 motions/*
 !models/.gitkeep
 !motions/.gitkeep
+# ...but the descriptions are metadata, not an asset — keep them versioned.
+!motions/motions.json
