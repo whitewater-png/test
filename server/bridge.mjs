@@ -6,12 +6,15 @@
 //   GET  /assets/models/<f>    a .vrm, streamed as-is
 //   GET  /assets/motions/<f>   a .vrma, auto-repaired on the way out
 //   POST /api/chat             {message, sessionId?} -> SSE: delta / done / error
+//   GET  /api/tts/status       can the OS speak for us?
+//   GET  /api/tts?text=...     WAV, synthesised by the OS
 import { createServer } from 'node:http';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize, resolve, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { repairVrma } from './vrma.mjs';
 import { respond, probeClaudeCli } from './claude.mjs';
+import { ttsStatus, synthesize } from './tts.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const WEB = join(root, 'web');
@@ -263,6 +266,26 @@ const server = createServer(async (req, res) => {
   const path = url.pathname;
 
   if (req.method === 'POST' && path === '/api/chat') return handleChat(req, res);
+
+  if (req.method === 'GET' && path === '/api/tts/status') {
+    return sendJson(res, 200, await ttsStatus());
+  }
+
+  if (req.method === 'GET' && path === '/api/tts') {
+    const text = (url.searchParams.get('text') ?? '').trim();
+    if (!text) return sendJson(res, 400, { error: 'text is required' });
+    try {
+      const wav = await synthesize(text, url.searchParams.get('voice') ?? undefined);
+      res.writeHead(200, {
+        'content-type': 'audio/wav',
+        'content-length': wav.byteLength,
+        'cache-control': 'no-store',
+      });
+      return res.end(wav);
+    } catch (err) {
+      return sendJson(res, 503, { error: err.message });
+    }
+  }
 
   if (req.method === 'GET' && path === '/api/manifest') {
     const [models, motions, descriptions] = await Promise.all([

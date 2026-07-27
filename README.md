@@ -6,7 +6,7 @@ Blenderで作ったキャラクターをデスクトップに立たせて、話�
 - **表示** … three.js + [@pixiv/three-vrm](https://github.com/pixiv/three-vrm)。背景透過のオーバーレイウィンドウなので、壁紙の上に直接立ちます
 - **踊り** … VRM Animation（`.vrma`）を `motions/` に入れるだけ。待機中は20〜40秒おきに勝手に踊り出します
 - **頭脳** … **Claude Code CLI をヘッドレスで叩きます**。だから「これ調べて」で本当にWeb検索が走るし、プロジェクト内のファイルも読めます。CLIが無い環境では Anthropic Messages API に自動フォールバック
-- **声** … スペース長押しで音声入力（Web Speech API）、返事は VOICEVOX があればそれ、無ければOSの読み上げ。口パクは音声波形から取ります
+- **声** … 返事は VOICEVOX →  OSの読み上げ（macOSの `say`）→ ブラウザの `speechSynthesis` の順に使えるものを自動選択。口パクは合成音声の波形から取ります
 
 ```
 ┌──────────── Electron ────────────┐
@@ -188,12 +188,47 @@ Claudeには「返事の最後にタグを付けて」と伝えてあります�
 | `MASCOT_ALLOWED_TOOLS` | `WebSearch,WebFetch,Read,Glob,Grep` | CLIに許可するツール |
 | `MASCOT_PROJECT_DIR` | このリポジトリ | Claude Code の作業ディレクトリ |
 | `ANTHROPIC_API_KEY` | — | フォールバック用（`ant auth login` のプロファイルでも可） |
+| `MASCOT_VOICE` | 日本語音声を自動選択 | `say` に渡す音声名（`say -v '?'` で一覧） |
 
-VOICEVOX を `http://127.0.0.1:50021` で起動しておくと、自動で検出してそちらの声で喋ります。
-そのとき口パクは合成音声の波形から取るので、ちゃんと合います。
+## 声について
+
+### 喋る（出力）
+
+3経路を自動で試して、使えたものを採用します。起動時のコンソールに `voice out: ...` として出ます。
+
+| | |
+| --- | --- |
+| `voicevox` | `http://127.0.0.1:50021` で起動していれば最優先 |
+| `server` | macOSの `say` をブリッジ経由で。**Electronではこれが本命** |
+| `browser` | `speechSynthesis`。ブラウザで開いたときのフォールバック |
+
+**Electron内では `speechSynthesis` が鳴りません。** ElectronのChromiumはGoogleの音声サービス抜きでビルドされているためで、
+アプリの不具合ではありません。だからmacOSでは `say` 経路を用意してあります（オフラインで動く・日本語音声がある・
+WAVが返るので口パクを波形から取れる、と実質こちらが上位互換）。
+
+音声を変えたいときは：
+
+```
+say -v '?'
+MASCOT_VOICE=Otoya npm start
+```
+
+### 聞く（入力）
+
+スペース長押しの音声入力は Web Speech API を使っていて、こちらも**Electron内では使えません**（同じ理由）。
+使えない環境では吹き出しでその旨を出すので、下の入力欄から打ってください。
+
+音声入力を使いたい場合は、ブラウザで開くのが手っ取り早いです：
+
+```
+npm run serve
+```
+
+→ Chromeで `http://127.0.0.1:4747` を開く
 
 ## 動作の前提
 
 - Node.js 20+
-- 音声入力は Chromium系（Web Speech API）。未対応環境では入力欄が代わりになります
+- 喋る側は macOS なら追加インストール不要。Windows / Linux は VOICEVOX を入れるのが確実です
+- 聞く側（音声入力）は Chrome などのブラウザ経由が必要です
 - 透過ウィンドウは macOS / Windows で安定。Linuxはコンポジタ次第です

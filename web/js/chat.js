@@ -94,26 +94,37 @@ export function createChat({ character, motions, voice, ears, elements }) {
   let holding = false;
   const typing = () => document.activeElement === input;
 
-  if (ears) {
-    window.addEventListener('keydown', (event) => {
-      if (event.code !== 'Space' || event.repeat || holding || typing()) return;
-      event.preventDefault();
-      holding = true;
-      voice.stop();
-      setStatus('listening', '聞いてるよ');
-      ears.start((partial) => say(partial || '…'));
-    });
+  window.addEventListener('keydown', (event) => {
+    if (event.code !== 'Space' || event.repeat || holding || typing()) return;
+    event.preventDefault();
 
-    window.addEventListener('keyup', async (event) => {
-      if (event.code !== 'Space' || !holding) return;
-      event.preventDefault();
-      holding = false;
-      setStatus('idle');
-      const transcript = await ears.stop();
-      if (transcript) send(transcript);
-      else say('');
-    });
-  }
+    // Say so rather than swallowing the keypress — a spacebar that does nothing
+    // reads as a bug, not as an unsupported feature.
+    if (ears.unavailable) {
+      sayFor(`${ears.unavailable}。下の入力欄からどうぞ`, 6000);
+      return;
+    }
+
+    holding = true;
+    voice.stop();
+    setStatus('listening', '聞いてるよ');
+    ears.start((partial) => say(partial || '…'));
+  });
+
+  window.addEventListener('keyup', async (event) => {
+    if (event.code !== 'Space' || !holding) return;
+    event.preventDefault();
+    holding = false;
+    setStatus('idle');
+    const transcript = await ears.stop();
+    if (transcript) {
+      send(transcript);
+    } else if (ears.unavailable) {
+      sayFor(`${ears.unavailable}。下の入力欄からどうぞ`, 6000);
+    } else {
+      say('');
+    }
+  });
 
   return { send, say: sayFor, setStatus, get sessionId() { return sessionId; } };
 }

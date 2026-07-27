@@ -91,8 +91,8 @@ async function start() {
     },
   });
 
-  if (!ears && mode === 'stage') {
-    el('hint').textContent = 'このブラウザは音声認識に未対応です。下の入力欄から話しかけてください';
+  if (!ears.supported && mode === 'stage') {
+    el('hint').textContent = '音声入力はこのアプリでは使えません。下の入力欄から話しかけてください';
   }
 
   // One button per motion, so you can trigger a dance without saying anything.
@@ -120,11 +120,26 @@ async function start() {
     });
   }
 
+  // Handy from the devtools console: mascotApi.play('dance'), mascotApi.send('こんにちは').
+  // Published before anything that can await, so "the overlay is gone" and "the
+  // API is there" are the same moment for anyone watching.
+  window.mascotApi = {
+    character,
+    motions,
+    stage,
+    voice,
+    ui,
+    play: motions.playThenIdle,
+    send: ui.send,
+  };
   boot.hidden = true;
-  console.log(`[mascot] ready — ${manifest.motions.length} motion(s), brain: ${manifest.backend}`);
 
-  // Handy from the devtools console: mascot.play('pokedance'), mascot.send('こんにちは')
-  window.mascotApi = { character, motions, stage, voice, ui, play: motions.playThenIdle, send: ui.send };
+  voice.ready.then((backend) => {
+    console.log(
+      `[mascot] ready — ${manifest.motions.length} motion(s), brain: ${manifest.backend}, ` +
+        `voice out: ${backend}, voice in: ${ears.supported ? 'web speech' : 'unavailable'}`,
+    );
+  });
 }
 
 start().catch((err) => {
