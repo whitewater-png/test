@@ -3,6 +3,10 @@ web/vendor/
 .env
 .DS_Store
 
+# Electron packaging output
+dist/
+.build/
+
 # Your own character / motion assets. Keep the folders, ignore the binaries.
 models/*
 motions/*
