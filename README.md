@@ -26,7 +26,8 @@ Blenderで作ったキャラクターをデスクトップに立たせて、話�
 
 ```bash
 npm install                 # 依存を入れて web/vendor/ にESMをコピーします
-# models/ に .vrm、motions/ に .vrma を置く
+npm run make-motions        # モーション（.vrma）を生成 — 手持ちが無くてもここで揃います
+# models/ に .vrm を置く
 npm start                   # Electron（マスコット＋ステージ）
 ```
 
@@ -79,7 +80,7 @@ blender your-character.blend --background --python blender/vrm_export_check.py
 > **ライセンスに注意。** `models/` と `motions/` は `.gitignore` 済みです。
 > 再配布不可のモデルをうっかりコミットしないための保険なので、外さないでください。
 
-## モーションを増やす
+## モーション
 
 `motions/` に `.vrma` を置くだけです。ファイル名がそのままモーション名になり、
 起動時にClaudeのシステムプロンプトへ一覧が渡されます。
@@ -87,9 +88,48 @@ blender your-character.blend --background --python blender/vrm_export_check.py
 ```
 motions/
   idle.vrma        ← この名前だけ特別。あればループ待機モーションになります
-  pokedance.vrma
-  shikanoko.vrma
+  dance.vrma
+  wave.vrma
 ```
+
+### 手持ちが無いとき
+
+**`.vrma` をコードから生成できます。** 買う必要も、モーキャプも要りません。
+
+```bash
+npm run make-motions            # idle / wave / nod / shake / dance / spin を生成
+npm run make-motions -- --list  # 一覧
+npm run make-motions -- dance   # 個別に作り直す
+```
+
+中身は [`scripts/make-motions.mjs`](scripts/make-motions.mjs) の1ファイルで、
+「正規化時間 0〜1 を受け取ってボーンの角度を返す関数」を書くだけで増やせます。
+
+```js
+dance: {
+  duration: 4,
+  loop: true,
+  frame(t) {
+    const pose = relaxedPose();          // Tポーズではなく自然に立った状態から
+    add(pose, 'head', [0, 6 * sin(t, 2), 0]);
+    return { pose, hips: [0, -0.04 * Math.abs(sin(t, 4)), 0] };
+  },
+},
+```
+
+回転軸の向きは実機レンダリングで測ってあり、スクリプト先頭にメモしてあります
+（VRM 0.x はレターゲット時にY軸180°反転が入るので、ボーンを直接触った勘は当てになりません）。
+
+| 関節 | 曲げる軸 |
+| --- | --- |
+| 肩を上げる | `leftUpperArm` +Z / `rightUpperArm` -Z |
+| 肘を曲げる | `leftLowerArm` -Y / `rightLowerArm` +Y |
+| 膝を曲げる | `lowerLeg` -X（左右とも） |
+
+### 既製品が欲しいとき
+
+- **[VRMアニメーション7種セット（.vrma）](https://booth.pm/ja/items/5512385)** … pixiv / VRoid Project が公式に**無料配布**しているもの。挨拶・Vサイン・回る・屈伸など7種
+- **Mixamo → Blender → `.vrma`** … Mixamoの無料モーションをBlenderに読み込み、[VRM Add-on for Blender](https://vrm-addon-for-blender.info/en-us/ui/export_scene.vrma/) の `File → Export → VRM Animation (.vrma)` で書き出す
 
 **販売されているVRMAには `specVersion` が抜けていて読み込めないものがあります。**
 配信時にメモリ上で自動修復するので基本はそのまま置けますが、ファイルごと直したいときは:

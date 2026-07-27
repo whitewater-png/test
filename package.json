@@ -10,6 +10,7 @@
     "vendor": "node scripts/vendor.mjs",
     "serve": "node server/bridge.mjs",
     "start": "electron .",
+    "make-motions": "node scripts/make-motions.mjs",
     "fix-vrma": "node scripts/fix-vrma.mjs"
   },
   "dependencies": {
