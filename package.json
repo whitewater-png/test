@@ -1,0 +1,24 @@
+{
+  "name": "vrm-desktop-mascot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Blender/VRM character that lives on your desktop, dances, and talks to you through Claude Code",
+  "type": "module",
+  "main": "app/main.js",
+  "scripts": {
+    "postinstall": "node scripts/vendor.mjs",
+    "vendor": "node scripts/vendor.mjs",
+    "serve": "node server/bridge.mjs",
+    "start": "electron .",
+    "fix-vrma": "node scripts/fix-vrma.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.68.0",
+    "@pixiv/three-vrm": "^3.5.5",
+    "@pixiv/three-vrm-animation": "^3.5.5",
+    "three": "^0.185.1"
+  },
+  "devDependencies": {
+    "electron": "^34.0.0"
+  }
+}

@@ -1,0 +1,10 @@
+node_modules/
+web/vendor/
+.env
+.DS_Store
+
+# Your own character / motion assets. Keep the folders, ignore the binaries.
+models/*
+motions/*
+!models/.gitkeep
+!motions/.gitkeep

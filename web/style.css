@@ -1,0 +1,231 @@
+:root {
+  --ui: rgba(18, 18, 22, 0.72);
+  --ui-border: rgba(255, 255, 255, 0.12);
+  --text: #f2f2f5;
+  --accent: #7ad0c0;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Hiragino Sans', 'Noto Sans JP', sans-serif;
+}
+
+/* The mascot window is a transparent hole in the desktop: no chrome, no
+   background, and the OS composites the character straight onto the wallpaper. */
+body[data-mode='mascot'] #hint,
+body[data-mode='mascot'] #composer,
+body[data-mode='mascot'] #motion-bar,
+body[data-mode='mascot'] #boot {
+  display: none;
+}
+
+body[data-mode='stage'] {
+  background: radial-gradient(circle at 50% 15%, #23252e 0%, #101014 70%);
+}
+
+#stage {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+#hint {
+  position: fixed;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  opacity: 0.85;
+  pointer-events: none;
+}
+
+#bubble {
+  position: fixed;
+  left: 50%;
+  bottom: 96px;
+  transform: translateX(-50%);
+  max-width: min(420px, 82vw);
+  padding: 12px 16px;
+  border-radius: 16px;
+  border: 1px solid var(--ui-border);
+  background: var(--ui);
+  backdrop-filter: blur(12px);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  animation: pop 160ms ease-out;
+}
+
+body[data-mode='mascot'] #bubble {
+  bottom: 12px;
+  font-size: 13px;
+}
+
+#bubble p {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+#bubble::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: -7px;
+  width: 14px;
+  height: 14px;
+  transform: translateX(-50%) rotate(45deg);
+  border-right: 1px solid var(--ui-border);
+  border-bottom: 1px solid var(--ui-border);
+  background: var(--ui);
+}
+
+@keyframes pop {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(6px);
+  }
+}
+
+#status {
+  position: fixed;
+  top: 10px;
+  right: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--ui-border);
+  background: var(--ui);
+  pointer-events: none;
+}
+
+#status:empty,
+#status[data-state='idle'] {
+  opacity: 0;
+  transition: opacity 240ms;
+}
+
+#status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+#status[data-state='listening'] #status-dot {
+  background: #ff6f7d;
+  animation: pulse 900ms ease-in-out infinite;
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+#composer {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 6px;
+  width: min(520px, 88vw);
+}
+
+#composer input {
+  flex: 1;
+  padding: 10px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--ui-border);
+  background: var(--ui);
+  backdrop-filter: blur(12px);
+  color: var(--text);
+  font-size: 14px;
+  outline: none;
+}
+
+#composer input:focus {
+  border-color: var(--accent);
+}
+
+#composer button {
+  width: 42px;
+  border-radius: 50%;
+  border: 1px solid var(--ui-border);
+  background: var(--ui);
+  color: var(--accent);
+  font-size: 14px;
+  cursor: pointer;
+}
+
+#motion-bar {
+  position: fixed;
+  left: 12px;
+  bottom: 18px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: 24vw;
+}
+
+#motion-bar button {
+  padding: 5px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--ui-border);
+  background: var(--ui);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+#motion-bar button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+#boot {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  gap: 8px;
+  text-align: center;
+  background: #101014;
+  padding: 24px;
+}
+
+#boot h1 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+}
+
+#boot p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.7;
+  opacity: 0.7;
+  white-space: pre-wrap;
+}
+
+#boot[hidden] {
+  display: none;
+}

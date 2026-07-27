@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>デスクトップの子</title>
+    <link rel="stylesheet" href="./style.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "./vendor/three/three.module.js",
+          "three/addons/": "./vendor/three/addons/",
+          "@pixiv/three-vrm": "./vendor/three-vrm/three-vrm.module.js",
+          "@pixiv/three-vrm-animation": "./vendor/three-vrm-animation/three-vrm-animation.module.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <canvas id="stage"></canvas>
+
+    <div id="hint">スペース長押しで話しかけられます（ドラッグで視点回転）</div>
+
+    <div id="bubble" hidden><p id="bubble-text"></p></div>
+
+    <div id="status" data-state="idle"><span id="status-dot"></span><span id="status-text"></span></div>
+
+    <form id="composer">
+      <input
+        id="composer-input"
+        type="text"
+        autocomplete="off"
+        placeholder="話しかける / モーション名を入力"
+      />
+      <button type="submit" aria-label="送信">▶</button>
+    </form>
+
+    <div id="motion-bar"></div>
+
+    <div id="boot">
+      <h1>キャラクターを読み込んでいます…</h1>
+      <p id="boot-detail"></p>
+    </div>
+
+    <script type="module" src="./js/main.js"></script>
+  </body>
+</html>
