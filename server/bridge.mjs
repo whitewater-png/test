@@ -30,15 +30,21 @@ const MIME = {
   '.svg': 'image/svg+xml',
   '.vrm': 'model/gltf-binary',
   '.vrma': 'model/gltf-binary',
+  '.glb': 'model/gltf-binary',
 };
+
+// VRM and VRMA files *are* .glb containers, and plenty of exporters emit them
+// with the generic extension. Accept both rather than making people rename.
+const MODEL_EXT = ['.vrm', '.glb'];
+const MOTION_EXT = ['.vrma', '.glb'];
 
 // The character can express these; they map onto VRM 1.0 expression presets.
 export const EMOTIONS = ['neutral', 'happy', 'angry', 'sad', 'relaxed', 'surprised'];
 
-async function listFiles(dir, ext) {
+async function listFiles(dir, extensions) {
   try {
     const entries = await readdir(dir);
-    return entries.filter((f) => extname(f).toLowerCase() === ext).sort();
+    return entries.filter((f) => extensions.includes(extname(f).toLowerCase())).sort();
   } catch {
     return [];
   }
@@ -197,7 +203,7 @@ async function handleChat(req, res) {
   const controller = new AbortController();
   req.on('close', () => controller.abort());
 
-  const motions = await listFiles(MOTIONS, '.vrma');
+  const motions = await listFiles(MOTIONS, MOTION_EXT);
 
   try {
     const result = await respond({
@@ -233,11 +239,11 @@ const server = createServer(async (req, res) => {
 
   if (req.method === 'GET' && path === '/api/manifest') {
     const [models, motions] = await Promise.all([
-      listFiles(MODELS, '.vrm'),
-      listFiles(MOTIONS, '.vrma'),
+      listFiles(MODELS, MODEL_EXT),
+      listFiles(MOTIONS, MOTION_EXT),
     ]);
     return sendJson(res, 200, {
-      models: models.map((f) => ({ name: basename(f, '.vrm'), url: `/assets/models/${f}` })),
+      models: models.map((f) => ({ name: motionName(f), url: `/assets/models/${f}` })),
       motions: motions.map((f) => ({ name: motionName(f), url: `/assets/motions/${f}` })),
       emotions: EMOTIONS,
       backend: (await probeClaudeCli()) ? 'claude-code' : 'messages-api',

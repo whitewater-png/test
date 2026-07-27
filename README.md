@@ -43,7 +43,31 @@ npm run serve               # → http://127.0.0.1:4747
 | **入力欄にモーション名** | Claudeを経由せずそのまま踊ります |
 | **⌘/Ctrl+Shift+M** | マスコットの表示・非表示 |
 
+URLパラメータ:
+
+| | |
+| --- | --- |
+| `?model=名前` | `models/` に複数置いたときの切り替え |
+| `?fit=full` \| `upper` \| `head` | 全身 / 上半身 / 顔アップ（既定は全身） |
+| `?autodance=off` | 勝手に踊るのを止める |
+
 ## キャラクターを用意する
+
+**VRM 0.x / 1.0 どちらでも読めます。** 拡張子は `.vrm` でも `.glb` でも構いません
+（VRMの実体はglbなので、書き出しツールによっては `.glb` で出てきます）。
+`models/` に置くだけで、カメラはモデルのバウンディングボックスから自動で合わせます。
+
+VRM 0.x の表情名は自動で読み替えられます:
+
+| VRM 0.x | このアプリ |
+| --- | --- |
+| `joy` | `happy` |
+| `sorrow` | `sad` |
+| `fun` | `relaxed` |
+| `a` | 口パク（`aa`） |
+| `blink` | 瞬き |
+
+VRM 0.x には `surprised` が無いので、そこだけは反応しません（表情が変わらないだけで、エラーにはなりません）。
 
 Blender側の手順・書き出し前チェックは [`blender/README.md`](blender/README.md) にまとめてあります。
 チェックスクリプトも置いてあります:
@@ -51,6 +75,9 @@ Blender側の手順・書き出し前チェックは [`blender/README.md`](blend
 ```bash
 blender your-character.blend --background --python blender/vrm_export_check.py
 ```
+
+> **ライセンスに注意。** `models/` と `motions/` は `.gitignore` 済みです。
+> 再配布不可のモデルをうっかりコミットしないための保険なので、外さないでください。
 
 ## モーションを増やす
 

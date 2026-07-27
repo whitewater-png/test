@@ -42,13 +42,20 @@ async function start() {
   const character = await loadCharacter({ url: entry.url, loader, scene: stage.scene });
   const motions = createMotionPlayer({ character, loader, motions: manifest.motions });
 
-  stage.frame(mode === 'mascot' ? 'head' : 'full');
+  // Sized from the model itself, so a 1.4m chibi and a 1.8m adult both fit.
+  // ?fit=head / ?fit=upper for a closer crop.
+  const reframe = () => stage.frame(character.scene, { fit: params.get('fit') ?? 'full' });
+  reframe();
+
   stage.onUpdate((delta) => {
     motions.update(delta);
     character.update(delta);
   });
 
   await motions.idle().catch((err) => console.warn(`[motion] idle: ${err.message}`));
+  // The rest pose is a T-pose — much wider than any idle animation. Once the
+  // idle clip has actually blended in, measure again so she isn't tiny.
+  setTimeout(reframe, 600);
 
   // Idle fidgeting: every 20–40s the character picks a dance, exactly like the
   // reference clip. Add ?autodance=off to sit still.

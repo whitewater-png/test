@@ -53,11 +53,12 @@ export function createStage({ canvas, mode }) {
   resize();
   window.addEventListener('resize', resize);
 
-  const clock = new THREE.Clock();
+  const timer = new THREE.Timer();
   const updaters = new Set();
 
   renderer.setAnimationLoop(() => {
-    const delta = clock.getDelta();
+    timer.update();
+    const delta = timer.getDelta();
     for (const update of updaters) update(delta);
     controls?.update();
     renderer.render(scene, camera);
@@ -73,19 +74,47 @@ export function createStage({ canvas, mode }) {
       updaters.add(fn);
       return () => updaters.delete(fn);
     },
-    /** Frame the character: `head` for the mascot bust, `full` for the stage. */
-    frame(kind) {
-      if (kind === 'head') {
-        camera.fov = 22;
-        camera.position.set(0, 1.34, 1.15);
-        controls?.target.set(0, 1.34, 0);
-      } else {
-        camera.fov = 28;
-        camera.position.set(0, 1.05, 2.6);
-        controls?.target.set(0, 0.95, 0);
+    /**
+     * Point the camera at the character, sized from her actual bounding box —
+     * characters come in wildly different heights, and hard-coded camera
+     * positions crop someone's head off the moment they swap models.
+     *
+     * @param {THREE.Object3D} target
+     * @param {{ fit?: 'full'|'upper'|'head', margin?: number }} [opts]
+     */
+    frame(target, { fit = 'full', margin = 1.1 } = {}) {
+      const box = new THREE.Box3().setFromObject(target);
+      if (box.isEmpty()) return;
+
+      const size = box.getSize(new THREE.Vector3());
+      const center = box.getCenter(new THREE.Vector3());
+
+      // Crop the box down from the top for the closer shots. A T-posed model is
+      // far wider than it is deep, so height drives the framing either way.
+      if (fit !== 'full') {
+        const keep = fit === 'head' ? 0.16 : 0.42; // fraction of total height
+        box.min.y = box.max.y - size.y * keep;
+        box.getSize(size);
+        box.getCenter(center);
+        size.x = Math.min(size.x, size.y * 1.2); // ignore outstretched arms
       }
+
+      const fov = THREE.MathUtils.degToRad(camera.fov);
+      const forHeight = size.y / 2 / Math.tan(fov / 2);
+      const forWidth = size.x / 2 / Math.tan(fov / 2) / camera.aspect;
+      const distance = Math.max(forHeight, forWidth) * margin + size.z / 2;
+
+      camera.position.set(center.x, center.y, center.z + distance);
+      camera.near = Math.max(0.01, distance / 100);
+      camera.far = distance * 20;
       camera.updateProjectionMatrix();
-      controls?.update();
+
+      if (controls) {
+        controls.target.copy(center);
+        controls.minDistance = distance * 0.25;
+        controls.maxDistance = distance * 4;
+        controls.update();
+      }
     },
   };
 }
