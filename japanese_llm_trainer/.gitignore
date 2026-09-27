@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+
+# 生成物（大容量・再生成可能）
+models/
+adapters/
+data/
+eval_results/
+spectrum_layers.json
+spectrum_report.txt
